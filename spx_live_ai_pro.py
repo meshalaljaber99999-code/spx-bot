@@ -1,12 +1,22 @@
 # ============================================================
-# SPX 0DTE ADVISOR v14.3 HONEST INSTITUTIONAL ENGINE
-# (Robust Error Handling for Alpaca Data Engine)
+# SPX 0DTE ADVISOR v14.4
+# HONEST ML SIGNAL ENGINE — RECOMMENDATION ONLY
+# ============================================================
+#
+# الوظيفة:
+#   SPX -> Features -> ML Ensemble -> Probability
+#       -> Market Filters -> CALL / PUT / WAIT
+#       -> 0DTE Contract Suggestion -> Telegram
+#
+# لا يوجد تنفيذ أوامر.
+# لا يوجد شراء/بيع حقيقي.
+#
+# ملاحظة:
+#   يستخدم SPY كمؤشر بديل لحركة SPX عندما لا تتوفر بيانات SPX
+#   مباشرة من مصدر البيانات، مع إبقاء ذلك واضحاً في التوصية.
 # ============================================================
 
 import os
-import sys
-import csv
-import json
 import time
 import warnings
 from math import sqrt, floor, ceil
@@ -16,343 +26,704 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score
 
-try:  # sklearn >= 1.6
-    from sklearn.frozen import FrozenEstimator
-except Exception:
-    FrozenEstimator = None
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
 
 warnings.filterwarnings("ignore")
 
 # ============================================================
-# CONFIG & ARCHITECTURE
+# CONFIG
 # ============================================================
+
 NY = ZoneInfo("America/New_York")
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "")
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
-APCA_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+
 APCA_DATA_URL = "https://data.alpaca.markets"
 
 POLL_SECONDS = 30
+
 MARKET_OPEN_MIN = 9 * 60 + 30
 MARKET_CLOSE_MIN = 16 * 60
-NO_TRADE_FIRST_MIN = 10               
-NO_TRADE_LAST_MIN = 30                
-MAX_BAR_AGE_MIN = 15                  
 
-LOCAL_DB_CSV = "local_market_db.csv"
-OPTIONS_DB_CSV = "local_options_premium_db.csv"
-TRADES_CSV = "paper_trades_v14_3.csv"
+# لا تداول/توصيات في أول وآخر دقائق
+NO_TRADE_FIRST_MIN = 10
+NO_TRADE_LAST_MIN = 30
 
-HISTORY_PERIOD = "60d"             
-MIN_TRAIN_ROWS = 100                  
+MAX_BAR_AGE_MIN = 15
+
+LOCAL_DB_CSV = "local_market_db_v14_4.csv"
+
+# ============================================================
+# ML
+# ============================================================
+
+MIN_TRAIN_ROWS = 150
 HORIZON = 6
-MAX_HOLD_BARS = 6
-MIN_PROBABILITY = 0.55                
-MIN_AUC = 0.45                        
+
+# خفضنا العتبة من 0.55 قليلاً لكن ما زالت فلترة حقيقية
+MIN_PROBABILITY = 0.57
+
+# لا نسمح بتجميل AUC
+MIN_ACCEPTABLE_AUC = 0.50
+
 RETRAIN_EVERY_MIN = 180
 
-ACCOUNT_EQUITY = 25000
-RISK_PER_TRADE = 0.01
-MAX_DAILY_LOSS = 0.05
-MAX_CONSECUTIVE_LOSSES = 5
-COMMISSION_PER_CONTRACT = 0.65
+# ============================================================
+# 0DTE
+# ============================================================
 
 STRIKE_STEP = 5.0
 STRIKE_OFFSET_STEPS = 1
-MIN_PREMIUM = 0.50                    
+
 STOP_LOSS_PCT = 0.40
 TAKE_PROFIT_PCT = 0.50
+
 MAX_HOLD_MINUTES = 30
-FORCE_EXIT_BEFORE_CLOSE_MIN = 5
 
-UP_ATR_MULT = 0.5
-DN_ATR_MULT = 0.5
+# ============================================================
+# TELEGRAM / SIGNAL CONTROL
+# ============================================================
 
-DIAG_THROTTLE_SEC = 60            
+DIAG_THROTTLE_SEC = 60
+
+# لا تكرر نفس الاتجاه باستمرار
+SIGNAL_COOLDOWN_MIN = 20
+
+# لا نرسل WAIT كل 30 ثانية
+WAIT_REPORT_MIN = 15
+
+# ============================================================
+# STATE
+# ============================================================
 
 STATE = {
-    "models": {}, "auc": 0.0, "last_train": None,
-    "date": None, "daily_pnl": 0.0, "loss_streak": 0, "signals_today": 0,
-    "open": None, "daily_summary_sent": False, "regime": "NORMAL",
+    "models": {},
+    "auc": 0.0,
+    "last_train": None,
+    "date": None,
+    "daily_pnl": 0.0,
+    "signals_today": 0,
+    "last_signal": None,
+    "last_signal_time": None,
+    "last_wait_time": None,
+    "last_spot": None,
+    "data_source": "UNKNOWN",
     "train_rows": 0,
 }
 
 _DIAG_LAST = {}
 
+
 # ============================================================
-# UTILITIES
+# BASIC
 # ============================================================
+
 def now_ny():
     return datetime.now(NY)
 
+
 def say(msg):
-    print(f"[{now_ny().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    print(
+        f"[{now_ny().strftime('%Y-%m-%d %H:%M:%S')}] {msg}",
+        flush=True
+    )
+
 
 def why(msg):
-    t = time.time()
-    if t - _DIAG_LAST.get(msg, 0) >= DIAG_THROTTLE_SEC:
-        _DIAG_LAST[msg] = t
+    now = time.time()
+
+    if now - _DIAG_LAST.get(msg, 0) >= DIAG_THROTTLE_SEC:
+        _DIAG_LAST[msg] = now
         say(f"[WHY-WAIT] {msg}")
+
 
 def minutes_of_day(dt=None):
     dt = dt or now_ny()
     return dt.hour * 60 + dt.minute
 
+
 def market_time_ok():
     n = now_ny()
-    return n.weekday() < 5 and MARKET_OPEN_MIN <= minutes_of_day(n) < MARKET_CLOSE_MIN
 
-def mins_left(dt=None):
-    dt = dt or now_ny()
-    return (MARKET_CLOSE_MIN - (dt.hour * 60 + dt.minute)) - dt.second / 60
+    return (
+        n.weekday() < 5
+        and MARKET_OPEN_MIN <= minutes_of_day(n) < MARKET_CLOSE_MIN
+    )
+
 
 def session_allowed():
     m = minutes_of_day() - MARKET_OPEN_MIN
-    return NO_TRADE_FIRST_MIN <= m <= (MARKET_CLOSE_MIN - MARKET_OPEN_MIN) - NO_TRADE_LAST_MIN
+
+    return (
+        NO_TRADE_FIRST_MIN
+        <= m
+        <= (MARKET_CLOSE_MIN - MARKET_OPEN_MIN) - NO_TRADE_LAST_MIN
+    )
+
 
 def reset_daily_state():
+
     today = now_ny().date()
+
     if STATE["date"] != today:
-        STATE.update(date=today, daily_pnl=0.0, loss_streak=0,
-                     signals_today=0, daily_summary_sent=False)
+
+        STATE["date"] = today
+        STATE["daily_pnl"] = 0.0
+        STATE["signals_today"] = 0
+        STATE["last_signal"] = None
+        STATE["last_signal_time"] = None
+        STATE["last_wait_time"] = None
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 def send_telegram(message):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        why("Telegram غير مفعّل: TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID فاضي")
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-        if r.status_code != 200:
-            say(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        say(f"Telegram error: {e}")
+
+        say(
+            "Telegram غير مفعّل: "
+            "TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID غير موجود"
+        )
+
         return False
 
+    try:
+
+        url = (
+            f"https://api.telegram.org/"
+            f"bot{TELEGRAM_TOKEN}/sendMessage"
+        )
+
+        response = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+
+            say(
+                f"Telegram HTTP {response.status_code}: "
+                f"{response.text[:300]}"
+            )
+
+            return False
+
+        return True
+
+    except Exception as e:
+
+        say(f"Telegram error: {e}")
+
+        return False
+
+
 # ============================================================
-# ALPACA CONNECTOR & DATA ENGINE (ROBUST SAFEGUARD)
+# ALPACA DATA
 # ============================================================
+
 def get_alpaca_headers():
+
     return {
         "APCA-API-KEY-ID": APCA_KEY,
         "APCA-API-SECRET-KEY": APCA_SECRET,
-        "accept": "application/json"
+        "accept": "application/json",
     }
 
-def _download_alpaca_bars(symbol, timeframe="5Min", limit=1000):
+
+def download_bars(symbol, timeframe="5Min", limit=1000):
+
     if not APCA_KEY or not APCA_SECRET:
-        why(f"مفاتيح Alpaca غير موجودة لجلب بيانات {symbol}")
+
+        why("Alpaca API keys غير موجودة")
+
         return None
-    
+
     url = f"{APCA_DATA_URL}/v2/stocks/bars"
+
     params = {
         "symbols": symbol,
         "timeframe": timeframe,
-        "limit": limit
+        "limit": limit,
+        "feed": "iex",
     }
+
     try:
-        response = requests.get(url, headers=get_alpaca_headers(), params=params, timeout=15)
+
+        response = requests.get(
+            url,
+            headers=get_alpaca_headers(),
+            params=params,
+            timeout=15
+        )
+
         if response.status_code != 200:
-            why(f"Alpaca bars error HTTP {response.status_code} for {symbol}")
+
+            why(
+                f"Alpaca bars HTTP "
+                f"{response.status_code} لـ {symbol}"
+            )
+
             return None
-        
-        data = response.json().get("bars", {}).get(symbol, [])
-        if not data:
+
+        payload = response.json()
+
+        bars = payload.get("bars", {}).get(symbol, [])
+
+        if not bars:
+
             return None
-        
-        df = pd.DataFrame(data)
-        df["timestamp"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert(NY)
+
+        df = pd.DataFrame(bars)
+
+        if df.empty:
+            return None
+
+        df["timestamp"] = (
+            pd.to_datetime(df["t"], utc=True)
+            .dt.tz_convert(NY)
+        )
+
         out = pd.DataFrame({
+
             "timestamp": df["timestamp"],
-            "open": pd.to_numeric(df["o"], errors="coerce"),
-            "high": pd.to_numeric(df["h"], errors="coerce"),
-            "low": 0.0 if "l" not in df else pd.to_numeric(df["l"], errors="coerce"),
-            "close": pd.to_numeric(df["c"], errors="coerce"),
-            "volume": pd.to_numeric(df["v"], errors="coerce") if "v" in df else 0.0
+
+            "open": pd.to_numeric(
+                df["o"],
+                errors="coerce"
+            ),
+
+            "high": pd.to_numeric(
+                df["h"],
+                errors="coerce"
+            ),
+
+            "low": pd.to_numeric(
+                df["l"],
+                errors="coerce"
+            ),
+
+            "close": pd.to_numeric(
+                df["c"],
+                errors="coerce"
+            ),
+
+            "volume": pd.to_numeric(
+                df["v"],
+                errors="coerce"
+            ),
+
         })
-        return out.dropna(subset=["close"]).sort_values("timestamp").drop_duplicates("timestamp")
+
+        out = (
+            out
+            .dropna(subset=["close"])
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp")
+        )
+
+        return out
+
     except Exception as e:
-        why(f"Alpaca download exception for {symbol}: {e}")
+
+        why(f"Alpaca exception {symbol}: {e}")
+
         return None
 
-def update_local_database():
-    try:
-        spy_df = _download_alpaca_bars("SPY", timeframe="5Min", limit=1000)
-    except Exception:
-        spy_df = None
 
-    if spy_df is None or spy_df.empty:
-        why("تعذر جلب الشموع من Alpaca لـ SPY، جاري استخدام قاعدة البيانات المحلية إن وجدت...")
-        return
+# ============================================================
+# DATABASE UPDATE
+# ============================================================
+
+def update_local_database():
+
+    spy = download_bars(
+        "SPY",
+        timeframe="5Min",
+        limit=1000
+    )
+
+    if spy is None or spy.empty:
+
+        why("لم يتم الحصول على بيانات SPY")
+
+        return False
 
     df = pd.DataFrame()
-    df["timestamp"] = spy_df["timestamp"]
-    df["spx_open"] = spy_df["open"] * 10.0
-    df["spx_high"] = spy_df["high"] * 10.0
-    df["spx_low"] = spy_df["low"] * 10.0
-    df["spx_close"] = spy_df["close"] * 10.0
-    
-    df["spy_close"] = spy_df["close"]
-    df["spy_volume"] = spy_df["volume"]
-    df["vix"] = 18.0
+
+    df["timestamp"] = spy["timestamp"]
+
+    # Proxy فقط وليس SPX حقيقي
+    df["spx_open"] = spy["open"] * 10.0
+    df["spx_high"] = spy["high"] * 10.0
+    df["spx_low"] = spy["low"] * 10.0
+    df["spx_close"] = spy["close"] * 10.0
+
+    df["spy_close"] = spy["close"]
+    df["spy_volume"] = spy["volume"]
+
+    # VIX غير متوفر هنا بشكل مباشر
+    # نستخدم proxy مبني على volatility بدلاً من قيمة ثابتة
+    returns = spy["close"].pct_change()
+
+    realized = (
+        returns
+        .rolling(12)
+        .std()
+        * sqrt(252 * 78)
+        * 100
+    )
+
+    df["vix"] = realized.fillna(18.0)
 
     df["timestamp_str"] = df["timestamp"].astype(str)
 
     if os.path.exists(LOCAL_DB_CSV):
-        existing = pd.read_csv(LOCAL_DB_CSV)
-        combined = pd.concat([existing, df]).drop_duplicates(subset=["timestamp_str"], keep="last").sort_values("timestamp_str")
-        combined.tail(40000).to_csv(LOCAL_DB_CSV, index=False)
-    else:
-        df.tail(40000).to_csv(LOCAL_DB_CSV, index=False)
 
-def get_live_option_from_alpaca(underlying_price, option_type="call"):
-    if not APCA_KEY or not APCA_SECRET:
-        return None
-
-    today_str = now_ny().strftime("%Y-%m-%d")
-    contracts = []
-    for und in ("SPXW", "SPX"):
-        url = (f"{APCA_BASE_URL}/v2/options/contracts?underlying_symbols={und}"
-               f"&expiration_date={today_str}&type={option_type.lower()}&limit=1000")
         try:
-            response = requests.get(url, headers=get_alpaca_headers(), timeout=10)
-            if response.status_code != 200:
-                continue
-            contracts = response.json().get("option_contracts", [])
-            if contracts:
-                break
+            old = pd.read_csv(LOCAL_DB_CSV)
+
+            combined = pd.concat(
+                [old, df],
+                ignore_index=True
+            )
+
+            combined = (
+                combined
+                .drop_duplicates(
+                    subset=["timestamp_str"],
+                    keep="last"
+                )
+                .sort_values("timestamp_str")
+                .tail(40000)
+            )
+
+            combined.to_csv(
+                LOCAL_DB_CSV,
+                index=False
+            )
+
         except Exception:
-            pass
 
-    if not contracts:
-        return None
+            df.to_csv(
+                LOCAL_DB_CSV,
+                index=False
+            )
 
-    try:
-        df_c = pd.DataFrame(contracts)
-        df_c["strike_price"] = pd.to_numeric(df_c["strike_price"])
-        if option_type == "call":
-            target_strike = ceil(underlying_price / STRIKE_STEP) * STRIKE_STEP + STRIKE_STEP * (STRIKE_OFFSET_STEPS - 1)
-        else:
-            target_strike = floor(underlying_price / STRIKE_STEP) * STRIKE_STEP - STRIKE_STEP * (STRIKE_OFFSET_STEPS - 1)
-        df_c["diff"] = (df_c["strike_price"] - target_strike).abs()
-        df_c = df_c.sort_values("diff").reset_index(drop=True)
-        row = df_c.iloc[0]
-        return get_specific_option_snapshot(row["symbol"], float(row["strike_price"]), option_type)
-    except Exception:
-        return None
+    else:
 
-def get_specific_option_snapshot(symbol, strike, option_type):
-    snapshot_url = f"{APCA_DATA_URL}/v1beta1/options/snapshots?symbols={symbol}"
-    try:
-        snap_resp = requests.get(snapshot_url, headers=get_alpaca_headers(), timeout=10)
-        if snap_resp.status_code != 200:
-            return None
-        snap_data = snap_resp.json().get("snapshots", {}).get(symbol, {})
-        latest_quote = snap_data.get("latestQuote", {})
-        greeks = snap_data.get("greeks", {}) or {}
-        implied_vol = snap_data.get("impliedVolatility", 0.0)
+        df.to_csv(
+            LOCAL_DB_CSV,
+            index=False
+        )
 
-        bid = latest_quote.get("bp", 0.0)
-        ask = latest_quote.get("ap", 0.0)
-        mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
-        if ask <= 0 and mid_price <= 0:
-            return None
+    STATE["data_source"] = "SPY_PROXY"
 
-        entry_execution_price = ask if ask > 0 else mid_price
-        return {
-            "symbol": symbol, "strike": strike, "type": option_type,
-            "bid": bid, "ask": ask, "entry": entry_execution_price,
-            "iv": implied_vol, "delta": greeks.get("delta", 0.5),
-            "gamma": greeks.get("gamma", 0.0), "theta": greeks.get("theta", 0.0),
-            "vega": greeks.get("vega", 0.0)
-        }
-    except Exception:
-        return None
+    return True
+
 
 # ============================================================
-# LOCAL DB & PREPARATION
+# GET DATA
 # ============================================================
+
 def get_data():
+
     update_local_database()
+
     if not os.path.exists(LOCAL_DB_CSV):
         return None
+
     try:
+
         df = pd.read_csv(LOCAL_DB_CSV)
+
         if df.empty:
             return None
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(NY)
-        t = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
-        df = df[(t >= MARKET_OPEN_MIN) & (t < MARKET_CLOSE_MIN)]
-        return df.dropna().reset_index(drop=True)
-    except Exception:
+
+        df["timestamp"] = (
+            pd.to_datetime(
+                df["timestamp"],
+                utc=True
+            )
+            .dt.tz_convert(NY)
+        )
+
+        t = (
+            df["timestamp"].dt.hour * 60
+            + df["timestamp"].dt.minute
+        )
+
+        df = df[
+            (t >= MARKET_OPEN_MIN)
+            &
+            (t < MARKET_CLOSE_MIN)
+        ]
+
+        return (
+            df
+            .dropna()
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+
+    except Exception as e:
+
+        why(f"Database read error: {e}")
+
         return None
 
-def rsi(series, period=14):
-    d = series.diff()
-    g = d.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
-    return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
-def atr(df, high_col, low_col, close_col, period=14):
-    pc = df[close_col].shift(1)
-    tr = pd.concat([df[high_col] - df[low_col], (df[high_col] - pc).abs(),
-                    (df[low_col] - pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def rsi(series, period=14):
+
+    d = series.diff()
+
+    gain = (
+        d.clip(lower=0)
+        .ewm(
+            alpha=1 / period,
+            adjust=False
+        )
+        .mean()
+    )
+
+    loss = (
+        -d.clip(upper=0)
+        .ewm(
+            alpha=1 / period,
+            adjust=False
+        )
+        .mean()
+    )
+
+    rs = gain / loss.replace(0, np.nan)
+
+    return 100 - (100 / (1 + rs))
+
+
+def atr(
+    df,
+    high_col,
+    low_col,
+    close_col,
+    period=14
+):
+
+    previous_close = df[close_col].shift(1)
+
+    tr = pd.concat(
+        [
+            df[high_col] - df[low_col],
+            (
+                df[high_col]
+                - previous_close
+            ).abs(),
+            (
+                df[low_col]
+                - previous_close
+            ).abs(),
+        ],
+        axis=1
+    ).max(axis=1)
+
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
 
 def prepare(raw):
+
     df = raw.copy()
+
     df["date"] = df["timestamp"].dt.date
+
     c = df["spx_close"]
 
     for n in (1, 3, 6, 12):
+
         df[f"spx_ret_{n}"] = c.pct_change(n)
-        df[f"spy_ret_{n}"] = df["spy_close"].pct_change(n)
+
+        df[f"spy_ret_{n}"] = (
+            df["spy_close"].pct_change(n)
+        )
 
     df["rsi"] = rsi(c)
-    df["spx_atr"] = atr(df, "spx_high", "spx_low", "spx_close")
-    df["atr_pct"] = df["spx_atr"] / c
 
-    df["realized_vol"] = c.pct_change().rolling(12).std() * sqrt(252 * 78) * 100
-    df["vol_spread"] = df["vix"] - df["realized_vol"]
-    df["vix_chg_5"] = df["vix"].diff(5).fillna(0.0)
-    df["vix_acceleration"] = df["vix_chg_5"].diff(1).fillna(0.0)
+    df["spx_atr"] = atr(
+        df,
+        "spx_high",
+        "spx_low",
+        "spx_close"
+    )
 
-    daily_high = df.groupby("date")["spx_high"].max()
-    daily_low = df.groupby("date")["spx_low"].min()
-    df["prev_day_high"] = df["date"].map(daily_high.shift(1)).fillna(df["spx_high"].iloc[0])
-    df["prev_day_low"] = df["date"].map(daily_low.shift(1)).fillna(df["spx_low"].iloc[0])
+    df["atr_pct"] = (
+        df["spx_atr"] / c
+    )
 
-    df["dist_prev_high"] = (c - df["prev_day_high"]) / c
-    df["dist_prev_low"] = (c - df["prev_day_low"]) / c
+    df["realized_vol"] = (
+        c.pct_change()
+        .rolling(12)
+        .std()
+        * sqrt(252 * 78)
+        * 100
+    )
 
-    df["mins_open"] = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute - MARKET_OPEN_MIN
+    df["vol_spread"] = (
+        df["vix"]
+        - df["realized_vol"]
+    )
 
-    is_first_30 = (df["mins_open"] >= 0) & (df["mins_open"] < 30)
-    or_highs = df[is_first_30].groupby("date")["spx_high"].max().to_dict()
-    or_lows = df[is_first_30].groupby("date")["spx_low"].min().to_dict()
+    df["vix_chg_5"] = (
+        df["vix"]
+        .diff(5)
+        .fillna(0)
+    )
 
-    df["orh"] = df["date"].map(or_highs)
-    df["orl"] = df["date"].map(or_lows)
-    df.loc[df["mins_open"] < 30, ["orh", "orl"]] = np.nan
+    df["vix_acceleration"] = (
+        df["vix_chg_5"]
+        .diff()
+        .fillna(0)
+    )
 
-    df["dist_from_orh"] = np.where(df["orh"].notna(), (c - df["orh"]) / c, 0.0)
-    df["dist_from_orl"] = np.where(df["orl"].notna(), (c - df["orl"]) / c, 0.0)
+    # --------------------------------------------------------
+    # PREVIOUS DAY LEVELS
+    # --------------------------------------------------------
 
-    vol_mean = df["spy_volume"].rolling(30, min_periods=5).mean()
-    vol_std = df["spy_volume"].rolling(30, min_periods=5).std().replace(0, 1)
-    df["volume_zscore"] = (df["spy_volume"] - vol_mean) / vol_std
+    daily_high = (
+        df.groupby("date")["spx_high"]
+        .max()
+    )
+
+    daily_low = (
+        df.groupby("date")["spx_low"]
+        .min()
+    )
+
+    previous_high = daily_high.shift(1)
+    previous_low = daily_low.shift(1)
+
+    df["prev_day_high"] = (
+        df["date"]
+        .map(previous_high)
+        .fillna(df["spx_high"])
+    )
+
+    df["prev_day_low"] = (
+        df["date"]
+        .map(previous_low)
+        .fillna(df["spx_low"])
+    )
+
+    df["dist_prev_high"] = (
+        c - df["prev_day_high"]
+    ) / c
+
+    df["dist_prev_low"] = (
+        c - df["prev_day_low"]
+    ) / c
+
+    # --------------------------------------------------------
+    # OPENING RANGE
+    # --------------------------------------------------------
+
+    df["mins_open"] = (
+        df["timestamp"].dt.hour * 60
+        + df["timestamp"].dt.minute
+        - MARKET_OPEN_MIN
+    )
+
+    first_30 = (
+        (df["mins_open"] >= 0)
+        &
+        (df["mins_open"] < 30)
+    )
+
+    or_high = (
+        df[first_30]
+        .groupby("date")["spx_high"]
+        .max()
+    )
+
+    or_low = (
+        df[first_30]
+        .groupby("date")["spx_low"]
+        .min()
+    )
+
+    df["orh"] = df["date"].map(or_high)
+    df["orl"] = df["date"].map(or_low)
+
+    df.loc[
+        df["mins_open"] < 30,
+        ["orh", "orl"]
+    ] = np.nan
+
+    df["dist_from_orh"] = np.where(
+        df["orh"].notna(),
+        (c - df["orh"]) / c,
+        0.0
+    )
+
+    df["dist_from_orl"] = np.where(
+        df["orl"].notna(),
+        (c - df["orl"]) / c,
+        0.0
+    )
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    volume_mean = (
+        df["spy_volume"]
+        .rolling(
+            30,
+            min_periods=5
+        )
+        .mean()
+    )
+
+    volume_std = (
+        df["spy_volume"]
+        .rolling(
+            30,
+            min_periods=5
+        )
+        .std()
+        .replace(0, 1)
+    )
+
+    df["volume_zscore"] = (
+        df["spy_volume"]
+        - volume_mean
+    ) / volume_std
+
+    # --------------------------------------------------------
+    # TARGET
+    # --------------------------------------------------------
 
     targets = []
+
     highs = df["spx_high"].values
     lows = df["spx_low"].values
     closes = c.values
@@ -360,248 +731,951 @@ def prepare(raw):
     dates = df["date"].values
 
     for i in range(len(df)):
-        if i + HORIZON >= len(df) or dates[i] != dates[i + HORIZON]:
+
+        if (
+            i + HORIZON >= len(df)
+            or dates[i] != dates[i + HORIZON]
+        ):
+
             targets.append(np.nan)
             continue
-        entry_price = closes[i]
-        atr_val = atrs[i]
-        upper_barrier = entry_price + (UP_ATR_MULT * atr_val)
-        lower_barrier = entry_price - (DN_ATR_MULT * atr_val)
 
-        hit_upper, hit_lower = False, False
+        entry = closes[i]
+        atr_value = atrs[i]
+
+        if (
+            not np.isfinite(atr_value)
+            or atr_value <= 0
+        ):
+
+            targets.append(np.nan)
+            continue
+
+        upper = entry + 0.5 * atr_value
+        lower = entry - 0.5 * atr_value
+
+        hit_up = False
+        hit_down = False
+
         for h in range(1, HORIZON + 1):
-            f_idx = i + h
-            if highs[f_idx] >= upper_barrier:
-                hit_upper = True
-                break
-            if lows[f_idx] <= lower_barrier:
-                hit_lower = True
+
+            idx = i + h
+
+            up = highs[idx] >= upper
+            down = lows[idx] <= lower
+
+            # إذا ضرب الاثنين بنفس الشمعة:
+            # نتجاهل الحالة بدلاً من افتراض الاتجاه
+            if up and down:
+                hit_up = False
+                hit_down = False
                 break
 
-        if hit_upper:
+            if up:
+                hit_up = True
+                break
+
+            if down:
+                hit_down = True
+                break
+
+        if hit_up:
             targets.append(1.0)
-        elif hit_lower:
+
+        elif hit_down:
             targets.append(0.0)
+
         else:
             targets.append(np.nan)
 
     df["target"] = targets
+
     return df
 
-TREND_FEATURES = ["spx_ret_3", "spx_ret_6", "rsi", "atr_pct", "dist_from_orh", "dist_from_orl", "dist_prev_high"]
-MOMENTUM_FEATURES = ["spx_ret_1", "spy_ret_3", "spy_ret_6", "volume_zscore", "realized_vol"]
-VOLATILITY_FEATURES = ["vix", "vix_chg_5", "vix_acceleration", "vol_spread", "mins_open"]
 
-def detect_market_regime(df):
-    return "NORMAL"
+# ============================================================
+# FEATURES
+# ============================================================
 
-def _calibrate(base, calib_df, feats):
-    if FrozenEstimator is not None:
-        cal = CalibratedClassifierCV(estimator=FrozenEstimator(base), method="sigmoid")
-    else:
-        cal = CalibratedClassifierCV(estimator=base, method="sigmoid", cv="prefit")
-    cal.fit(calib_df[feats], calib_df["target"])
-    return cal
+TREND_FEATURES = [
+    "spx_ret_3",
+    "spx_ret_6",
+    "rsi",
+    "atr_pct",
+    "dist_from_orh",
+    "dist_from_orl",
+    "dist_prev_high",
+]
+
+MOMENTUM_FEATURES = [
+    "spx_ret_1",
+    "spy_ret_3",
+    "spy_ret_6",
+    "volume_zscore",
+    "realized_vol",
+]
+
+VOLATILITY_FEATURES = [
+    "vix",
+    "vix_chg_5",
+    "vix_acceleration",
+    "vol_spread",
+    "mins_open",
+]
+
+
+ALL_FEATURES = list(
+    dict.fromkeys(
+        TREND_FEATURES
+        + MOMENTUM_FEATURES
+        + VOLATILITY_FEATURES
+    )
+)
+
+
+# ============================================================
+# TRAINING
+# ============================================================
 
 def train_ensemble(df):
-    data = df.dropna(subset=TREND_FEATURES + MOMENTUM_FEATURES + VOLATILITY_FEATURES + ["target"]).reset_index(drop=True)
+
+    needed = ALL_FEATURES + ["target"]
+
+    data = (
+        df
+        .dropna(subset=needed)
+        .reset_index(drop=True)
+    )
+
     STATE["train_rows"] = len(data)
+
     if len(data) < MIN_TRAIN_ROWS:
-        return {}, 0.5
+
+        why(
+            f"بيانات التدريب غير كافية: "
+            f"{len(data)}/{MIN_TRAIN_ROWS}"
+        )
+
+        return {}, 0.0
+
+    # --------------------------------------------------------
+    # TIME-ORDERED SPLIT
+    # --------------------------------------------------------
+
+    n = len(data)
+
+    train_end = int(n * 0.60)
+    validation_end = int(n * 0.80)
+
+    train_df = data.iloc[:train_end]
+    validation_df = data.iloc[
+        train_end:validation_end
+    ]
+    test_df = data.iloc[validation_end:]
 
     models = {}
     aucs = []
-    subsets = {"trend": TREND_FEATURES, "momentum": MOMENTUM_FEATURES, "volatility": VOLATILITY_FEATURES}
 
-    n = len(data)
-    train_end = int(n * 0.6)
-    calib_end = int(n * 0.8)
-
-    train_df = data.iloc[:train_end]
-    calib_df = data.iloc[train_end:calib_end]
-    test_df = data.iloc[calib_end:]
-
-    for name, feats in subsets.items():
-        try:
-            base = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.03, max_iter=100, random_state=42)
-            base.fit(train_df[feats], train_df["target"])
-            calibrated = _calibrate(base, calib_df, feats)
-            models[name] = calibrated
-
-            if len(test_df) > 10 and test_df["target"].nunique() > 1:
-                preds = calibrated.predict_proba(test_df[feats])[:, 1]
-                aucs.append(roc_auc_score(test_df["target"], preds))
-        except Exception:
-            return {}, 0.5
-
-    mean_auc = float(np.mean(aucs)) if aucs else 0.5
-    return models, max(mean_auc, 0.60)
-
-def calculate_ensemble_signal(df, regime):
-    if df is None or len(df) < 50:
-        return {"direction": "WAIT"}
-    last = df.iloc[-1]
-
-    age = (now_ny() - last["timestamp"]).total_seconds() / 60
-    if age > MAX_BAR_AGE_MIN:
-        why(f"آخر شمعة قديمة ({age:.1f} دقيقة)")
-        return {"direction": "WAIT"}
-
-    if not STATE["models"]:
-        return {"direction": "WAIT"}
-
-    try:
-        p_trend = STATE["models"]["trend"].predict_proba(pd.DataFrame([last[TREND_FEATURES]]))[0][1]
-        p_mom = STATE["models"]["momentum"].predict_proba(pd.DataFrame([last[MOMENTUM_FEATURES]]))[0][1]
-        p_vol = STATE["models"]["volatility"].predict_proba(pd.DataFrame([last[VOLATILITY_FEATURES]]))[0][1]
-    except Exception:
-        return {"direction": "WAIT"}
-
-    avg_prob_up = (p_trend + p_mom + p_vol) / 3.0
-    avg_prob_dn = 1.0 - avg_prob_up
-
-    if avg_prob_up >= MIN_PROBABILITY:
-        return {"direction": "CALL", "probability": avg_prob_up}
-    elif avg_prob_dn >= MIN_PROBABILITY:
-        return {"direction": "PUT", "probability": avg_prob_dn}
-
-    return {"direction": "WAIT", "probability": max(avg_prob_up, avg_prob_dn)}
-
-def suggested_strike(spot, kind):
-    if kind == "CALL":
-        return ceil(spot / STRIKE_STEP) * STRIKE_STEP + STRIKE_STEP * (STRIKE_OFFSET_STEPS - 1)
-    return floor(spot / STRIKE_STEP) * STRIKE_STEP - STRIKE_STEP * (STRIKE_OFFSET_STEPS - 1)
-
-def build_recommendation(df, regime):
-    if not market_time_ok():
-        return {"status": "WAIT"}
-
-    sig = calculate_ensemble_signal(df, regime)
-    if sig["direction"] == "WAIT":
-        return {"status": "WAIT"}
-
-    last = df.iloc[-1]
-    spot = float(last["spx_close"])
-    atr_val = float(last["spx_atr"])
-    kind = sig["direction"]
-    strike = suggested_strike(spot, kind)
-
-    opt_data = get_live_option_from_alpaca(spot, option_type=kind.lower())
-
-    if not opt_data:
-        if kind == "CALL":
-            spot_target, spot_stop = spot + UP_ATR_MULT * atr_val, spot - DN_ATR_MULT * atr_val
-        else:
-            spot_target, spot_stop = spot - UP_ATR_MULT * atr_val, spot + DN_ATR_MULT * atr_val
-        return {
-            "status": kind, "mode": "SPX_ONLY", "probability": sig["probability"], "spx": spot,
-            "symbol": f"SPX 0DTE {kind} {strike:.0f}", "strike": strike,
-            "entry": spot, "stop": spot_stop, "target": spot_target, "contracts": 1,
-            "delta": 0.5, "gamma": 0.0, "iv": 0.2,
-            "time": now_ny(), "max_prem": spot, "min_prem": spot,
-        }
-
-    entry = opt_data["entry"]
-    stop, target = entry * (1 - STOP_LOSS_PCT), entry * (1 + TAKE_PROFIT_PCT)
-    contracts = 1
-
-    return {
-        "status": kind, "mode": "OPTION", "probability": sig["probability"], "spx": spot,
-        "symbol": opt_data["symbol"], "strike": opt_data["strike"],
-        "entry": entry, "stop": stop, "target": target, "contracts": contracts,
-        "delta": opt_data["delta"], "gamma": opt_data["gamma"], "iv": opt_data["iv"],
-        "time": now_ny(), "max_prem": entry, "min_prem": entry
+    subsets = {
+        "trend": TREND_FEATURES,
+        "momentum": MOMENTUM_FEATURES,
+        "volatility": VOLATILITY_FEATURES,
     }
 
-def open_paper_trade(rec):
-    STATE["open"] = rec
-    msg = (f"🏛️ SPX v14.3 ADVISOR: {rec['status']} | الثقة: {rec['probability']*100:.1f}%\n"
-           f"SPX الآن: {rec['spx']:.2f}\n"
-           f"عقد مقترح 0DTE: {rec['status']} Strike {rec['strike']:.0f}\n"
-           f"هدف SPX: {rec['target']:.2f} | وقف SPX: {rec['stop']:.2f}")
-    say(msg.replace("\n", " | "))
+    for name, features in subsets.items():
+
+        try:
+
+            if train_df["target"].nunique() < 2:
+                continue
+
+            model = HistGradientBoostingClassifier(
+                max_depth=3,
+                learning_rate=0.03,
+                max_iter=150,
+                min_samples_leaf=20,
+                l2_regularization=1.0,
+                random_state=42
+            )
+
+            model.fit(
+                train_df[features],
+                train_df["target"]
+            )
+
+            # ------------------------------------------------
+            # VALIDATION
+            # ------------------------------------------------
+
+            if (
+                len(validation_df) > 20
+                and validation_df["target"].nunique() > 1
+            ):
+
+                val_prob = model.predict_proba(
+                    validation_df[features]
+                )[:, 1]
+
+                val_auc = roc_auc_score(
+                    validation_df["target"],
+                    val_prob
+                )
+
+            # ------------------------------------------------
+            # OUT-OF-SAMPLE TEST
+            # ------------------------------------------------
+
+            if (
+                len(test_df) > 20
+                and test_df["target"].nunique() > 1
+            ):
+
+                test_prob = model.predict_proba(
+                    test_df[features]
+                )[:, 1]
+
+                test_auc = roc_auc_score(
+                    test_df["target"],
+                    test_prob
+                )
+
+                aucs.append(test_auc)
+
+                say(
+                    f"MODEL {name}: "
+                    f"TEST AUC={test_auc:.3f}"
+                )
+
+            models[name] = model
+
+        except Exception as e:
+
+            say(
+                f"Model {name} training error: {e}"
+            )
+
+    if not models:
+        return {}, 0.0
+
+    real_auc = (
+        float(np.mean(aucs))
+        if aucs
+        else 0.0
+    )
+
+    return models, real_auc
+
+
+# ============================================================
+# MARKET REGIME
+# ============================================================
+
+def detect_market_regime(df):
+
+    if df is None or len(df) < 30:
+        return "UNKNOWN"
+
+    last = df.iloc[-1]
+
+    atr_pct = float(last["atr_pct"])
+    rv = float(last["realized_vol"])
+
+    if atr_pct > 0.004 or rv > 35:
+        return "HIGH_VOL"
+
+    if atr_pct < 0.0015 and rv < 12:
+        return "LOW_VOL"
+
+    return "NORMAL"
+
+
+# ============================================================
+# ENSEMBLE SIGNAL
+# ============================================================
+
+def calculate_ensemble_signal(
+    df,
+    regime
+):
+
+    if df is None or len(df) < 50:
+
+        return {
+            "direction": "WAIT",
+            "probability": 0.50,
+            "reason": "بيانات غير كافية"
+        }
+
+    last = df.iloc[-1]
+
+    age = (
+        now_ny()
+        - last["timestamp"]
+    ).total_seconds() / 60
+
+    if age > MAX_BAR_AGE_MIN:
+
+        return {
+            "direction": "WAIT",
+            "probability": 0.50,
+            "reason": (
+                f"آخر شمعة قديمة "
+                f"{age:.1f} دقيقة"
+            )
+        }
+
+    if not STATE["models"]:
+
+        return {
+            "direction": "WAIT",
+            "probability": 0.50,
+            "reason": "النموذج لم يكتمل تدريبه"
+        }
+
+    probabilities = []
+
+    try:
+
+        for name, features in [
+            ("trend", TREND_FEATURES),
+            ("momentum", MOMENTUM_FEATURES),
+            ("volatility", VOLATILITY_FEATURES),
+        ]:
+
+            model = STATE["models"].get(name)
+
+            if model is None:
+                continue
+
+            p = model.predict_proba(
+                pd.DataFrame(
+                    [last[features]]
+                )
+            )[0][1]
+
+            probabilities.append(float(p))
+
+    except Exception as e:
+
+        return {
+            "direction": "WAIT",
+            "probability": 0.50,
+            "reason": f"Model error: {e}"
+        }
+
+    if len(probabilities) < 2:
+
+        return {
+            "direction": "WAIT",
+            "probability": 0.50,
+            "reason": "عدد النماذج الفعالة غير كافٍ"
+        }
+
+    # --------------------------------------------------------
+    # Ensemble
+    # --------------------------------------------------------
+
+    p_up = float(
+        np.mean(probabilities)
+    )
+
+    p_down = 1.0 - p_up
+
+    # --------------------------------------------------------
+    # REGIME FILTER
+    # --------------------------------------------------------
+
+    if regime == "LOW_VOL":
+
+        # لا نمنع تماماً، لكن نحتاج ثقة أعلى
+        threshold = 0.60
+
+    elif regime == "HIGH_VOL":
+
+        # في التقلب العالي نحتاج تأكيد أكبر
+        threshold = 0.60
+
+    else:
+
+        threshold = MIN_PROBABILITY
+
+    if p_up >= threshold:
+
+        return {
+            "direction": "CALL",
+            "probability": p_up,
+            "reason": (
+                f"Ensemble bullish "
+                f"{p_up*100:.1f}%"
+            )
+        }
+
+    if p_down >= threshold:
+
+        return {
+            "direction": "PUT",
+            "probability": p_down,
+            "reason": (
+                f"Ensemble bearish "
+                f"{p_down*100:.1f}%"
+            )
+        }
+
+    return {
+        "direction": "WAIT",
+        "probability": max(
+            p_up,
+            p_down
+        ),
+        "reason": (
+            f"الثقة غير كافية "
+            f"(UP={p_up*100:.1f}% "
+            f"DOWN={p_down*100:.1f}%)"
+        )
+    }
+
+
+# ============================================================
+# STRIKE
+# ============================================================
+
+def suggested_strike(
+    spot,
+    direction
+):
+
+    if direction == "CALL":
+
+        return (
+            ceil(spot / STRIKE_STEP)
+            * STRIKE_STEP
+            + STRIKE_STEP
+            * (STRIKE_OFFSET_STEPS - 1)
+        )
+
+    return (
+        floor(spot / STRIKE_STEP)
+        * STRIKE_STEP
+        - STRIKE_STEP
+        * (STRIKE_OFFSET_STEPS - 1)
+    )
+
+
+# ============================================================
+# RECOMMENDATION
+# ============================================================
+
+def build_recommendation(
+    df,
+    regime
+):
+
+    if not market_time_ok():
+
+        return {
+            "status": "WAIT",
+            "reason": "السوق مغلق"
+        }
+
+    if not session_allowed():
+
+        return {
+            "status": "WAIT",
+            "reason": "خارج نافذة التوصيات"
+        }
+
+    signal = calculate_ensemble_signal(
+        df,
+        regime
+    )
+
+    if signal["direction"] == "WAIT":
+
+        return {
+            "status": "WAIT",
+            "probability": signal["probability"],
+            "reason": signal["reason"]
+        }
+
+    last = df.iloc[-1]
+
+    spot = float(
+        last["spx_close"]
+    )
+
+    atr_value = float(
+        last["spx_atr"]
+    )
+
+    direction = signal["direction"]
+
+    strike = suggested_strike(
+        spot,
+        direction
+    )
+
+    if direction == "CALL":
+
+        target = (
+            spot
+            + 0.5 * atr_value
+        )
+
+        stop = (
+            spot
+            - 0.5 * atr_value
+        )
+
+    else:
+
+        target = (
+            spot
+            - 0.5 * atr_value
+        )
+
+        stop = (
+            spot
+            + 0.5 * atr_value
+        )
+
+    return {
+
+        "status": direction,
+
+        "probability":
+            signal["probability"],
+
+        "reason":
+            signal["reason"],
+
+        "spx":
+            spot,
+
+        "strike":
+            strike,
+
+        "target":
+            target,
+
+        "stop":
+            stop,
+
+        "data_source":
+            STATE["data_source"],
+
+        "time":
+            now_ny(),
+
+    }
+
+
+# ============================================================
+# SIGNAL DUPLICATE FILTER
+# ============================================================
+
+def should_send_signal(rec):
+
+    direction = rec["status"]
+
+    now = now_ny()
+
+    last_direction = STATE[
+        "last_signal"
+    ]
+
+    last_time = STATE[
+        "last_signal_time"
+    ]
+
+    if (
+        last_direction == direction
+        and last_time is not None
+    ):
+
+        elapsed = (
+            now - last_time
+        ).total_seconds() / 60
+
+        if elapsed < SIGNAL_COOLDOWN_MIN:
+
+            return False
+
+    return True
+
+
+# ============================================================
+# SEND RECOMMENDATION
+# ============================================================
+
+def send_recommendation(rec):
+
+    direction = rec["status"]
+
+    emoji = (
+        "🟢" if direction == "CALL"
+        else "🔴"
+    )
+
+    msg = f"""
+{emoji} SPX 0DTE — {direction}
+
+📊 الثقة: {rec["probability"]*100:.1f}%
+
+SPX: {rec["spx"]:.2f}
+
+🎯 العقد المقترح:
+{direction} {rec["strike"]:.0f} 0DTE
+
+🎯 هدف SPX:
+{rec["target"]:.2f}
+
+🛑 وقف SPX:
+{rec["stop"]:.2f}
+
+📈 Regime:
+{STATE.get("regime", "NORMAL")}
+
+🧠 السبب:
+{rec["reason"]}
+
+📡 البيانات:
+{rec["data_source"]}
+
+⚠️ توصية فقط — لا يوجد تنفيذ آلي.
+""".strip()
+
+    say(
+        msg.replace(
+            "\n",
+            " | "
+        )
+    )
+
+    ok = send_telegram(msg)
+
+    if ok:
+
+        STATE["last_signal"] = direction
+        STATE["last_signal_time"] = now_ny()
+        STATE["signals_today"] += 1
+
+    return ok
+
+
+# ============================================================
+# WAIT REPORT
+# ============================================================
+
+def maybe_send_wait(reason):
+
+    now = now_ny()
+
+    last_wait = STATE[
+        "last_wait_time"
+    ]
+
+    if last_wait is not None:
+
+        elapsed = (
+            now - last_wait
+        ).total_seconds() / 60
+
+        if elapsed < WAIT_REPORT_MIN:
+            return
+
+    msg = (
+        "⚪ SPX 0DTE — WAIT\n\n"
+        f"السبب: {reason}\n\n"
+        "لا توجد إشارة CALL/PUT قوية "
+        "حاليًا.\n"
+        "النظام مستمر بالمراقبة."
+    )
+
     send_telegram(msg)
 
-def manage_open_trade(spot):
-    t = STATE["open"]
-    if not t:
-        return
-    held_minutes = (now_ny() - t["time"]).total_seconds() / 60
-    is_call = t["status"] == "CALL"
-    
-    hit_tp = spot >= t["target"] if is_call else spot <= t["target"]
-    hit_sl = spot <= t["stop"] if is_call else spot >= t["stop"]
+    STATE[
+        "last_wait_time"
+    ] = now
 
-    reason = None
-    if hit_sl: reason = "STOP_LOSS"
-    elif hit_tp: reason = "TAKE_PROFIT"
-    elif held_minutes >= MAX_HOLD_MINUTES: reason = "MAX_HOLD_TIME"
 
-    if not reason:
-        return
+# ============================================================
+# STARTUP
+# ============================================================
 
-    pnl = 100 if hit_tp else -100
-    STATE["daily_pnl"] += pnl
-    msg = f"🔔 خروج التوصية ({reason}) — PnL تقديري: ${pnl:+.0f} | {t['symbol']}"
-    say(msg)
-    send_telegram(msg)
-    STATE["open"] = None
+def startup_test():
+
+    say(
+        "SPX v14.4 — "
+        "بدء التشغيل"
+    )
+
+    if not APCA_KEY or not APCA_SECRET:
+
+        say(
+            "⚠️ مفاتيح Alpaca غير موجودة"
+        )
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+
+        say(
+            "⚠️ Telegram غير مهيأ"
+        )
+
+    else:
+
+        send_telegram(
+            "✅ SPX v14.4 اشتغل بنجاح\n"
+            "🧠 ML Recommendation Engine\n"
+            "📡 المراقبة بدأت\n"
+            "⚠️ توصيات فقط — بدون تنفيذ أوامر"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    say("SPX v14.3 HONEST INSTITUTIONAL — بدء التشغيل (مع حماية جلب البيانات)")
-    send_telegram("✅ SPX v14.3 اشتغل — نظام الحماية مفعل")
+
+    startup_test()
+
     reset_daily_state()
 
-    df_raw = None
-    while df_raw is None or df_raw.empty:
-        df_raw = get_data()
-        if df_raw is None or df_raw.empty:
-            why("جاري إعادة محاولة جلب البيانات في الخلفية...")
-            time.sleep(30)
-    
-    df_prep = prepare(df_raw)
-    models, auc = train_ensemble(df_prep)
-    STATE.update(models=models, auc=max(auc, 0.60), last_train=now_ny())
-    send_telegram(f"📊 تدريب النماذج تم بنجاح | AUC={STATE['auc']:.2f}")
+    # --------------------------------------------------------
+    # WAIT FOR DATA
+    # --------------------------------------------------------
 
     while True:
+
+        df_raw = get_data()
+
+        if (
+            df_raw is not None
+            and len(df_raw) >= 100
+        ):
+
+            break
+
+        why(
+            "بانتظار بيانات كافية "
+            "لبناء النموذج..."
+        )
+
+        time.sleep(30)
+
+    # --------------------------------------------------------
+    # FIRST TRAIN
+    # --------------------------------------------------------
+
+    say(
+        f"بيانات أولية: "
+        f"{len(df_raw)} شمعة"
+    )
+
+    df_prep = prepare(
+        df_raw
+    )
+
+    models, auc = train_ensemble(
+        df_prep
+    )
+
+    if models:
+
+        STATE.update(
+            models=models,
+            auc=auc,
+            last_train=now_ny()
+        )
+
+        send_telegram(
+            "📚 تم تدريب النموذج\n\n"
+            f"Training rows: "
+            f"{STATE['train_rows']}\n"
+            f"Out-of-sample AUC: "
+            f"{auc:.3f}\n\n"
+            "ملاحظة: AUC يعرض "
+            "النتيجة الحقيقية فقط."
+        )
+
+    else:
+
+        send_telegram(
+            "⚠️ لم يكتمل تدريب ML بعد.\n"
+            "النظام مستمر في جمع البيانات."
+        )
+
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
+
+    while True:
+
         try:
+
             reset_daily_state()
+
+            # خارج السوق
             if not market_time_ok():
+
                 time.sleep(30)
+
                 continue
+
+            # ------------------------------------------------
+            # GET DATA
+            # ------------------------------------------------
 
             df_raw = get_data()
-            if df_raw is None or len(df_raw) < 50:
-                time.sleep(POLL_SECONDS)
+
+            if (
+                df_raw is None
+                or len(df_raw) < 50
+            ):
+
+                why(
+                    "بيانات غير كافية "
+                    "لإنتاج إشارة"
+                )
+
+                time.sleep(
+                    POLL_SECONDS
+                )
+
                 continue
 
-            df_prep = prepare(df_raw)
-            regime = detect_market_regime(df_prep)
+            # ------------------------------------------------
+            # PREPARE
+            # ------------------------------------------------
 
-            if (now_ny() - STATE["last_train"]).total_seconds() > RETRAIN_EVERY_MIN * 60:
-                models, auc = train_ensemble(df_prep)
+            df_prep = prepare(
+                df_raw
+            )
+
+            regime = detect_market_regime(
+                df_prep
+            )
+
+            STATE["regime"] = regime
+
+            # ------------------------------------------------
+            # RETRAIN
+            # ------------------------------------------------
+
+            if STATE["last_train"] is None:
+
+                retrain = True
+
+            else:
+
+                retrain = (
+                    (
+                        now_ny()
+                        - STATE["last_train"]
+                    ).total_seconds()
+                    >
+                    RETRAIN_EVERY_MIN * 60
+                )
+
+            if retrain:
+
+                say(
+                    "🔄 إعادة تدريب ML..."
+                )
+
+                models, auc = train_ensemble(
+                    df_prep
+                )
+
                 if models:
-                    STATE.update(models=models, auc=max(auc, 0.60), last_train=now_ny())
+
+                    STATE.update(
+                        models=models,
+                        auc=auc,
+                        last_train=now_ny()
+                    )
+
+                    say(
+                        f"Training complete | "
+                        f"AUC={auc:.3f}"
+                    )
+
+            # ------------------------------------------------
+            # LIVE BAR
+            # ------------------------------------------------
 
             last = df_prep.iloc[-1]
-            spot = float(last["spx_close"])
 
-            if STATE["open"] is not None:
-                manage_open_trade(spot)
+            STATE["last_spot"] = float(
+                last["spx_close"]
+            )
+
+            # ------------------------------------------------
+            # RECOMMENDATION
+            # ------------------------------------------------
+
+            rec = build_recommendation(
+                df_prep,
+                regime
+            )
+
+            # ------------------------------------------------
+            # SIGNAL
+            # ------------------------------------------------
+
+            if rec["status"] in (
+                "CALL",
+                "PUT"
+            ):
+
+                if should_send_signal(rec):
+
+                    send_recommendation(
+                        rec
+                    )
+
+                else:
+
+                    why(
+                        "تم منع تكرار نفس "
+                        "التوصية خلال فترة التهدئة"
+                    )
+
             else:
-                rec = build_recommendation(df_prep, regime)
-                if rec["status"] in ("CALL", "PUT"):
-                    STATE["signals_today"] += 1
-                    open_paper_trade(rec)
 
-            time.sleep(POLL_SECONDS)
+                maybe_send_wait(
+                    rec.get(
+                        "reason",
+                        "لا توجد إشارة"
+                    )
+                )
+
+            time.sleep(
+                POLL_SECONDS
+            )
+
         except KeyboardInterrupt:
-            say("تم إيقاف النظام.")
+
+            say(
+                "تم إيقاف النظام يدويًا."
+            )
+
             break
+
         except Exception as e:
-            say(f"MAIN LOOP ERROR: {e}")
-            time.sleep(POLL_SECONDS)
+
+            say(
+                f"MAIN LOOP ERROR: {e}"
+            )
+
+            time.sleep(
+                POLL_SECONDS
+            )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
