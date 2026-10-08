@@ -1,9 +1,12 @@
 # ============================================================
-# SPX & 10 STOCKS 0DTE AI ADVISOR / SCANNER v16.1 (STABLE)
+# SPX & 10 STOCKS 0DTE AI ADVISOR / SCANNER v16.2 (FULL PRO)
+# ============================================================
+# Recommendation Only - NO ORDER EXECUTION
 # ============================================================
 
 import os
 import time
+import math
 import warnings
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -17,7 +20,7 @@ from sklearn.metrics import roc_auc_score
 
 warnings.filterwarnings("ignore")
 
-VERSION = "v16.1-STABLE"
+VERSION = "v16.2-FULL-PRO"
 NY = ZoneInfo("America/New_York")
 
 TIMEFRAME = "5Min"
@@ -25,14 +28,17 @@ HISTORY_DAYS = 60
 MIN_TRAIN_ROWS = 150
 HORIZON = 6
 ATR_TARGET = 0.50
+
 MIN_PROBABILITY = 0.62
 MIN_OPTION_SCORE = 75
 MAX_SPREAD_PERCENT = 0.15
 MIN_OPTION_PREMIUM = 0.20
 MAX_STRIKE_DISTANCE = 40
+
 SIGNAL_COOLDOWN_MINUTES = 20
 POLL_SECONDS = 30
 MAX_TELEGRAM_OPPORTUNITIES = 3
+
 NO_TRADE_FIRST_MIN = 10
 NO_TRADE_LAST_MIN = 30
 
@@ -50,6 +56,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ALPACA_TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://api.alpaca.markets")
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
+
+OPTIONS_CONTRACTS_URL = f"{ALPACA_TRADING_URL}/v2/options/contracts"
+OPTIONS_LATEST_QUOTES_URL = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
 
 STATE = {"last_sent": {}}
 session = requests.Session()
@@ -227,21 +236,215 @@ def predict(model_info, feature_df):
         "relative_strength": float(latest["relative_strength"]), "auc": model_info["auc"], "regime": regime
     }
 
+def get_option_contracts(underlying, option_type, expiration):
+    params = {"underlying_symbols": underlying, "status": "active", "expiration_date": expiration, "type": option_type.lower(), "limit": 10000}
+    data = alpaca_get(OPTIONS_CONTRACTS_URL, params=params, timeout=30)
+    if not data: return []
+    return data.get("option_contracts") or data.get("contracts") or []
+
+def get_option_quotes(symbols):
+    if not symbols: return {}
+    result = {}
+    for i in range(0, len(symbols), 100):
+        batch = symbols[i:i + 100]
+        params = {"symbols": ",".join(batch), "feed": "indicative"}
+        data = alpaca_get(OPTIONS_LATEST_QUOTES_URL, params=params, timeout=30)
+        if not data: continue
+        for symbol, q in data.get("quotes", {}).items():
+            bid, ask = q.get("bp"), q.get("ap")
+            if bid is None or ask is None: continue
+            try:
+                bid, ask = float(bid), float(ask)
+            except Exception:
+                continue
+            if bid <= 0 or ask <= 0: continue
+            mid = (bid + ask) / 2
+            spread_pct = (ask - bid) / mid if mid > 0 else 999
+            result[symbol] = {"bid": bid, "ask": ask, "mid": mid, "spread_pct": spread_pct}
+    return result
+
+def score_option(pred, contract, quote):
+    if not pred or not contract or not quote: return 0
+    score = 0.0
+    score += min(30, max(0, (pred["confidence"] - 0.50) * 100) * 0.75)
+    score += min(15, max(0, (pred["auc"] - 0.50) * 100) * 0.75)
+    sp_pct = quote["spread_pct"]
+    if sp_pct <= 0.05: score += 20
+    elif sp_pct <= 0.08: score += 16
+    elif sp_pct <= 0.12: score += 10
+    elif sp_pct <= MAX_SPREAD_PERCENT: score += 4
+    else: return 0
+    if quote["mid"] < MIN_OPTION_PREMIUM: return 0
+    score += 8 if quote["mid"] >= 1 else 5 if quote["mid"] >= 0.50 else 2
+    score += 8 if abs(pred["momentum"]) >= 0.004 else 5 if abs(pred["momentum"]) >= 0.002 else 1
+    score += 8 if pred["volume_z"] >= 2 else 5 if pred["volume_z"] >= 1 else 2
+    return int(max(0, min(100, round(score))))
+
+def choose_best_contract(symbol, signal, underlying_price):
+    today = now_ny().date().isoformat()
+    option_type = "call" if signal == "CALL" else "put"
+    contracts = get_option_contracts(symbol, option_type, today)
+    if not contracts: return None
+    candidates = []
+    for c in contracts:
+        try:
+            strike = float(c.get("strike_price"))
+        except Exception:
+            continue
+        if not c.get("tradable", True): continue
+        if symbol == "SPX":
+            root = str(c.get("root_symbol", "")).upper()
+            c_sym = str(c.get("symbol", "")).upper()
+            if "SPXW" not in root and "SPXW" not in c_sym: continue
+        distance = abs(strike - underlying_price)
+        if distance > MAX_STRIKE_DISTANCE: continue
+        candidates.append((distance, c))
+    if not candidates: return None
+    candidates.sort(key=lambda x: x[0])
+    selected = [c for _, c in candidates[:25]]
+    quotes = get_option_quotes([c.get("symbol") for c in selected if c.get("symbol")])
+    best, best_score = None, -999
+    for c in selected:
+        sym = c.get("symbol")
+        if sym not in quotes: continue
+        q = quotes[sym]
+        if q["mid"] < MIN_OPTION_PREMIUM or q["spread_pct"] > MAX_SPREAD_PERCENT: continue
+        distance = abs(float(c["strike_price"]) - underlying_price)
+        candidate_score = (20 - min(20, q["spread_pct"] * 100)) - (distance / max(underlying_price, 1) * 100)
+        if candidate_score > best_score:
+            best_score = candidate_score
+            best = {"contract": c, "quote": q}
+    return best
+
+def build_opportunity(symbol, display_symbol, pred):
+    if not pred or pred["signal"] not in ("CALL", "PUT"): return None
+    contract_data = choose_best_contract(symbol, pred["signal"], pred["price"])
+    if not contract_data: return None
+    contract, quote = contract_data["contract"], contract_data["quote"]
+    score = score_option(pred, contract, quote)
+    if score < MIN_OPTION_SCORE: return None
+    entry = quote["mid"]
+    return {
+        "symbol": display_symbol, "signal": pred["signal"], "confidence": pred["confidence"],
+        "price": pred["price"], "auc": pred["auc"], "regime": pred["regime"], "score": score,
+        "contract_symbol": contract.get("symbol", "UNKNOWN"), "strike": float(contract.get("strike_price", 0)),
+        "expiration": contract.get("expiration_date", ""), "entry": entry, "target": entry * 1.40, "stop": entry * 0.70,
+        "bid": quote["bid"], "ask": quote["ask"], "spread_pct": quote["spread_pct"]
+    }
+
+def market_consensus(predictions):
+    valid = [p for p in predictions if p is not None]
+    if not valid: return {"bias": "NEUTRAL", "strength": 0}
+    call_c = sum(1 for p in valid if p["signal"] == "CALL")
+    put_c = sum(1 for p in valid if p["signal"] == "PUT")
+    call_p = np.mean([p["p_up"] for p in valid])
+    put_p = np.mean([p["p_down"] for p in valid])
+    if call_c > put_c: return {"bias": "BULLISH", "strength": float(call_p)}
+    if put_c > call_c: return {"bias": "BEARISH", "strength": float(put_p)}
+    return {"bias": "NEUTRAL", "strength": float(max(call_p, put_p))}
+
+def format_opportunity(o, rank):
+    emoji = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉"
+    sig_emoji = "🟢" if o["signal"] == "CALL" else "🔴"
+    return (
+        f"{emoji} <b>{o['symbol']} {sig_emoji} {o['signal']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 القوة: <b>{o['score']}/100</b> | الثقة: <b>{o['confidence']*100:.1f}%</b>\n"
+        f"📊 AUC: {o['auc']:.2f} | السعر: <b>${o['price']:.2f}</b>\n"
+        f"🎯 السترايك: <b>{o['strike']:.2f}</b>\n"
+        f"📜 العقد: <code>{o['contract_symbol']}</code>\n"
+        f"💰 دخول: <b>${o['entry']:.2f}</b> | الهدف: <b>${o['target']:.2f}</b> | الوقف: <b>${o['stop']:.2f}</b>\n"
+        f"↔️ السبريد: {o['spread_pct']*100:.1f}% | 🌡️ النظام: {o['regime']}\n"
+    )
+
+def is_duplicate(o):
+    key = f"{o['contract_symbol']}_{o['signal']}"
+    now = time.time()
+    if key in STATE["last_sent"] and (now - STATE["last_sent"][key]) / 60 < SIGNAL_COOLDOWN_MINUTES:
+        return True
+    STATE["last_sent"][key] = now
+    return False
+
 def main():
     log(f"SPX & STOCKS AI ADVISOR {VERSION} STARTING")
     if not ALPACA_API_KEY or not TELEGRAM_BOT_TOKEN:
         log("Missing API keys or tokens.")
         return
-    telegram_send(f"🤖 <b>AI ADVISOR {VERSION}</b>\n\n🚀 بدأ التشغيل واستقرار الخادم بنجاح.")
+    telegram_send(f"🤖 <b>AI ADVISOR {VERSION}</b>\n\n🚀 بدأ التشغيل الكامل وفحص الأوبشن بنجاح.")
     
+    cycle = 0
     while True:
+        cycle += 1
+        log(f"\n========== SCAN #{cycle} ==========")
         try:
+            market_ok, reason = market_open_now()
+            if not market_ok:
+                log(f"[MARKET] WAIT | {reason}")
+                time.sleep(POLL_SECONDS)
+                continue
+
             frames = fetch_all_bars(ALL_SYMBOLS)
             spy = frames.get("SPY")
-            if spy is not None and not spy.empty:
-                log("Data fetched successfully. Loop running...")
+            qqq = frames.get("QQQ")
+            if spy is None or spy.empty:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            models = {}
+            spx = spy.copy()
+            for col in ["open", "high", "low", "close"]:
+                spx[col] *= 10
+            spx_feat = make_features(spx, market_df=spy, qqq_df=qqq)
+            spx_model = train_model(spx_feat)
+            if spx_model:
+                models["SPX"] = {"features": spx_feat, "model": spx_model}
+
+            for symbol in STOCKS:
+                df = frames.get(symbol)
+                if df is not None and not df.empty:
+                    feat = make_features(df, market_df=spy, qqq_df=qqq)
+                    model = train_model(feat)
+                    if model:
+                        models[symbol] = {"features": feat, "model": model}
+
+            if not models:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            predictions, pred_map = [], {}
+            for sym, info in models.items():
+                pred = predict(info["model"], info["features"])
+                if pred:
+                    pred_map[sym] = pred
+                    predictions.append(pred)
+
+            consensus = market_consensus(predictions)
+            opportunities = []
+
+            for sym, pred in pred_map.items():
+                if pred["signal"] in ("CALL", "PUT"):
+                    underlying = "SPX" if sym == "SPX" else sym
+                    opp = build_opportunity(underlying, sym, pred)
+                    if opp and not is_duplicate(opp):
+                        opportunities.append(opp)
+
+            opportunities.sort(key=lambda x: (x["score"], x["confidence"]), reverse=True)
+            opportunities = opportunities[:MAX_TELEGRAM_OPPORTUNITIES]
+
+            if opportunities:
+                msg_lines = [
+                    "🚨 <b>AI OPTIONS & SPX ALERT</b>",
+                    f"🕒 {now_ny().strftime('%H:%M:%S')} NY | الاتجاه: <b>{consensus['bias']}</b> ({consensus['strength']*100:.1f}%)\n",
+                ]
+                for i, o in enumerate(opportunities, 1):
+                    msg_lines.append(format_opportunity(o, i))
+                telegram_send("\n".join(msg_lines))
+                log(f"[TELEGRAM] Sent {len(opportunities)} opportunities.")
+            else:
+                log("No high-quality option opportunity. Telegram silent.")
+
         except Exception as e:
-            log(f"Error: {e}")
+            log(f"[MAIN ERROR] {e}")
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
