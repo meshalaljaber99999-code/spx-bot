@@ -1,19 +1,19 @@
 # ============================================================
-# SPX 0DTE AI ADVISOR v14.5
+# SPX 0DTE AI ADVISOR v14.6
 # ============================================================
 # Recommendation Only
 #
-# SPY 5m -> SPX Proxy -> Features -> ML Ensemble
-# -> Historical Training -> CALL / PUT / WAIT
+# SPY 5m -> SPX Proxy -> ML Ensemble
+# -> SPXW 0DTE Option Chain
+# -> CALL / PUT / WAIT
+# -> Entry / Target / Stop
 # -> Telegram
 #
-# لا يوجد تنفيذ أوامر.
+# NO ORDER EXECUTION
 # ============================================================
 
 import os
-import sys
 import time
-import json
 import warnings
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -33,24 +33,18 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ============================================================
 
-BOT_VERSION = "v14.5"
+VERSION = "v14.6"
 
 SPY_SYMBOL = "SPY"
 TIMEFRAME = "5Min"
 
 HISTORY_DAYS = 60
-
-# لا ننزل بهذا الرقم فقط لإجبار البوت على إصدار إشارات
 MIN_TRAIN_ROWS = 150
 
 HORIZON = 6
-
 ATR_TARGET = 0.50
 
 MIN_PROBABILITY = 0.57
-
-HIGH_VOL_THRESHOLD = 0.018
-LOW_VOL_THRESHOLD = 0.008
 
 SIGNAL_COOLDOWN_MINUTES = 20
 WAIT_MESSAGE_MINUTES = 15
@@ -60,26 +54,60 @@ POLL_SECONDS = 30
 NO_TRADE_FIRST_MIN = 10
 NO_TRADE_LAST_MIN = 30
 
-# عدد المحاولات عند بداية التشغيل
-STARTUP_RETRIES = 10
+OPTION_EXPIRY_DAYS = 0
 
-# إذا كان أقل من هذا، لا ندعي أن النموذج ممتاز
-MIN_REASONABLE_AUC = 0.50
+# عقد الأوبشن:
+OPTION_MAX_SPREAD_PERCENT = 15.0
+
+# لا نختار عقود بعيدة جدًا عن السعر
+MAX_STRIKE_DISTANCE = 40
+
+# الحد الأدنى التقريبي لسعر العقد
+MIN_OPTION_PREMIUM = 0.20
 
 
 # ============================================================
 # ENV
 # ============================================================
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_API_KEY = (
+    os.getenv("ALPACA_API_KEY")
+    or os.getenv("APCA_API_KEY_ID")
+    or ""
+)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ALPACA_SECRET_KEY = (
+    os.getenv("ALPACA_SECRET_KEY")
+    or os.getenv("APCA_API_SECRET_KEY")
+    or ""
+)
 
-DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+)
 
-NY = ZoneInfo("America/New_York")
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+)
+
+
+STOCK_DATA_URL = (
+    "https://data.alpaca.markets/v2/stocks/bars"
+)
+
+OPTIONS_CONTRACTS_URL = (
+    "https://paper-api.alpaca.markets/v2/options/contracts"
+)
+
+OPTIONS_LATEST_QUOTES_URL = (
+    "https://data.alpaca.markets/v1beta1/options/quotes/latest"
+)
+
+NY = ZoneInfo(
+    "America/New_York"
+)
 
 
 # ============================================================
@@ -88,14 +116,17 @@ NY = ZoneInfo("America/New_York")
 
 STATE = {
     "models": [],
-    "feature_columns": [],
     "auc": None,
+    "trained": False,
+
     "last_signal": None,
     "last_signal_time": None,
+
     "last_wait_time": None,
-    "trained": False,
+
+    "last_training_time": None,
+
     "last_training_rows": 0,
-    "last_data_update": None,
 }
 
 
@@ -104,8 +135,17 @@ STATE = {
 # ============================================================
 
 def log(message):
-    now = datetime.now(NY).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+
+    now = datetime.now(
+        NY
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    print(
+        f"[{now}] {message}",
+        flush=True
+    )
 
 
 # ============================================================
@@ -114,12 +154,17 @@ def log(message):
 
 def telegram_send(message):
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("[TELEGRAM] مفاتيح Telegram غير موجودة")
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        log(
+            "[TELEGRAM] credentials missing"
+        )
         return False
 
     url = (
-        f"https://api.telegram.org/bot"
+        "https://api.telegram.org/bot"
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
@@ -130,6 +175,7 @@ def telegram_send(message):
     }
 
     try:
+
         r = requests.post(
             url,
             json=payload,
@@ -139,11 +185,20 @@ def telegram_send(message):
         if r.ok:
             return True
 
-        log(f"[TELEGRAM ERROR] {r.status_code} {r.text[:300]}")
+        log(
+            f"[TELEGRAM ERROR] "
+            f"{r.status_code}: "
+            f"{r.text[:300]}"
+        )
+
         return False
 
     except Exception as e:
-        log(f"[TELEGRAM ERROR] {e}")
+
+        log(
+            f"[TELEGRAM ERROR] {e}"
+        )
+
         return False
 
 
@@ -152,83 +207,131 @@ def telegram_send(message):
 # ============================================================
 
 def now_ny():
-    return datetime.now(NY)
+
+    return datetime.now(
+        NY
+    )
 
 
 def iso_utc(dt):
 
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY)
+
+        dt = dt.replace(
+            tzinfo=NY
+        )
 
     return (
-        dt.astimezone(timezone.utc)
+        dt.astimezone(
+            timezone.utc
+        )
         .isoformat()
-        .replace("+00:00", "Z")
+        .replace(
+            "+00:00",
+            "Z"
+        )
     )
 
 
 # ============================================================
-# ALPACA HISTORICAL DATA
+# ALPACA HEADERS
+# ============================================================
+
+def alpaca_headers():
+
+    return {
+        "APCA-API-KEY-ID":
+            ALPACA_API_KEY,
+
+        "APCA-API-SECRET-KEY":
+            ALPACA_SECRET_KEY,
+    }
+
+
+# ============================================================
+# DOWNLOAD STOCK BARS
 # ============================================================
 
 def download_bars(
     symbol=SPY_SYMBOL,
     timeframe=TIMEFRAME,
-    days=None,
+    days=60,
     limit=10000
 ):
 
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        log("[DATA ERROR] ALPACA_API_KEY / ALPACA_SECRET_KEY غير موجودة")
+    if (
+        not ALPACA_API_KEY
+        or not ALPACA_SECRET_KEY
+    ):
+
+        log(
+            "[DATA ERROR] "
+            "Alpaca keys missing"
+        )
+
         return pd.DataFrame()
 
     end_dt = now_ny()
 
+    start_dt = (
+        end_dt
+        - timedelta(days=days)
+    )
+
     params = {
-        "symbols": symbol,
-        "timeframe": timeframe,
-        "limit": min(limit, 10000),
-        "feed": "iex",
-        "adjustment": "raw",
+
+        "symbols":
+            symbol,
+
+        "timeframe":
+            timeframe,
+
+        "start":
+            iso_utc(start_dt),
+
+        "end":
+            iso_utc(end_dt),
+
+        "limit":
+            min(limit, 10000),
+
+        "feed":
+            "iex",
+
+        "adjustment":
+            "raw",
     }
 
-    if days is not None:
-        start_dt = end_dt - timedelta(days=days)
-
-        params["start"] = iso_utc(start_dt)
-        params["end"] = iso_utc(end_dt)
-
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-    }
-
-    all_rows = []
+    rows = []
 
     page_token = None
 
-    max_pages = 20
-
     try:
 
-        for page in range(max_pages):
+        for _ in range(20):
 
-            request_params = dict(params)
+            p = dict(
+                params
+            )
 
             if page_token:
-                request_params["page_token"] = page_token
+
+                p[
+                    "page_token"
+                ] = page_token
 
             r = requests.get(
-                DATA_URL,
-                headers=headers,
-                params=request_params,
+                STOCK_DATA_URL,
+                headers=alpaca_headers(),
+                params=p,
                 timeout=30
             )
 
             if not r.ok:
 
                 log(
-                    f"[DATA ERROR] HTTP {r.status_code}: "
+                    f"[DATA ERROR] "
+                    f"{r.status_code}: "
                     f"{r.text[:500]}"
                 )
 
@@ -236,34 +339,35 @@ def download_bars(
 
             data = r.json()
 
-            bars = data.get("bars", {})
-
-            symbol_rows = bars.get(symbol, [])
-
-            if symbol_rows:
-                all_rows.extend(symbol_rows)
-
-            page_token = data.get("next_page_token")
-
-            if not page_token:
-                break
-
-            log(
-                f"[DATA] صفحة تاريخية إضافية: "
-                f"{page + 1}"
+            bars = data.get(
+                "bars",
+                {}
             )
 
-        if not all_rows:
+            symbol_rows = bars.get(
+                symbol,
+                []
+            )
 
-            log("[DATA] لم تصل أي شموع")
+            rows.extend(
+                symbol_rows
+            )
+
+            page_token = data.get(
+                "next_page_token"
+            )
+
+            if not page_token:
+
+                break
+
+        if not rows:
 
             return pd.DataFrame()
 
-        df = pd.DataFrame(all_rows)
-
-        if "t" not in df.columns:
-            log("[DATA ERROR] تنسيق البيانات غير متوقع")
-            return pd.DataFrame()
+        df = pd.DataFrame(
+            rows
+        )
 
         df = df.rename(
             columns={
@@ -273,23 +377,19 @@ def download_bars(
                 "l": "low",
                 "c": "close",
                 "v": "volume",
-                "n": "trade_count",
                 "vw": "vwap",
+                "n": "trade_count",
             }
         )
 
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"],
-            utc=True
+        df["timestamp"] = (
+            pd.to_datetime(
+                df["timestamp"],
+                utc=True
+            )
         )
 
-        df = df.sort_values("timestamp")
-
-        df = df.drop_duplicates(
-            subset=["timestamp"]
-        )
-
-        numeric_cols = [
+        numeric = [
             "open",
             "high",
             "low",
@@ -297,34 +397,43 @@ def download_bars(
             "volume",
         ]
 
-        for col in numeric_cols:
+        for col in numeric:
 
             if col in df.columns:
+
                 df[col] = pd.to_numeric(
                     df[col],
                     errors="coerce"
                 )
 
         df = df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
+            subset=numeric
+        )
+
+        df = df.sort_values(
+            "timestamp"
+        )
+
+        df = df.drop_duplicates(
+            "timestamp"
+        )
+
+        df = df.reset_index(
+            drop=True
         )
 
         log(
             f"[DATA] {symbol}: "
-            f"{len(df)} شمعة 5m تم تحميلها"
+            f"{len(df)} bars"
         )
 
-        return df.reset_index(drop=True)
+        return df
 
     except Exception as e:
 
-        log(f"[DATA ERROR] {e}")
+        log(
+            f"[DATA ERROR] {e}"
+        )
 
         return pd.DataFrame()
 
@@ -333,26 +442,16 @@ def download_bars(
 # LOCAL DATA
 # ============================================================
 
-LOCAL_FILE = "spx_advisor_data.csv"
+LOCAL_FILE = (
+    "spx_advisor_data.csv"
+)
 
 
-def save_local_data(df):
+def load_local():
 
-    try:
-        df.to_csv(
-            LOCAL_FILE,
-            index=False
-        )
-
-        STATE["last_data_update"] = now_ny()
-
-    except Exception as e:
-        log(f"[SAVE ERROR] {e}")
-
-
-def load_local_data():
-
-    if not os.path.exists(LOCAL_FILE):
+    if not os.path.exists(
+        LOCAL_FILE
+    ):
         return pd.DataFrame()
 
     try:
@@ -361,158 +460,175 @@ def load_local_data():
             LOCAL_FILE
         )
 
-        if "timestamp" in df.columns:
-
-            df["timestamp"] = pd.to_datetime(
+        df["timestamp"] = (
+            pd.to_datetime(
                 df["timestamp"],
                 utc=True
             )
+        )
 
         return df
 
+    except Exception:
+
+        return pd.DataFrame()
+
+
+def save_local(df):
+
+    try:
+
+        df.to_csv(
+            LOCAL_FILE,
+            index=False
+        )
+
     except Exception as e:
 
-        log(f"[LOAD ERROR] {e}")
-
-        return pd.DataFrame()
-
-
-# ============================================================
-# UPDATE DATABASE
-# ============================================================
-
-def update_local_database(initial=False):
-
-    if initial:
-
         log(
-            f"[DATA] جلب تاريخ {HISTORY_DAYS} يوم "
-            f"للتدريب الأول..."
+            f"[SAVE ERROR] {e}"
         )
 
-        df = download_bars(
-            symbol=SPY_SYMBOL,
-            timeframe=TIMEFRAME,
-            days=HISTORY_DAYS,
-            limit=10000
-        )
 
-    else:
+# ============================================================
+# UPDATE DATA
+# ============================================================
 
-        df = download_bars(
-            symbol=SPY_SYMBOL,
-            timeframe=TIMEFRAME,
-            days=7,
-            limit=5000
-        )
+def update_data(
+    initial=False
+):
+
+    days = (
+        HISTORY_DAYS
+        if initial
+        else 7
+    )
+
+    df = download_bars(
+        SPY_SYMBOL,
+        TIMEFRAME,
+        days=days
+    )
 
     if df.empty:
+
         return pd.DataFrame()
 
-    # ========================================================
-    # SPY -> SPX PROXY
-    # ========================================================
+    # --------------------------------------------------------
+    # SPY -> SPX proxy
+    # --------------------------------------------------------
 
-    df["spx_open"] = df["open"] * 10.0
-    df["spx_high"] = df["high"] * 10.0
-    df["spx_low"] = df["low"] * 10.0
-    df["spx_close"] = df["close"] * 10.0
+    df["spx_open"] = (
+        df["open"] * 10
+    )
 
-    df["spx_volume"] = df["volume"]
+    df["spx_high"] = (
+        df["high"] * 10
+    )
 
-    # ========================================================
-    # MERGE WITH LOCAL
-    # ========================================================
+    df["spx_low"] = (
+        df["low"] * 10
+    )
 
-    old = load_local_data()
+    df["spx_close"] = (
+        df["close"] * 10
+    )
+
+    df["spx_volume"] = (
+        df["volume"]
+    )
+
+    old = load_local()
 
     if not old.empty:
 
-        combined = pd.concat(
+        df = pd.concat(
             [old, df],
             ignore_index=True
         )
 
-    else:
-
-        combined = df
-
-    combined["timestamp"] = pd.to_datetime(
-        combined["timestamp"],
-        utc=True
+    df["timestamp"] = (
+        pd.to_datetime(
+            df["timestamp"],
+            utc=True
+        )
     )
 
-    combined = combined.sort_values(
+    df = df.sort_values(
         "timestamp"
     )
 
-    combined = combined.drop_duplicates(
-        subset=["timestamp"],
+    df = df.drop_duplicates(
+        "timestamp",
         keep="last"
     )
 
-    # Keep roughly 90 days locally
     cutoff = (
-        pd.Timestamp.now(tz="UTC")
-        - pd.Timedelta(days=90)
+        pd.Timestamp.now(
+            tz="UTC"
+        )
+        - pd.Timedelta(
+            days=90
+        )
     )
 
-    combined = combined[
-        combined["timestamp"] >= cutoff
+    df = df[
+        df["timestamp"]
+        >= cutoff
     ]
 
-    combined = combined.reset_index(drop=True)
-
-    save_local_data(combined)
-
-    log(
-        f"[DATA] إجمالي البيانات المحلية: "
-        f"{len(combined)} شمعة"
+    df = df.reset_index(
+        drop=True
     )
 
-    return combined
+    save_local(df)
+
+    return df
 
 
 # ============================================================
-# SESSION FILTER
+# REGULAR SESSION
 # ============================================================
 
 def regular_session(df):
 
     if df.empty:
+
         return df
 
     x = df.copy()
 
-    x["ny_time"] = (
+    ny = (
         x["timestamp"]
         .dt.tz_convert(NY)
     )
 
-    x["time_only"] = (
-        x["ny_time"].dt.hour * 60
-        + x["ny_time"].dt.minute
+    minutes = (
+        ny.dt.hour * 60
+        + ny.dt.minute
     )
 
-    start_min = 9 * 60 + 30
-    end_min = 16 * 60
+    start = (
+        9 * 60 + 30
+    )
+
+    end = (
+        16 * 60
+    )
 
     x = x[
-        (x["time_only"] >= start_min)
-        & (x["time_only"] <= end_min)
+        (minutes >= start)
+        & (minutes <= end)
     ]
 
-    return x.drop(
-        columns=["time_only"],
-        errors="ignore"
-    )
+    return x
 
 
 # ============================================================
 # RSI
 # ============================================================
 
-def calculate_rsi(series, period=14):
+def rsi(series, period=14):
 
     delta = series.diff()
 
@@ -532,44 +648,53 @@ def calculate_rsi(series, period=14):
         period
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
+    rs = (
+        avg_gain
+        / avg_loss.replace(
+            0,
+            np.nan
+        )
     )
 
-    rsi = 100 - (
-        100 / (1 + rs)
+    return (
+        100
+        - (
+            100
+            / (1 + rs)
+        )
     )
-
-    return rsi
 
 
 # ============================================================
 # ATR
 # ============================================================
 
-def calculate_atr(df, period=14):
+def atr(df, period=14):
 
-    high = df["spx_high"]
-    low = df["spx_low"]
-    close = df["spx_close"]
+    high = df[
+        "spx_high"
+    ]
 
-    prev_close = close.shift(1)
+    low = df[
+        "spx_low"
+    ]
 
-    tr1 = high - low
+    close = df[
+        "spx_close"
+    ]
 
-    tr2 = (
-        high - prev_close
-    ).abs()
-
-    tr3 = (
-        low - prev_close
-    ).abs()
+    prev = close.shift(1)
 
     tr = pd.concat(
-        [tr1, tr2, tr3],
+        [
+            high - low,
+            (high - prev).abs(),
+            (low - prev).abs(),
+        ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return tr.rolling(
         period
@@ -580,7 +705,8 @@ def calculate_atr(df, period=14):
 # FEATURES
 # ============================================================
 
-FEATURE_COLUMNS = [
+FEATURES = [
+
     "ret_1",
     "ret_3",
     "ret_6",
@@ -608,9 +734,14 @@ FEATURE_COLUMNS = [
 ]
 
 
-def prepare_features(df):
+# ============================================================
+# PREPARE
+# ============================================================
+
+def prepare(df):
 
     if df.empty:
+
         return pd.DataFrame()
 
     x = regular_session(
@@ -618,47 +749,41 @@ def prepare_features(df):
     )
 
     if len(x) < 100:
+
         return pd.DataFrame()
 
-    close = x["spx_close"]
+    close = x[
+        "spx_close"
+    ]
 
-    # --------------------------------------------------------
-    # Returns
-    # --------------------------------------------------------
-
-    x["ret_1"] = close.pct_change(1)
-
-    x["ret_3"] = close.pct_change(3)
-
-    x["ret_6"] = close.pct_change(6)
-
-    x["ret_12"] = close.pct_change(12)
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    x["rsi"] = calculate_rsi(
-        close,
-        14
+    x["ret_1"] = (
+        close.pct_change(1)
     )
 
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
+    x["ret_3"] = (
+        close.pct_change(3)
+    )
 
-    x["atr"] = calculate_atr(
-        x,
-        14
+    x["ret_6"] = (
+        close.pct_change(6)
+    )
+
+    x["ret_12"] = (
+        close.pct_change(12)
+    )
+
+    x["rsi"] = rsi(
+        close
+    )
+
+    x["atr"] = atr(
+        x
     )
 
     x["atr_pct"] = (
-        x["atr"] / close
+        x["atr"]
+        / close
     )
-
-    # --------------------------------------------------------
-    # Realized volatility
-    # --------------------------------------------------------
 
     x["vol_12"] = (
         x["ret_1"]
@@ -672,22 +797,20 @@ def prepare_features(df):
         .std()
     )
 
-    # --------------------------------------------------------
-    # Candle range
-    # --------------------------------------------------------
-
     x["range_pct"] = (
         x["spx_high"]
         - x["spx_low"]
     ) / close
 
-    # --------------------------------------------------------
-    # Moving averages
-    # --------------------------------------------------------
+    ma20 = (
+        close.rolling(20)
+        .mean()
+    )
 
-    ma20 = close.rolling(20).mean()
-
-    ma50 = close.rolling(50).mean()
+    ma50 = (
+        close.rolling(50)
+        .mean()
+    )
 
     x["close_vs_ma20"] = (
         close / ma20
@@ -697,17 +820,13 @@ def prepare_features(df):
         close / ma50
     ) - 1
 
-    # --------------------------------------------------------
-    # Volume Z
-    # --------------------------------------------------------
-
-    volume_mean = (
+    vm = (
         x["spx_volume"]
         .rolling(30)
         .mean()
     )
 
-    volume_std = (
+    vs = (
         x["spx_volume"]
         .rolling(30)
         .std()
@@ -715,48 +834,37 @@ def prepare_features(df):
 
     x["volume_z"] = (
         x["spx_volume"]
-        - volume_mean
-    ) / volume_std.replace(
+        - vm
+    ) / vs.replace(
         0,
         np.nan
     )
 
-    # --------------------------------------------------------
-    # Momentum
-    # --------------------------------------------------------
-
     x["momentum_3"] = (
         close
-        - close.shift(3)
-    ) / close.shift(3)
+        / close.shift(3)
+    ) - 1
 
     x["momentum_6"] = (
         close
-        - close.shift(6)
-    ) / close.shift(6)
+        / close.shift(6)
+    ) - 1
 
-    # --------------------------------------------------------
-    # Time
-    # --------------------------------------------------------
-
-    ny_time = (
+    ny = (
         x["timestamp"]
         .dt.tz_convert(NY)
     )
 
-    minutes = (
-        ny_time.dt.hour * 60
-        + ny_time.dt.minute
-    )
-
-    minutes_from_open = (
-        minutes - (9 * 60 + 30)
+    mins = (
+        ny.dt.hour * 60
+        + ny.dt.minute
+        - 570
     )
 
     angle = (
         2
         * np.pi
-        * minutes_from_open
+        * mins
         / 390
     )
 
@@ -771,44 +879,56 @@ def prepare_features(df):
     # ========================================================
     # TARGET
     # ========================================================
-    #
-    # 1 = السعر يضرب +0.5 ATR قبل -0.5 ATR
-    # 0 = السعر يضرب -0.5 ATR قبل +0.5 ATR
-    #
-    # إذا ضرب الاثنين داخل نفس الشمعة:
-    # نستبعدها حتى لا نخلق انحيازًا مصطنعًا.
-    # ========================================================
 
-    targets = []
+    target = []
 
-    for i in range(len(x)):
-
-        if i + HORIZON >= len(x):
-
-            targets.append(np.nan)
-
-            continue
-
-        entry = x["spx_close"].iloc[i]
-
-        atr = x["atr"].iloc[i]
+    for i in range(
+        len(x)
+    ):
 
         if (
-            not np.isfinite(entry)
-            or not np.isfinite(atr)
-            or atr <= 0
+            i + HORIZON
+            >= len(x)
         ):
 
-            targets.append(np.nan)
+            target.append(
+                np.nan
+            )
 
             continue
 
-        upper = entry + (
-            ATR_TARGET * atr
+        entry = float(
+            x["spx_close"]
+            .iloc[i]
         )
 
-        lower = entry - (
-            ATR_TARGET * atr
+        current_atr = float(
+            x["atr"].iloc[i]
+        )
+
+        if (
+            not np.isfinite(
+                current_atr
+            )
+            or current_atr <= 0
+        ):
+
+            target.append(
+                np.nan
+            )
+
+            continue
+
+        upper = (
+            entry
+            + ATR_TARGET
+            * current_atr
+        )
+
+        lower = (
+            entry
+            - ATR_TARGET
+            * current_atr
         )
 
         result = np.nan
@@ -821,55 +941,57 @@ def prepare_features(df):
             )
         ):
 
-            hi = x["spx_high"].iloc[j]
-            lo = x["spx_low"].iloc[j]
+            hi = float(
+                x["spx_high"]
+                .iloc[j]
+            )
 
-            hit_up = hi >= upper
-            hit_down = lo <= lower
+            lo = float(
+                x["spx_low"]
+                .iloc[j]
+            )
 
-            if hit_up and hit_down:
+            up = (
+                hi >= upper
+            )
+
+            down = (
+                lo <= lower
+            )
+
+            # Ambiguous candle
+            if up and down:
 
                 result = np.nan
                 break
 
-            if hit_up:
+            if up:
 
                 result = 1
                 break
 
-            if hit_down:
+            if down:
 
                 result = 0
                 break
 
-        targets.append(result)
+        target.append(
+            result
+        )
 
-    x["target"] = targets
+    x["target"] = target
 
     return x
 
 
 # ============================================================
-# TRAIN ENSEMBLE
+# TRAIN
 # ============================================================
 
-def train_ensemble(df):
-
-    if df.empty:
-
-        log(
-            "[TRAIN] لا توجد بيانات"
-        )
-
-        return False
-
-    required = (
-        FEATURE_COLUMNS
-        + ["target"]
-    )
+def train(df):
 
     work = df.dropna(
-        subset=required
+        subset=FEATURES + ["target"]
     ).copy()
 
     work = work.replace(
@@ -878,21 +1000,17 @@ def train_ensemble(df):
     )
 
     work = work.dropna(
-        subset=required
+        subset=FEATURES + ["target"]
     )
 
     if len(work) < MIN_TRAIN_ROWS:
 
         log(
-            "[TRAIN] بيانات غير كافية: "
+            f"[TRAIN] "
             f"{len(work)}/{MIN_TRAIN_ROWS}"
         )
 
         return False
-
-    # ========================================================
-    # TIME ORDERED SPLIT
-    # ========================================================
 
     n = len(work)
 
@@ -900,49 +1018,33 @@ def train_ensemble(df):
         n * 0.60
     )
 
-    val_end = int(
+    test_start = int(
         n * 0.80
     )
 
-    train = work.iloc[
+    train_df = work.iloc[
         :train_end
     ]
 
-    val = work.iloc[
-        train_end:val_end
+    test_df = work.iloc[
+        test_start:
     ]
 
-    test = work.iloc[
-        val_end:
+    X_train = train_df[
+        FEATURES
     ]
 
-    X_train = train[
-        FEATURE_COLUMNS
-    ]
-
-    y_train = train[
+    y_train = train_df[
         "target"
     ].astype(int)
 
-    X_val = val[
-        FEATURE_COLUMNS
+    X_test = test_df[
+        FEATURES
     ]
 
-    y_val = val[
+    y_test = test_df[
         "target"
     ].astype(int)
-
-    X_test = test[
-        FEATURE_COLUMNS
-    ]
-
-    y_test = test[
-        "target"
-    ].astype(int)
-
-    # ========================================================
-    # CHECK BOTH CLASSES
-    # ========================================================
 
     if (
         y_train.nunique() < 2
@@ -950,37 +1052,39 @@ def train_ensemble(df):
     ):
 
         log(
-            "[TRAIN] لا توجد فئتان كافيتان "
-            "CALL/PUT في البيانات"
+            "[TRAIN] "
+            "not enough target classes"
         )
 
         return False
 
     models = []
 
-    seeds = [
+    for seed in [
         11,
         29,
         71,
-    ]
-
-    for seed in seeds:
-
-        base = HistGradientBoostingClassifier(
-            learning_rate=0.045,
-            max_iter=250,
-            max_leaf_nodes=15,
-            min_samples_leaf=15,
-            l2_regularization=1.0,
-            random_state=seed
-        )
+    ]:
 
         try:
 
-            model = CalibratedClassifierCV(
-                base,
-                method="sigmoid",
-                cv=3
+            base = (
+                HistGradientBoostingClassifier(
+                    learning_rate=0.045,
+                    max_iter=250,
+                    max_leaf_nodes=15,
+                    min_samples_leaf=15,
+                    l2_regularization=1.0,
+                    random_state=seed,
+                )
+            )
+
+            model = (
+                CalibratedClassifierCV(
+                    base,
+                    method="sigmoid",
+                    cv=3,
+                )
             )
 
             model.fit(
@@ -995,92 +1099,87 @@ def train_ensemble(df):
         except Exception as e:
 
             log(
-                f"[TRAIN] فشل نموذج: {e}"
+                f"[TRAIN MODEL ERROR] {e}"
             )
 
     if not models:
 
-        log(
-            "[TRAIN] فشل تدريب جميع النماذج"
-        )
-
         return False
 
-    # ========================================================
-    # TEST AUC
-    # ========================================================
-
-    probabilities = []
+    predictions = []
 
     for model in models:
 
-        p = model.predict_proba(
-            X_test
-        )[:, 1]
+        predictions.append(
+            model.predict_proba(
+                X_test
+            )[:, 1]
+        )
 
-        probabilities.append(p)
-
-    mean_probability = np.mean(
-        probabilities,
+    probability = np.mean(
+        predictions,
         axis=0
     )
 
     try:
 
-        auc = roc_auc_score(
-            y_test,
-            mean_probability
+        auc_score = (
+            roc_auc_score(
+                y_test,
+                probability
+            )
         )
 
     except Exception:
 
-        auc = np.nan
-
-    # ========================================================
-    # SAVE STATE
-    # ========================================================
+        auc_score = np.nan
 
     STATE["models"] = models
 
-    STATE["feature_columns"] = (
-        FEATURE_COLUMNS.copy()
-    )
-
     STATE["auc"] = (
-        float(auc)
-        if np.isfinite(auc)
+        float(auc_score)
+        if np.isfinite(
+            auc_score
+        )
         else None
     )
 
     STATE["trained"] = True
 
-    STATE["last_training_rows"] = len(work)
+    STATE[
+        "last_training_rows"
+    ] = len(work)
+
+    STATE[
+        "last_training_time"
+    ] = now_ny()
 
     log(
-        f"[TRAIN] اكتمل التدريب | "
-        f"usable={len(work)} | "
-        f"test={len(test)} | "
-        f"AUC={auc:.3f}"
+        f"[TRAIN] DONE | "
+        f"rows={len(work)} | "
+        f"AUC={auc_score:.3f}"
     )
 
     telegram_send(
-        "🧠 SPX AI Advisor\n\n"
-        "✅ اكتمل التدريب\n"
+        "🧠 SPX AI Advisor\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✅ تم تدريب النموذج\n\n"
         f"📊 بيانات التدريب: {len(work)}\n"
-        f"🧪 Test AUC: {auc:.3f}\n\n"
-        "البوت الآن جاهز لتحليل السوق."
+        f"🧪 Test AUC: {auc_score:.3f}\n\n"
+        "جاهز لتحليل SPX."
     )
 
     return True
 
 
 # ============================================================
-# MARKET REGIME
+# REGIME
 # ============================================================
 
-def detect_market_regime(df):
+def regime(df):
 
     if df.empty:
+
         return "UNKNOWN"
 
     x = df.dropna(
@@ -1088,17 +1187,18 @@ def detect_market_regime(df):
     )
 
     if x.empty:
+
         return "UNKNOWN"
 
-    vol = float(
+    value = float(
         x["vol_24"].iloc[-1]
     )
 
-    if vol >= HIGH_VOL_THRESHOLD:
+    if value >= 0.018:
 
         return "HIGH_VOL"
 
-    if vol <= LOW_VOL_THRESHOLD:
+    if value <= 0.008:
 
         return "LOW_VOL"
 
@@ -1106,38 +1206,42 @@ def detect_market_regime(df):
 
 
 # ============================================================
-# SIGNAL
+# ML SIGNAL
 # ============================================================
 
-def calculate_signal(df):
+def ml_signal(df):
 
     if not STATE["trained"]:
 
         return {
             "signal": "WAIT",
             "probability": 0.50,
-            "reason": "النموذج لم يكتمل تدريبه",
+            "reason":
+                "النموذج غير جاهز",
         }
 
     x = df.dropna(
-        subset=FEATURE_COLUMNS
-    ).copy()
+        subset=FEATURES
+    )
 
     if x.empty:
 
         return {
             "signal": "WAIT",
             "probability": 0.50,
-            "reason": "لا توجد شمعة صالحة للتحليل",
+            "reason":
+                "لا توجد بيانات صالحة",
         }
 
     latest = x.iloc[
         [-1]
-    ][FEATURE_COLUMNS]
+    ][FEATURES]
 
-    probabilities = []
+    probs = []
 
-    for model in STATE["models"]:
+    for model in STATE[
+        "models"
+    ]:
 
         try:
 
@@ -1145,62 +1249,59 @@ def calculate_signal(df):
                 latest
             )[0][1]
 
-            probabilities.append(
+            probs.append(
                 float(p)
             )
 
         except Exception:
             pass
 
-    if not probabilities:
+    if not probs:
 
         return {
             "signal": "WAIT",
             "probability": 0.50,
-            "reason": "فشل حساب احتمالية النماذج",
+            "reason":
+                "فشل النموذج",
         }
 
-    probability = float(
-        np.mean(probabilities)
+    p_call = float(
+        np.mean(probs)
     )
 
-    regime = detect_market_regime(
+    p_put = (
+        1 - p_call
+    )
+
+    market_regime = regime(
         df
     )
 
-    threshold = MIN_PROBABILITY
+    threshold = (
+        0.60
+        if market_regime
+        == "HIGH_VOL"
+        else MIN_PROBABILITY
+    )
 
-    # في التقلب العالي نكون أكثر تحفظًا
-    if regime == "HIGH_VOL":
-
-        threshold = 0.60
-
-    # ========================================================
-    # DIRECTION
-    # ========================================================
-
-    if probability >= threshold:
+    if p_call >= threshold:
 
         signal = "CALL"
 
-        confidence = probability
+        confidence = p_call
 
         reason = (
-            f"النموذج يميل للصعود "
-            f"({probability:.1%})"
+            "النموذج يميل للصعود"
         )
 
-    elif probability <= (
-        1 - threshold
-    ):
+    elif p_put >= threshold:
 
         signal = "PUT"
 
-        confidence = 1 - probability
+        confidence = p_put
 
         reason = (
-            f"النموذج يميل للهبوط "
-            f"({1-probability:.1%})"
+            "النموذج يميل للهبوط"
         )
 
     else:
@@ -1208,157 +1309,620 @@ def calculate_signal(df):
         signal = "WAIT"
 
         confidence = max(
-            probability,
-            1 - probability
+            p_call,
+            p_put
         )
 
         reason = (
-            f"الاحتمالية غير كافية "
-            f"(CALL={probability:.1%})"
+            "الاحتمالية غير كافية"
         )
 
     return {
-        "signal": signal,
-        "probability": probability,
-        "confidence": confidence,
-        "regime": regime,
-        "reason": reason,
+
+        "signal":
+            signal,
+
+        "p_call":
+            p_call,
+
+        "p_put":
+            p_put,
+
+        "probability":
+            p_call,
+
+        "confidence":
+            confidence,
+
+        "regime":
+            market_regime,
+
+        "reason":
+            reason,
     }
 
 
 # ============================================================
-# MARKET TIME FILTER
+# MARKET TIME
 # ============================================================
 
-def trading_window_status():
+def market_open_now():
 
     now = now_ny()
 
-    minutes = (
+    mins = (
         now.hour * 60
         + now.minute
     )
 
-    market_open = (
+    open_min = (
         9 * 60 + 30
     )
 
-    market_close = (
+    close_min = (
         16 * 60
     )
 
-    if minutes < market_open:
+    if mins < open_min:
 
-        return False, "السوق لم يفتح بعد"
+        return False, (
+            "السوق لم يفتح بعد"
+        )
 
-    if minutes >= market_close:
+    if mins >= close_min:
 
-        return False, "السوق مغلق"
+        return False, (
+            "السوق مغلق"
+        )
 
-    from_open = (
-        minutes - market_open
-    )
+    if (
+        mins
+        - open_min
+        < NO_TRADE_FIRST_MIN
+    ):
 
-    to_close = (
-        market_close - minutes
-    )
-
-    if from_open < NO_TRADE_FIRST_MIN:
-
-        return (
-            False,
+        return False, (
             "أول دقائق السوق"
         )
 
-    if to_close <= NO_TRADE_LAST_MIN:
+    if (
+        close_min
+        - mins
+        <= NO_TRADE_LAST_MIN
+    ):
 
-        return (
-            False,
+        return False, (
             "آخر دقائق السوق"
         )
 
-    return True, "داخل نافذة التداول"
-
-
-# ============================================================
-# SPX PRICE
-# ============================================================
-
-def current_spx(df):
-
-    if df.empty:
-        return np.nan
-
-    return float(
-        df["spx_close"].iloc[-1]
+    return True, (
+        "السوق مفتوح"
     )
 
 
 # ============================================================
-# RECOMMENDATION
+# OPTION CHAIN
 # ============================================================
 
-def send_signal(
-    signal_data,
-    df
+def get_spxw_contracts(
+    signal,
+    underlying_price
 ):
 
-    signal = signal_data["signal"]
-
-    if signal == "WAIT":
-
-        return False
-
-    spx = current_spx(df)
-
-    if not np.isfinite(spx):
-
-        return False
-
-    atr = float(
-        df["atr"].iloc[-1]
+    expiry = (
+        now_ny()
+        .date()
+        .isoformat()
     )
 
-    if not np.isfinite(atr) or atr <= 0:
-
-        return False
-
-    confidence = (
-        signal_data["confidence"]
+    contract_type = (
+        "call"
+        if signal == "CALL"
+        else "put"
     )
 
-    # ========================================================
-    # SUGGESTED LEVELS
-    # ========================================================
+    params = {
+
+        "underlying_symbols":
+            "SPX",
+
+        "status":
+            "active",
+
+        "expiration_date":
+            expiry,
+
+        "type":
+            contract_type,
+
+        "limit":
+            100,
+
+        "root_symbol":
+            "SPX",
+    }
+
+    try:
+
+        r = requests.get(
+            OPTIONS_CONTRACTS_URL,
+            headers=alpaca_headers(),
+            params=params,
+            timeout=20
+        )
+
+        if not r.ok:
+
+            log(
+                f"[OPTIONS] "
+                f"HTTP {r.status_code}: "
+                f"{r.text[:300]}"
+            )
+
+            return []
+
+        data = r.json()
+
+        contracts = data.get(
+            "option_contracts",
+            data.get(
+                "contracts",
+                []
+            )
+        )
+
+        if not contracts:
+
+            return []
+
+        selected = []
+
+        for c in contracts:
+
+            symbol = (
+                c.get("symbol")
+                or c.get(
+                    "tradingsymbol"
+                )
+            )
+
+            strike = c.get(
+                "strike_price"
+            )
+
+            if (
+                symbol is None
+                or strike is None
+            ):
+                continue
+
+            try:
+
+                strike = float(
+                    strike
+                )
+
+            except Exception:
+
+                continue
+
+            distance = abs(
+                strike
+                - underlying_price
+            )
+
+            if (
+                distance
+                <= MAX_STRIKE_DISTANCE
+            ):
+
+                selected.append(
+                    {
+                        "symbol":
+                            symbol,
+
+                        "strike":
+                            strike,
+
+                        "type":
+                            contract_type,
+
+                        "expiration":
+                            expiry,
+                    }
+                )
+
+        return selected
+
+    except Exception as e:
+
+        log(
+            f"[OPTIONS ERROR] {e}"
+        )
+
+        return []
+
+
+# ============================================================
+# OPTION QUOTE
+# ============================================================
+
+def get_option_quote(
+    symbols
+):
+
+    if not symbols:
+
+        return {}
+
+    params = {
+        "symbols":
+            ",".join(symbols)
+    }
+
+    try:
+
+        r = requests.get(
+            OPTIONS_LATEST_QUOTES_URL,
+            headers=alpaca_headers(),
+            params=params,
+            timeout=20
+        )
+
+        if not r.ok:
+
+            log(
+                f"[OPTION QUOTE] "
+                f"HTTP {r.status_code}"
+            )
+
+            return {}
+
+        data = r.json()
+
+        quotes = data.get(
+            "quotes",
+            {}
+        )
+
+        result = {}
+
+        for symbol, q in quotes.items():
+
+            bid = q.get(
+                "bp",
+                q.get(
+                    "bid_price",
+                    0
+                )
+            )
+
+            ask = q.get(
+                "ap",
+                q.get(
+                    "ask_price",
+                    0
+                )
+            )
+
+            try:
+
+                bid = float(
+                    bid or 0
+                )
+
+                ask = float(
+                    ask or 0
+                )
+
+            except Exception:
+
+                continue
+
+            if bid > 0 and ask > 0:
+
+                mid = (
+                    bid + ask
+                ) / 2
+
+                spread = (
+                    (ask - bid)
+                    / mid
+                    * 100
+                )
+
+                result[symbol] = {
+
+                    "bid": bid,
+
+                    "ask": ask,
+
+                    "mid": mid,
+
+                    "spread_pct":
+                        spread,
+                }
+
+        return result
+
+    except Exception as e:
+
+        log(
+            f"[OPTION QUOTE ERROR] {e}"
+        )
+
+        return {}
+
+
+# ============================================================
+# SELECT OPTION
+# ============================================================
+
+def select_option(
+    signal,
+    spx_price
+):
+
+    contracts = (
+        get_spxw_contracts(
+            signal,
+            spx_price
+        )
+    )
+
+    if not contracts:
+
+        return None
+
+    symbols = [
+        c["symbol"]
+        for c in contracts
+    ]
+
+    quotes = (
+        get_option_quote(
+            symbols
+        )
+    )
+
+    candidates = []
+
+    for c in contracts:
+
+        q = quotes.get(
+            c["symbol"]
+        )
+
+        if not q:
+
+            continue
+
+        if (
+            q["mid"]
+            < MIN_OPTION_PREMIUM
+        ):
+
+            continue
+
+        if (
+            q["spread_pct"]
+            > OPTION_MAX_SPREAD_PERCENT
+        ):
+
+            continue
+
+        distance = abs(
+            c["strike"]
+            - spx_price
+        )
+
+        score = (
+            distance
+            + q["spread_pct"]
+            * 0.15
+        )
+
+        item = dict(c)
+
+        item.update(q)
+
+        item["score"] = score
+
+        candidates.append(
+            item
+        )
+
+    if not candidates:
+
+        return None
+
+    candidates.sort(
+        key=lambda x:
+            x["score"]
+    )
+
+    return candidates[0]
+
+
+# ============================================================
+# OPTION LEVELS
+# ============================================================
+
+def option_levels(
+    option,
+    signal
+):
+
+    if not option:
+
+        return None
+
+    entry = float(
+        option["mid"]
+    )
 
     if signal == "CALL":
 
-        target = spx + (
-            ATR_TARGET * atr
+        target = (
+            entry * 1.35
         )
 
-        stop = spx - (
-            0.35 * atr
+        stop = (
+            entry * 0.70
         )
-
-        direction = "🟢 CALL"
 
     else:
 
-        target = spx - (
-            ATR_TARGET * atr
+        target = (
+            entry * 1.35
         )
 
-        stop = spx + (
-            0.35 * atr
+        stop = (
+            entry * 0.70
         )
 
-        direction = "🔴 PUT"
+    return {
 
-    # تقريب strike إلى 5 نقاط
+        "entry":
+            entry,
+
+        "target":
+            target,
+
+        "stop":
+            stop,
+    }
+
+
+# ============================================================
+# SIGNAL COOLDOWN
+# ============================================================
+
+def can_send(signal):
+
+    if signal not in [
+        "CALL",
+        "PUT"
+    ]:
+
+        return False
+
+    if (
+        STATE["last_signal"]
+        is None
+    ):
+
+        return True
+
+    if signal != (
+        STATE["last_signal"]
+    ):
+
+        return True
+
+    if (
+        STATE["last_signal_time"]
+        is None
+    ):
+
+        return True
+
+    elapsed = (
+        now_ny()
+        - STATE[
+            "last_signal_time"
+        ]
+    ).total_seconds() / 60
+
+    return (
+        elapsed
+        >= SIGNAL_COOLDOWN_MINUTES
+    )
+
+
+# ============================================================
+# WAIT TELEGRAM
+# ============================================================
+
+def send_wait(
+    ml,
+    df,
+    reason=None,
+    force=False
+):
+
+    now = now_ny()
+
+    if not force:
+
+        last = (
+            STATE["last_wait_time"]
+        )
+
+        if last:
+
+            elapsed = (
+                now - last
+            ).total_seconds() / 60
+
+            if (
+                elapsed
+                < WAIT_MESSAGE_MINUTES
+            ):
+
+                return
+
+    spx = float(
+        df["spx_close"].iloc[-1]
+    )
+
+    atr_value = float(
+        df["atr"].iloc[-1]
+    )
+
+    p_call = ml.get(
+        "p_call",
+        0.5
+    )
+
+    p_put = ml.get(
+        "p_put",
+        0.5
+    )
+
+    if p_call > p_put:
+
+        expected = (
+            "🟢 صعود / CALL"
+        )
+
+    elif p_put > p_call:
+
+        expected = (
+            "🔴 هبوط / PUT"
+        )
+
+    else:
+
+        expected = (
+            "⚪ محايد"
+        )
+
     suggested_strike = (
         round(spx / 5)
         * 5
+    )
+
+    target_up = (
+        spx
+        + ATR_TARGET
+        * atr_value
+    )
+
+    target_down = (
+        spx
+        - ATR_TARGET
+        * atr_value
     )
 
     auc = STATE["auc"]
@@ -1370,221 +1934,291 @@ def send_signal(
     )
 
     message = (
-        "🚨 SPX 0DTE AI RECOMMENDATION\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"{direction}\n\n"
+        "⚪ SPX AI — WAIT\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
         f"📍 SPX Proxy: {spx:.2f}\n"
-        f"🎯 Suggested Strike: {suggested_strike}\n"
-        f"📈 Confidence: {confidence:.1%}\n"
-        f"🧪 Test AUC: {auc_text}\n"
-        f"🌡 Regime: {signal_data['regime']}\n\n"
-        f"🎯 Target: {target:.2f}\n"
-        f"🛑 Stop: {stop:.2f}\n\n"
-        f"🧠 السبب: {signal_data['reason']}\n\n"
+
+        f"📈 احتمال CALL: "
+        f"{p_call:.1%}\n"
+
+        f"📉 احتمال PUT: "
+        f"{p_put:.1%}\n\n"
+
+        f"🔮 التوقع المفضل: "
+        f"{expected}\n"
+
+        f"🎯 Strike المفضل: "
+        f"{suggested_strike}\n\n"
+
+        f"🌡 حالة السوق: "
+        f"{ml.get('regime', 'N/A')}\n"
+
+        f"🧪 Test AUC: "
+        f"{auc_text}\n\n"
+
+        f"🎯 هدف صعود SPX: "
+        f"{target_up:.2f}\n"
+
+        f"🎯 هدف هبوط SPX: "
+        f"{target_down:.2f}\n\n"
+
+        "💵 عقد 0DTE:\n"
+        "غير متاح حاليًا — "
+        "لم يتم العثور على Quote صالح.\n\n"
+
+        f"🧠 السبب: "
+        f"{reason or ml.get('reason')}\n\n"
+
+        "⏳ القرار الحالي: WAIT\n"
         "⚠️ توصية فقط — لا يوجد تنفيذ أوامر\n"
-        "⚠️ SPX محسوب تقريبيًا من SPY × 10"
+        "⚠️ SPX هنا Proxy من SPY × 10"
     )
 
-    telegram_send(message)
+    telegram_send(
+        message
+    )
 
-    STATE["last_signal"] = signal
+    STATE[
+        "last_wait_time"
+    ] = now
 
-    STATE["last_signal_time"] = now_ny()
+
+# ============================================================
+# SEND CALL / PUT
+# ============================================================
+
+def send_recommendation(
+    ml,
+    df
+):
+
+    signal = ml["signal"]
+
+    spx = float(
+        df["spx_close"].iloc[-1]
+    )
+
+    auc = STATE["auc"]
+
+    auc_text = (
+        f"{auc:.3f}"
+        if auc is not None
+        else "N/A"
+    )
+
+    option = select_option(
+        signal,
+        spx
+    )
+
+    levels = (
+        option_levels(
+            option,
+            signal
+        )
+        if option
+        else None
+    )
+
+    if signal == "CALL":
+
+        emoji = "🟢"
+
+    else:
+
+        emoji = "🔴"
+
+    strike = (
+        option["strike"]
+        if option
+        else round(spx / 5) * 5
+    )
+
+    if option and levels:
+
+        option_text = (
+            f"🎫 العقد: "
+            f"{option['symbol']}\n"
+            f"🎯 Strike: "
+            f"{strike:.0f}\n"
+            f"💵 Entry: "
+            f"${levels['entry']:.2f}\n"
+            f"🎯 Target: "
+            f"${levels['target']:.2f}\n"
+            f"🛑 Stop: "
+            f"${levels['stop']:.2f}\n"
+            f"📊 Bid/Ask: "
+            f"${option['bid']:.2f} / "
+            f"${option['ask']:.2f}\n"
+            f"↔️ Spread: "
+            f"{option['spread_pct']:.1f}%"
+        )
+
+    else:
+
+        option_text = (
+            "🎫 عقد 0DTE: "
+            "غير متاح حاليًا\n"
+            "لم يتم العثور على Quote "
+            "صالح من Alpaca."
+        )
+
+    message = (
+        "🚨 SPX 0DTE AI RECOMMENDATION\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"{emoji} {signal}\n\n"
+
+        f"📍 SPX Proxy: "
+        f"{spx:.2f}\n"
+
+        f"📈 Confidence: "
+        f"{ml['confidence']:.1%}\n"
+
+        f"🧪 Test AUC: "
+        f"{auc_text}\n"
+
+        f"🌡 Regime: "
+        f"{ml['regime']}\n\n"
+
+        f"{option_text}\n\n"
+
+        f"🧠 السبب: "
+        f"{ml['reason']}\n\n"
+
+        "⚠️ توصية فقط — "
+        "لا يوجد تنفيذ أوامر\n"
+
+        "⚠️ SPX Proxy محسوب من SPY × 10"
+    )
+
+    telegram_send(
+        message
+    )
+
+    STATE[
+        "last_signal"
+    ] = signal
+
+    STATE[
+        "last_signal_time"
+    ] = now_ny()
 
     log(
-        f"[SIGNAL] {signal} | "
-        f"confidence={confidence:.1%} | "
+        f"[SIGNAL] "
+        f"{signal} | "
+        f"confidence="
+        f"{ml['confidence']:.1%} | "
         f"SPX={spx:.2f}"
     )
 
-    return True
-
 
 # ============================================================
-# WAIT MESSAGE
+# STARTUP
 # ============================================================
 
-def maybe_send_wait(
-    reason,
-    force=False
-):
-
-    now = now_ny()
-
-    last = STATE["last_wait_time"]
-
-    if not force and last is not None:
-
-        elapsed = (
-            now - last
-        ).total_seconds() / 60
-
-        if elapsed < WAIT_MESSAGE_MINUTES:
-
-            return
-
-    message = (
-        "⚪ SPX AI — WAIT\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"السبب: {reason}\n\n"
-        "البوت يراقب السوق ولا يصدر "
-        "إشارة CALL/PUT إلا عند توفر "
-        "احتمالية كافية."
-    )
-
-    telegram_send(message)
-
-    STATE["last_wait_time"] = now
+def startup():
 
     log(
-        f"[WHY-WAIT] {reason}"
-    )
-
-
-# ============================================================
-# DUPLICATE SIGNAL FILTER
-# ============================================================
-
-def should_send_signal(signal):
-
-    if signal not in [
-        "CALL",
-        "PUT"
-    ]:
-
-        return False
-
-    last_signal = (
-        STATE["last_signal"]
-    )
-
-    last_time = (
-        STATE["last_signal_time"]
-    )
-
-    if (
-        last_signal is None
-        or last_time is None
-    ):
-
-        return True
-
-    if signal != last_signal:
-
-        return True
-
-    elapsed = (
-        now_ny() - last_time
-    ).total_seconds() / 60
-
-    return (
-        elapsed
-        >= SIGNAL_COOLDOWN_MINUTES
-    )
-
-
-# ============================================================
-# INITIAL DATA + TRAINING
-# ============================================================
-
-def initialize_model():
-
-    log(
-        f"SPX {BOT_VERSION} "
+        f"SPX {VERSION} "
         "— بدء التشغيل"
     )
 
     telegram_send(
-        f"🤖 SPX AI Advisor {BOT_VERSION}\n\n"
-        "بدأ التشغيل.\n"
-        "📚 جاري جلب البيانات التاريخية "
+        f"🤖 SPX AI Advisor {VERSION}\n\n"
+        "🚀 بدأ التشغيل\n"
+        "📚 جاري تحميل التاريخ "
         "وتدريب النموذج..."
     )
 
     for attempt in range(
         1,
-        STARTUP_RETRIES + 1
+        11
     ):
 
         log(
-            f"[STARTUP] محاولة {attempt}/"
-            f"{STARTUP_RETRIES}"
+            f"[STARTUP] "
+            f"محاولة {attempt}/10"
         )
 
-        df_raw = update_local_database(
+        raw = update_data(
             initial=True
         )
 
-        if df_raw.empty:
+        if raw.empty:
 
-            maybe_send_wait(
-                "تعذر جلب بيانات SPY من Alpaca",
+            send_wait(
+                {
+                    "p_call": 0.5,
+                    "p_put": 0.5,
+                    "regime":
+                        "UNKNOWN",
+                },
+                pd.DataFrame(
+                    {
+                        "spx_close": [],
+                        "atr": [],
+                    }
+                ),
+                "تعذر جلب البيانات",
                 force=(attempt == 1)
-            )
+            ) if False else None
 
             time.sleep(10)
 
             continue
 
-        df_prepared = prepare_features(
-            df_raw
+        prepared = prepare(
+            raw
         )
 
-        if df_prepared.empty:
+        if prepared.empty:
 
-            maybe_send_wait(
-                "البيانات وصلت لكن لا توجد "
-                "شموع كافية بعد تنظيفها",
-                force=(attempt == 1)
+            log(
+                "[STARTUP] "
+                "البيانات غير كافية بعد التنظيف"
             )
 
             time.sleep(10)
 
             continue
 
-        usable = df_prepared.dropna(
-            subset=FEATURE_COLUMNS + ["target"]
+        usable = prepared.dropna(
+            subset=FEATURES + ["target"]
         )
 
         log(
-            f"[STARTUP] raw={len(df_raw)} | "
-            f"prepared={len(df_prepared)} | "
+            f"[STARTUP] "
+            f"raw={len(raw)} | "
+            f"prepared={len(prepared)} | "
             f"usable={len(usable)}"
         )
 
-        if len(usable) < MIN_TRAIN_ROWS:
-
-            maybe_send_wait(
-                f"بيانات التدريب غير كافية: "
-                f"{len(usable)}/{MIN_TRAIN_ROWS}",
-                force=(attempt == 1)
-            )
+        if (
+            len(usable)
+            < MIN_TRAIN_ROWS
+        ):
 
             time.sleep(10)
 
             continue
 
-        if train_ensemble(
-            df_prepared
+        if train(
+            prepared
         ):
 
             log(
-                "[STARTUP] النموذج جاهز ✅"
+                "[STARTUP] "
+                "MODEL READY"
             )
 
             return True
 
-        time.sleep(10)
-
-    log(
-        "[STARTUP] فشل بناء النموذج "
-        "بعد عدة محاولات"
-    )
-
     telegram_send(
         "❌ SPX AI Advisor\n\n"
-        "تعذر بناء النموذج.\n"
-        "تحقق من مفاتيح Alpaca وبيانات السوق."
+        "فشل تدريب النموذج.\n"
+        "تحقق من بيانات Alpaca."
     )
 
     return False
@@ -1594,28 +2228,23 @@ def initialize_model():
 # LIVE LOOP
 # ============================================================
 
-def run_live():
+def live_loop():
 
     last_retrain = now_ny()
-
-    retrain_every_minutes = 60
 
     while True:
 
         try:
 
-            # ------------------------------------------------
-            # تحديث البيانات
-            # ------------------------------------------------
-
-            raw = update_local_database(
+            raw = update_data(
                 initial=False
             )
 
             if raw.empty:
 
-                maybe_send_wait(
-                    "لا توجد بيانات حديثة من Alpaca"
+                log(
+                    "[ANALYSIS] "
+                    "WAIT | no data"
                 )
 
                 time.sleep(
@@ -1624,16 +2253,12 @@ def run_live():
 
                 continue
 
-            prepared = prepare_features(
+            prepared = prepare(
                 raw
             )
 
             if prepared.empty:
 
-                maybe_send_wait(
-                    "لا توجد بيانات صالحة للتحليل"
-                )
-
                 time.sleep(
                     POLL_SECONDS
                 )
@@ -1641,41 +2266,41 @@ def run_live():
                 continue
 
             # ------------------------------------------------
-            # إعادة التدريب كل ساعة
+            # RETRAIN
             # ------------------------------------------------
 
-            elapsed_retrain = (
+            if (
                 now_ny()
                 - last_retrain
-            ).total_seconds() / 60
-
-            if (
-                elapsed_retrain
-                >= retrain_every_minutes
-            ):
+            ).total_seconds()
+            >= 3600:
 
                 log(
-                    "[TRAIN] إعادة تدريب دورية..."
+                    "[TRAIN] "
+                    "إعادة تدريب..."
                 )
 
-                if train_ensemble(
+                if train(
                     prepared
                 ):
 
-                    last_retrain = now_ny()
+                    last_retrain = (
+                        now_ny()
+                    )
 
             # ------------------------------------------------
-            # وقت السوق
+            # MARKET
             # ------------------------------------------------
 
             market_ok, reason = (
-                trading_window_status()
+                market_open_now()
             )
 
             if not market_ok:
 
-                maybe_send_wait(
-                    reason
+                log(
+                    f"[ANALYSIS] "
+                    f"WAIT | {reason}"
                 )
 
                 time.sleep(
@@ -1683,39 +2308,41 @@ def run_live():
                 )
 
                 continue
+
+            # ------------------------------------------------
+            # ML
+            # ------------------------------------------------
+
+            ml = ml_signal(
+                prepared
+            )
+
+            log(
+                f"[ANALYSIS] "
+                f"{ml['signal']} | "
+                f"CALL="
+                f"{ml.get('p_call', 0):.1%} | "
+                f"PUT="
+                f"{ml.get('p_put', 0):.1%} | "
+                f"regime="
+                f"{ml.get('regime')}"
+            )
 
             # ------------------------------------------------
             # SIGNAL
             # ------------------------------------------------
 
-            signal_data = calculate_signal(
-                prepared
-            )
-
-            signal = signal_data[
-                "signal"
-            ]
-
-            log(
-                f"[ANALYSIS] "
-                f"{signal} | "
-                f"prob="
-                f"{signal_data.get('probability', 0):.1%} | "
-                f"regime="
-                f"{signal_data.get('regime', 'N/A')}"
-            )
-
-            if signal in [
+            if ml["signal"] in [
                 "CALL",
                 "PUT"
             ]:
 
-                if should_send_signal(
-                    signal
+                if can_send(
+                    ml["signal"]
                 ):
 
-                    send_signal(
-                        signal_data,
+                    send_recommendation(
+                        ml,
                         prepared
                     )
 
@@ -1723,19 +2350,20 @@ def run_live():
 
                     log(
                         "[FILTER] "
-                        "تم منع تكرار نفس الإشارة"
+                        "duplicate signal"
                     )
 
             else:
 
-                maybe_send_wait(
-                    signal_data["reason"]
+                send_wait(
+                    ml,
+                    prepared
                 )
 
         except KeyboardInterrupt:
 
             log(
-                "إيقاف البوت..."
+                "إيقاف البوت"
             )
 
             break
@@ -1744,10 +2372,6 @@ def run_live():
 
             log(
                 f"[MAIN ERROR] {e}"
-            )
-
-            maybe_send_wait(
-                f"خطأ مؤقت: {str(e)[:150]}"
             )
 
         time.sleep(
@@ -1762,31 +2386,26 @@ def run_live():
 def main():
 
     if not ALPACA_API_KEY:
+
         log(
             "❌ ALPACA_API_KEY غير موجود"
         )
+
         return
 
     if not ALPACA_SECRET_KEY:
+
         log(
             "❌ ALPACA_SECRET_KEY غير موجود"
         )
-        return
-
-    initialize_ok = (
-        initialize_model()
-    )
-
-    if not initialize_ok:
-
-        log(
-            "البوت توقف لأن النموذج "
-            "لم يكتمل تدريبه."
-        )
 
         return
 
-    run_live()
+    if not startup():
+
+        return
+
+    live_loop()
 
 
 if __name__ == "__main__":
