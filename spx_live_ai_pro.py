@@ -1,5 +1,5 @@
 # ============================================================
-# SPX 0DTE ADVISOR v12.1 PRO INSTITUTIONAL - RAILWAY READY
+# SPX 0DTE ADVISOR v14.2 HONEST INSTITUTIONAL ENGINE
 # ============================================================
 
 import os
@@ -29,7 +29,6 @@ NY = ZoneInfo("America/New_York")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# قراءة مفاتيح Alpaca مباشرة من متغيرات البيئة في Railway بأمان تام
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "")
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "")
 APCA_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
@@ -42,13 +41,14 @@ NO_TRADE_LAST_MIN = 60
 MAX_BAR_AGE_MIN = 3
 
 LOCAL_DB_CSV = "local_market_db.csv"
-TRADES_CSV = "paper_trades_v12.csv"
+OPTIONS_DB_CSV = "local_options_premium_db.csv"
+TRADES_CSV = "paper_trades_v14_2.csv"
 
 MIN_TRAIN_ROWS = 600
-HORIZON = 6                        # 6 شموع × 5 دقائق = 30 دقيقة
+HORIZON = 6                        
 MAX_HOLD_BARS = 6
-MIN_PROBABILITY = 0.73
-MIN_AUC = 0.63
+MIN_PROBABILITY = 0.75
+MIN_AUC = 0.65
 RETRAIN_EVERY_MIN = 180
 
 ACCOUNT_EQUITY = 25000
@@ -64,7 +64,6 @@ STOP_LOSS_PCT = 0.35
 TAKE_PROFIT_PCT = 0.65
 MAX_HOLD_MINUTES = 30
 FORCE_EXIT_BEFORE_CLOSE_MIN = 10
-SLIPPAGE_PENALTY_PCT = 0.10
 
 STATE = {
     "models": {}, "auc": 0.0, "last_train": None,
@@ -73,7 +72,7 @@ STATE = {
 }
 
 # ============================================================
-# UTILITIES & ALPACA API OPTIONS CONNECTOR
+# UTILITIES & ALPACA OPTIONS CONNECTOR
 # ============================================================
 def now_ny():
     return datetime.now(NY)
@@ -121,16 +120,12 @@ def get_alpaca_headers():
     }
 
 def get_live_option_from_alpaca(underlying_price, option_type="call"):
-    """
-    سحب أسعار خيارات SPXW 0DTE الحقيقية من حسابك في Alpaca API مباشرة
-    """
     today_str = now_ny().strftime("%Y-%m-%d")
     contracts_url = f"https://data.alpaca.markets/v1beta1/options/contracts?underlying_symbol=SPX&expiration_date={today_str}"
     
     try:
         response = requests.get(contracts_url, headers=get_alpaca_headers(), timeout=10)
         if response.status_code != 200:
-            say(f"[Alpaca Error] Contracts fetch failed: {response.status_code}")
             return None
         
         contracts = response.json().get("option_contracts", [])
@@ -153,9 +148,15 @@ def get_live_option_from_alpaca(underlying_price, option_type="call"):
         target_contract = df_contracts.iloc[0]
         symbol = target_contract["symbol"]
         
-        snapshot_url = f"https://data.alpaca.markets/v1beta1/options/snapshots?symbols={symbol}"
+        return get_specific_option_snapshot(symbol, target_contract["strike_price"], option_type)
+    except Exception as e:
+        say(f"Alpaca Option Exception: {e}")
+        return None
+
+def get_specific_option_snapshot(symbol, strike, option_type):
+    snapshot_url = f"https://data.alpaca.markets/v1beta1/options/snapshots?symbols={symbol}"
+    try:
         snap_resp = requests.get(snapshot_url, headers=get_alpaca_headers(), timeout=10)
-        
         if snap_resp.status_code == 200:
             snap_data = snap_resp.json().get("snapshots", {}).get(symbol, {})
             latest_quote = snap_data.get("latestQuote", {})
@@ -164,28 +165,38 @@ def get_live_option_from_alpaca(underlying_price, option_type="call"):
             
             bid = latest_quote.get("bp", 0.0)
             ask = latest_quote.get("ap", 0.0)
-            mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else target_contract.get("close", 1.0)
+            mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 1.0
             
+            entry_execution_price = ask if ask > 0 else mid_price
+
+            record_option_premium(symbol, strike, option_type, bid, ask, mid_price, implied_vol, greeks)
+
             return {
-                "symbol": symbol,
-                "strike": target_contract["strike_price"],
-                "type": option_type,
-                "bid": bid,
-                "ask": ask,
-                "entry": mid_price * (1.0 + SLIPPAGE_PENALTY_PCT),
-                "iv": implied_vol,
-                "delta": greeks.get("delta", 0.0),
-                "gamma": greeks.get("gamma", 0.0),
-                "theta": greeks.get("theta", 0.0),
+                "symbol": symbol, "strike": strike, "type": option_type,
+                "bid": bid, "ask": ask, "entry": entry_execution_price,
+                "iv": implied_vol, "delta": greeks.get("delta", 0.0),
+                "gamma": greeks.get("gamma", 0.0), "theta": greeks.get("theta", 0.0),
                 "vega": greeks.get("vega", 0.0)
             }
     except Exception as e:
-        say(f"Alpaca Live Option Exception: {e}")
-        
+        say(f"Snapshot Exception for {symbol}: {e}")
     return None
 
+def record_option_premium(symbol, strike, opt_type, bid, ask, mid, iv, greeks):
+    row = {
+        "timestamp": now_ny().isoformat(), "symbol": symbol, "strike": strike, "type": opt_type,
+        "bid": bid, "ask": ask, "mid": mid, "iv": iv,
+        "delta": greeks.get("delta", 0.0), "gamma": greeks.get("gamma", 0.0), "theta": greeks.get("theta", 0.0)
+    }
+    file_exists = os.path.exists(OPTIONS_DB_CSV)
+    with open(OPTIONS_DB_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+
 # ============================================================
-# LOCAL DB ACCUMULATION
+# LOCAL DB & PREPARATION (WITH OPENING RANGE FIX)
 # ============================================================
 def _download_safe(symbol, period, interval):
     try:
@@ -241,9 +252,6 @@ def get_data():
     df = df[(t >= MARKET_OPEN_MIN) & (t < MARKET_CLOSE_MIN)]
     return df.dropna().reset_index(drop=True)
 
-# ============================================================
-# ADVANCED FEATURES & TRIPLE BARRIER METHOD
-# ============================================================
 def rsi(series, period=14):
     d = series.diff()
     g = d.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
@@ -271,9 +279,8 @@ def prepare(raw):
     
     df["realized_vol"] = c.pct_change().rolling(12).std() * sqrt(252 * 78) * 100
     df["vol_spread"] = df["vix"] - df["realized_vol"]
-    
-    # 🚨 تم إضافة حساب vix_chg_5 لتفادي خطأ KeyError نهائياً
     df["vix_chg_5"] = df["vix"].diff(5).fillna(0.0)
+    df["vix_acceleration"] = df["vix_chg_5"].diff(1).fillna(0.0)
 
     daily_high = df.groupby("date")["spx_high"].transform("max")
     daily_low = df.groupby("date")["spx_low"].transform("min")
@@ -289,13 +296,14 @@ def prepare(raw):
 
     df["mins_open"] = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute - MARKET_OPEN_MIN
 
-    is_first_30 = (df["mins_open"] >= 0) & (df["mins_open"] <= 30)
+    # 🚨 التصحيح الدقيق: استبعاد الدقيقة 30 تماماً لضبط أول 30 دقيقة (9:30 - 10:00)
+    is_first_30 = (df["mins_open"] >= 0) & (df["mins_open"] < 30)
     or_highs = df[is_first_30].groupby("date")["spx_high"].max().to_dict()
     or_lows = df[is_first_30].groupby("date")["spx_low"].min().to_dict()
 
     df["orh"] = df["date"].map(or_highs)
     df["orl"] = df["date"].map(or_lows)
-    df.loc[df["mins_open"] <= 30, ["orh", "orl"]] = np.nan
+    df.loc[df["mins_open"] < 30, ["orh", "orl"]] = np.nan
 
     df["dist_from_orh"] = np.where(df["orh"].notna(), (c - df["orh"]) / c, 0.0)
     df["dist_from_orl"] = np.where(df["orl"].notna(), (c - df["orl"]) / c, 0.0)
@@ -315,57 +323,46 @@ def prepare(raw):
         if i + HORIZON >= len(df) or dates[i] != dates[i + HORIZON]:
             targets.append(np.nan)
             continue
-        
         entry_price = closes[i]
         atr_val = atrs[i]
         upper_barrier = entry_price + (0.6 * atr_val)
         lower_barrier = entry_price - (0.4 * atr_val)
 
-        hit_upper = False
-        hit_lower = False
-
+        hit_upper, hit_lower = False, False
         for h in range(1, HORIZON + 1):
-            future_idx = i + h
-            bar_high = highs[future_idx]
-            bar_low = lows[future_idx]
+            f_idx = i + h
+            if highs[f_idx] >= upper_barrier:
+                hit_upper = True
+                break
+            if lows[f_idx] <= lower_barrier:
+                hit_lower = True
+                break
 
-            if not hit_upper and not hit_lower:
-                touched_up = bar_high >= upper_barrier
-                touched_dn = bar_low <= lower_barrier
-                if touched_up and not touched_dn:
-                    hit_upper = True
-                    break
-                elif touched_dn and not touched_up:
-                    hit_lower = True
-                    break
-                elif touched_up and touched_dn:
-                    hit_lower = True
-                    break
-
-        if hit_upper:
-            targets.append(1.0)
-        elif hit_lower:
-            targets.append(0.0)
-        else:
-            targets.append(np.nan)
-
+        if hit_upper: targets.append(1.0)
+        elif hit_lower: targets.append(0.0)
+        else: targets.append(np.nan)
+    
     df["target"] = targets
     return df
 
 # ============================================================
-# ENSEMBLE MODELS & MARKET REGIME FILTERING
+# ENSEMBLE MODELS & REGIME FILTER
 # ============================================================
 TREND_FEATURES = ["spx_ret_3", "spx_ret_6", "rsi", "atr_pct", "dist_from_orh", "dist_from_orl", "dist_prev_high"]
 MOMENTUM_FEATURES = ["spx_ret_1", "spy_ret_3", "spy_ret_6", "volume_zscore", "realized_vol"]
-VOLATILITY_FEATURES = ["vix", "vix_chg_5", "vol_spread", "mins_open"]
+VOLATILITY_FEATURES = ["vix", "vix_chg_5", "vix_acceleration", "vol_spread", "mins_open"]
 
 def detect_market_regime(df):
     if df is None or len(df) < 10:
         return "NORMAL"
     last_vix = df.iloc[-1]["vix"]
     last_atr = df.iloc[-1]["atr_pct"]
-    if last_vix > 24.0 or last_atr > 0.0035:
+    vix_accel = df.iloc[-1]["vix_acceleration"]
+    
+    if last_vix > 25.0 or last_atr > 0.0040:
         return "HIGH_VOLATILITY"
+    elif abs(vix_accel) > 0.5:
+        return "VOLATILITY_EXPANSION"
     elif last_vix < 13.0:
         return "LOW_VOL_CHOPPY"
     return "NORMAL"
@@ -400,22 +397,18 @@ def train_ensemble(df):
             aucs.append(roc_auc_score(test_df["target"], preds))
 
     mean_auc = float(np.mean(aucs)) if aucs else 0.5
-    say(f"Institutional Ensemble Trained. Test AUC = {mean_auc:.3f}")
+    say(f"Honest Institutional Ensemble Trained. Proxy AUC = {mean_auc:.3f}")
     return models, mean_auc
 
-# ============================================================
-# SIGNAL & LIVE TRADE MANAGEMENT
-# ============================================================
 def calculate_ensemble_signal(df, regime):
-    if regime == "LOW_VOL_CHOPPY":
+    if regime in ("LOW_VOL_CHOPPY", "VOLATILITY_EXPANSION"):
         return {"direction": "WAIT"}
 
     if df is None or len(df) < 50:
         return {"direction": "WAIT"}
     last = df.iloc[-1]
     
-    age = (now_ny() - last["timestamp"]).total_seconds() / 60
-    if age > MAX_BAR_AGE_MIN:
+    if (now_ny() - last["timestamp"]).total_seconds() / 60 > MAX_BAR_AGE_MIN:
         return {"direction": "WAIT"}
 
     if not STATE["models"] or STATE["auc"] < MIN_AUC:
@@ -437,12 +430,11 @@ def calculate_ensemble_signal(df, regime):
 
 def build_recommendation(df, regime):
     if not market_time_ok() or not session_allowed():
-        return {"status": "WAIT", "reason": "خارج النافذة المسموحة"}
-    
+        return {"status": "WAIT"}
     if STATE["daily_pnl"] <= -ACCOUNT_EQUITY * MAX_DAILY_LOSS:
-        return {"status": "WAIT", "reason": "بلوغ حد الخسارة اليومي"}
+        return {"status": "WAIT"}
     if STATE["loss_streak"] >= MAX_CONSECUTIVE_LOSSES:
-        return {"status": "WAIT", "reason": "توقف إجباري بسبب خسائر متتالية"}
+        return {"status": "WAIT"}
 
     sig = calculate_ensemble_signal(df, regime)
     if sig["direction"] == "WAIT":
@@ -452,10 +444,13 @@ def build_recommendation(df, regime):
     kind = sig["direction"]
 
     opt_data = get_live_option_from_alpaca(spot, option_type=kind.lower())
-    if not opt_data or opt_data["entry"] < MIN_PREMIUM:
-        return {"status": "WAIT", "reason": "عقد غير متاح أو البريميوم منخفض"}
+    if not opt_data:
+        return {"status": "WAIT"}
 
     entry = opt_data["entry"]
+    if entry < MIN_PREMIUM:
+        return {"status": "WAIT"}
+
     stop, target = entry * (1 - STOP_LOSS_PCT), entry * (1 + TAKE_PROFIT_PCT)
     contracts = int((ACCOUNT_EQUITY * RISK_PER_TRADE) / (entry * STOP_LOSS_PCT * 100))
     if contracts <= 0:
@@ -471,8 +466,8 @@ def build_recommendation(df, regime):
 
 def open_paper_trade(rec):
     STATE["open"] = rec
-    msg = (f"🏛️ SPX v12.1 ALPACA LIVE SIGNAL: {rec['status']} | الثقة: {rec['probability']*100:.1f}% | "
-           f"Symbol: {rec['symbol']} | Strike: {rec['strike']} | دخول: ${rec['entry']:.2f} | Delta: {rec['delta']:.2f}")
+    msg = (f"🏛️ SPX v14.2 ADVISOR: {rec['status']} | الثقة: {rec['probability']*100:.1f}% | "
+           f"Symbol: {rec['symbol']} | Strike: {rec['strike']} | دخول (Ask): ${rec['entry']:.2f} | Delta: {rec['delta']:.2f}")
     say(msg)
     send_telegram(msg)
 
@@ -481,8 +476,12 @@ def manage_open_trade(spot):
     if not t:
         return
     
-    opt_data = get_live_option_from_alpaca(spot, option_type=t["status"].lower())
-    prem = opt_data["entry"] if opt_data else t["entry"]
+    opt_data = get_specific_option_snapshot(t["symbol"], t["strike"], t["status"].lower())
+    
+    if opt_data:
+        prem = opt_data["bid"] if opt_data["bid"] > 0 else opt_data["entry"]
+    else:
+        prem = t["entry"]
     
     t["max_prem"] = max(t["max_prem"], prem)
     t["min_prem"] = min(t["min_prem"], prem)
@@ -503,42 +502,39 @@ def manage_open_trade(spot):
     if not reason:
         return
 
-    pnl = (prem - t["entry"]) * 100 * t["contracts"] - 2 * COMMISSION_PER_CONTRACT * t["contracts"]
+    pnl = (prem - t["entry"]) * 100 * t["contracts"] - (2 * COMMISSION_PER_CONTRACT * t["contracts"])
     STATE["daily_pnl"] += pnl
     STATE["loss_streak"] = STATE["loss_streak"] + 1 if pnl < 0 else 0
 
-    new_file = not os.path.exists(TRADES_CSV)
+    file_exists = os.path.exists(TRADES_CSV)
     with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if new_file:
-            w.writerow(["entry_time", "exit_time", "symbol", "kind", "strike", "entry_prem", "exit_prem", "contracts", "pnl", "reason"])
+        if not file_exists:
+            w.writerow(["entry_time", "exit_time", "symbol", "kind", "strike", "entry_ask", "exit_bid", "contracts", "pnl", "reason"])
         w.writerow([t["time"].isoformat(), now_ny().isoformat(), t["symbol"], t["status"], t["strike"],
                     round(t["entry"], 2), round(prem, 2), t["contracts"], round(pnl, 2), reason])
 
-    msg = f"🔔 خروج صفقة حي عبر Alpaca ({reason}) — PnL: ${pnl:+.0f} | اليومي: ${STATE['daily_pnl']:+.0f}"
+    msg = f"🔔 خروج التوصية ({reason}) — PnL: ${pnl:+.0f} | الرمز: {t['symbol']} | اليومي: ${STATE['daily_pnl']:+.0f}"
     say(msg)
     send_telegram(msg)
     STATE["open"] = None
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
-    say("SPX 0DTE v12.1 ALPACA LIVE OPTIONS — بدء التشغيل عبر Railway")
+    say("SPX v14.2 HONEST INSTITUTIONAL — بدء التشغيل مع إصلاح شمعة الـ Opening Range")
     reset_daily_state()
     
     df_raw = get_data()
     if df_raw is None or df_raw.empty:
-        raise RuntimeError("تعذر جلب البيانات.")
+        raise RuntimeError("تعذر جلب البيانات الأساسية.")
     
     df_prep = prepare(df_raw)
     regime = detect_market_regime(df_prep)
     STATE["regime"] = regime
-    say(f"حالة نظام السوق الحالي (Market Regime): {regime}")
+    say(f"حالة نظام السوق (Market Regime): {regime}")
 
     models, auc = train_ensemble(df_prep)
     STATE.update(models=models, auc=auc, last_train=now_ny())
-    say(f"النماذج جاهزة. AUC = {STATE['auc']:.3f}")
+    say(f"النماذج جاهزة. Proxy AUC = {STATE['auc']:.3f}")
 
     while True:
         try:
