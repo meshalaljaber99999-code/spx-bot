@@ -1,5 +1,5 @@
 # ============================================================
-# SPX 0DTE ADVISOR v12.0 PRO INSTITUTIONAL - RAILWAY READY
+# SPX 0DTE ADVISOR v12.1 PRO INSTITUTIONAL - RAILWAY READY
 # ============================================================
 
 import os
@@ -271,6 +271,9 @@ def prepare(raw):
     
     df["realized_vol"] = c.pct_change().rolling(12).std() * sqrt(252 * 78) * 100
     df["vol_spread"] = df["vix"] - df["realized_vol"]
+    
+    # 🚨 تم إضافة حساب vix_chg_5 لتفادي خطأ KeyError نهائياً
+    df["vix_chg_5"] = df["vix"].diff(5).fillna(0.0)
 
     daily_high = df.groupby("date")["spx_high"].transform("max")
     daily_low = df.groupby("date")["spx_low"].transform("min")
@@ -468,7 +471,7 @@ def build_recommendation(df, regime):
 
 def open_paper_trade(rec):
     STATE["open"] = rec
-    msg = (f"🏛️ SPX v12.0 ALPACA LIVE SIGNAL: {rec['status']} | الثقة: {rec['probability']*100:.1f}% | "
+    msg = (f"🏛️ SPX v12.1 ALPACA LIVE SIGNAL: {rec['status']} | الثقة: {rec['probability']*100:.1f}% | "
            f"Symbol: {rec['symbol']} | Strike: {rec['strike']} | دخول: ${rec['entry']:.2f} | Delta: {rec['delta']:.2f}")
     say(msg)
     send_telegram(msg)
@@ -521,7 +524,7 @@ def manage_open_trade(spot):
 # MAIN
 # ============================================================
 def main():
-    say("SPX 0DTE v12.0 ALPACA LIVE OPTIONS — بدء التشغيل عبر Railway")
+    say("SPX 0DTE v12.1 ALPACA LIVE OPTIONS — بدء التشغيل عبر Railway")
     reset_daily_state()
     
     df_raw = get_data()
