@@ -1,19 +1,27 @@
 # ============================================================
-# SPX & 10 STOCKS 0DTE AI ADVISOR / SCANNER v16.3
-# DIAGNOSTIC PRO / HONEST MODE
+# SPX 0DTE AI ADVISOR v17.0
+# SPXW FOCUS / PATIENT / DIAGNOSTIC / HONEST MODE
 # ============================================================
+#
 # Recommendation Only - NO ORDER EXECUTION
 #
-# v16.3 FIXES:
-# - Full Alpaca error diagnostics
-# - Data health diagnostics
-# - QQQ feature alignment fixed
-# - Detailed rejection reasons
+# v17.0:
+# - SPX/SPXW is the PRIMARY instrument
+# - Stocks are confirmation/context only
+# - No fake SPY x 10 SPX option pricing
+# - Explicit 0DTE diagnostics
+# - Better SPXW contract filtering
 # - Option quote diagnostics
-# - No false cooldown before Telegram send
-# - SPX proxy clearly identified as SPY x 10
-# - ML / AUC / option score transparency
-# - No silent failures
+# - Market confirmation from SPY / QQQ / stocks
+# - ML ensemble
+# - AUC transparency
+# - Confidence filter
+# - Momentum filter
+# - Market alignment filter
+# - Liquidity / spread filter
+# - Patience mode
+# - Telegram only for HIGH QUALITY opportunities
+# - No false cooldown
 # ============================================================
 
 import os
@@ -36,7 +44,7 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ============================================================
 
-VERSION = "v16.3-DIAGNOSTIC-PRO"
+VERSION = "v17.0-SPX-0DTE-FOCUS"
 
 NY = ZoneInfo("America/New_York")
 
@@ -47,25 +55,54 @@ MIN_TRAIN_ROWS = 150
 HORIZON = 6
 ATR_TARGET = 0.50
 
+# ------------------------------------------------------------
 # ML
-MIN_PROBABILITY = 0.62
+# ------------------------------------------------------------
 
+MIN_PROBABILITY = 0.64
+MIN_AUC = 0.55
+
+# ------------------------------------------------------------
+# SPX SIGNAL QUALITY
+# ------------------------------------------------------------
+
+MIN_SPX_SCORE = 78
+
+# Require multiple confirmations
+MIN_CONFIRMATIONS = 2
+
+# ------------------------------------------------------------
 # OPTIONS
-MIN_OPTION_SCORE = 75
-MAX_SPREAD_PERCENT = 0.15
-MIN_OPTION_PREMIUM = 0.20
-MAX_STRIKE_DISTANCE = 40
+# ------------------------------------------------------------
 
-# Runtime
+MAX_SPREAD_PERCENT = 0.12
+MIN_OPTION_PREMIUM = 0.50
+
+# Distance from SPX reference
+MAX_SPX_STRIKE_DISTANCE = 35
+
+# Avoid extremely cheap / far OTM contracts
+MIN_DELTA_PROXY = 0.20
+MAX_DELTA_PROXY = 0.80
+
+# ------------------------------------------------------------
+# RISK / PATIENCE
+# ------------------------------------------------------------
+
 SIGNAL_COOLDOWN_MINUTES = 20
 POLL_SECONDS = 30
-MAX_TELEGRAM_OPPORTUNITIES = 3
 
-# Market protection
+# No trade during unstable opening/closing periods
 NO_TRADE_FIRST_MIN = 10
 NO_TRADE_LAST_MIN = 30
 
-# Symbols
+# Require fresh market data
+MAX_DATA_AGE_MINUTES = 10
+
+# ------------------------------------------------------------
+# STOCKS USED AS CONFIRMATION
+# ------------------------------------------------------------
+
 STOCKS = [
     "NVDA",
     "AAPL",
@@ -79,11 +116,19 @@ STOCKS = [
     "NFLX",
 ]
 
-ALL_SYMBOLS = ["SPY", "QQQ"] + STOCKS
+MARKET_SYMBOLS = [
+    "SPY",
+    "QQQ",
+]
+
+ALL_SYMBOLS = (
+    MARKET_SYMBOLS +
+    STOCKS
+)
 
 
 # ============================================================
-# ENV
+# ENVIRONMENT
 # ============================================================
 
 ALPACA_API_KEY = (
@@ -98,15 +143,24 @@ ALPACA_SECRET_KEY = (
     or ""
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+)
 
 ALPACA_TRADING_URL = os.getenv(
     "ALPACA_TRADING_URL",
     "https://api.alpaca.markets"
 )
 
-ALPACA_DATA_URL = "https://data.alpaca.markets"
+ALPACA_DATA_URL = (
+    "https://data.alpaca.markets"
+)
 
 DATA_FEED = os.getenv(
     "ALPACA_DATA_FEED",
@@ -123,18 +177,21 @@ OPTIONS_LATEST_QUOTES_URL = (
 
 
 # ============================================================
-# GLOBAL STATE
+# GLOBAL
 # ============================================================
-
-STATE = {
-    "last_sent": {},
-}
 
 session = requests.Session()
 
 HEADERS = {
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+    "APCA-API-KEY-ID":
+        ALPACA_API_KEY,
+
+    "APCA-API-SECRET-KEY":
+        ALPACA_SECRET_KEY,
+}
+
+STATE = {
+    "last_sent": {}
 }
 
 
@@ -143,15 +200,25 @@ HEADERS = {
 # ============================================================
 
 def log(message):
-    now = datetime.now(NY).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+
+    now = datetime.now(
+        NY
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    print(
+        f"[{now}] {message}",
+        flush=True
+    )
 
 
-def log_section(title):
+def section(title):
+
     log("")
-    log("=" * 60)
+    log("=" * 72)
     log(title)
-    log("=" * 60)
+    log("=" * 72)
 
 
 # ============================================================
@@ -159,23 +226,40 @@ def log_section(title):
 # ============================================================
 
 def telegram_send(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("[TELEGRAM] Missing token/chat ID")
+
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+
+        log(
+            "[TELEGRAM] "
+            "Missing token/chat ID"
+        )
+
         return False
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "chat_id":
+            TELEGRAM_CHAT_ID,
+
+        "text":
+            message,
+
+        "parse_mode":
+            "HTML",
+
+        "disable_web_page_preview":
+            True,
     }
 
     try:
+
         r = session.post(
             url,
             json=payload,
@@ -186,14 +270,20 @@ def telegram_send(message):
             return True
 
         log(
-            f"[TELEGRAM ERROR] "
-            f"HTTP {r.status_code}: {r.text[:500]}"
+            "[TELEGRAM ERROR] "
+            f"HTTP {r.status_code}: "
+            f"{r.text[:500]}"
         )
 
         return False
 
     except Exception as e:
-        log(f"[TELEGRAM EXCEPTION] {e}")
+
+        log(
+            "[TELEGRAM EXCEPTION] "
+            f"{e}"
+        )
+
         return False
 
 
@@ -202,17 +292,29 @@ def telegram_send(message):
 # ============================================================
 
 def now_ny():
+
     return datetime.now(NY)
 
 
+def today_ny():
+
+    return now_ny().date().isoformat()
+
+
 def iso_utc(dt):
+
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY)
+        dt = dt.replace(
+            tzinfo=NY
+        )
 
     return (
         dt.astimezone(timezone.utc)
         .isoformat()
-        .replace("+00:00", "Z")
+        .replace(
+            "+00:00",
+            "Z"
+        )
     )
 
 
@@ -224,31 +326,71 @@ def market_open_now():
 
     now = now_ny()
 
-    mins = now.hour * 60 + now.minute
+    mins = (
+        now.hour * 60
+        +
+        now.minute
+    )
 
-    open_min = 9 * 60 + 30
-    close_min = 16 * 60
+    open_min = (
+        9 * 60 + 30
+    )
+
+    close_min = (
+        16 * 60
+    )
 
     if mins < open_min:
-        return False, "السوق لم يفتح بعد"
+
+        return (
+            False,
+            "السوق لم يفتح بعد"
+        )
 
     if mins >= close_min:
-        return False, "السوق مغلق"
 
-    if mins - open_min < NO_TRADE_FIRST_MIN:
-        return False, "أول دقائق السوق - حماية"
+        return (
+            False,
+            "السوق مغلق"
+        )
 
-    if close_min - mins <= NO_TRADE_LAST_MIN:
-        return False, "آخر دقائق السوق - حماية"
+    if (
+        mins - open_min
+        <
+        NO_TRADE_FIRST_MIN
+    ):
 
-    return True, "السوق مفتوح"
+        return (
+            False,
+            "أول دقائق السوق - حماية"
+        )
+
+    if (
+        close_min - mins
+        <=
+        NO_TRADE_LAST_MIN
+    ):
+
+        return (
+            False,
+            "آخر دقائق السوق - حماية"
+        )
+
+    return (
+        True,
+        "السوق مفتوح"
+    )
 
 
 # ============================================================
 # ALPACA GET
 # ============================================================
 
-def alpaca_get(url, params=None, timeout=30):
+def alpaca_get(
+    url,
+    params=None,
+    timeout=30
+):
 
     try:
 
@@ -256,41 +398,58 @@ def alpaca_get(url, params=None, timeout=30):
             url,
             headers=HEADERS,
             params=params,
-            timeout=timeout,
+            timeout=timeout
         )
 
         if r.status_code != 200:
 
             log(
-                f"[ALPACA ERROR] "
+                "[ALPACA ERROR] "
                 f"HTTP {r.status_code}"
             )
 
             try:
-                body = r.json()
+
                 log(
-                    f"[ALPACA ERROR BODY] "
-                    f"{body}"
+                    "[ALPACA BODY] "
+                    f"{r.json()}"
                 )
+
             except Exception:
+
                 log(
-                    f"[ALPACA ERROR TEXT] "
-                    f"{r.text[:800]}"
+                    "[ALPACA TEXT] "
+                    f"{r.text[:1000]}"
                 )
 
             return None
 
-        return r.json()
+        try:
+
+            return r.json()
+
+        except Exception as e:
+
+            log(
+                "[ALPACA JSON ERROR] "
+                f"{e}"
+            )
+
+            return None
 
     except requests.exceptions.Timeout:
 
-        log("[ALPACA ERROR] Request timeout")
+        log(
+            "[ALPACA ERROR] "
+            "Request timeout"
+        )
+
         return None
 
     except Exception as e:
 
         log(
-            f"[ALPACA EXCEPTION] "
+            "[ALPACA EXCEPTION] "
             f"{type(e).__name__}: {e}"
         )
 
@@ -303,11 +462,15 @@ def alpaca_get(url, params=None, timeout=30):
 
 def fetch_all_bars(symbols):
 
-    end_dt = datetime.now(timezone.utc)
+    end_dt = datetime.now(
+        timezone.utc
+    )
 
     start_dt = (
         end_dt -
-        timedelta(days=HISTORY_DAYS)
+        timedelta(
+            days=HISTORY_DAYS
+        )
     )
 
     result = {
@@ -320,79 +483,115 @@ def fetch_all_bars(symbols):
     while True:
 
         params = {
-            "symbols": ",".join(symbols),
-            "timeframe": TIMEFRAME,
-            "start": iso_utc(start_dt),
-            "end": iso_utc(end_dt),
-            "limit": 10000,
-            "feed": DATA_FEED,
-            "sort": "asc",
+
+            "symbols":
+                ",".join(symbols),
+
+            "timeframe":
+                TIMEFRAME,
+
+            "start":
+                iso_utc(start_dt),
+
+            "end":
+                iso_utc(end_dt),
+
+            "limit":
+                10000,
+
+            "feed":
+                DATA_FEED,
+
+            "sort":
+                "asc",
         }
 
         if page_token:
-            params["page_token"] = page_token
+
+            params[
+                "page_token"
+            ] = page_token
 
         data = alpaca_get(
             f"{ALPACA_DATA_URL}/v2/stocks/bars",
             params=params,
-            timeout=45,
+            timeout=45
         )
 
         if not data:
+
             log(
-                "[DATA] No response from Alpaca "
-                "stock bars endpoint"
+                "[DATA] "
+                "No response from bars API"
             )
+
             break
 
-        bars = data.get("bars", {})
-
-        if not bars:
-            log(
-                "[DATA] Alpaca returned empty bars."
-            )
+        bars = data.get(
+            "bars",
+            {}
+        )
 
         for symbol in symbols:
 
-            symbol_bars = bars.get(
+            for b in bars.get(
                 symbol,
                 []
-            )
-
-            for b in symbol_bars:
+            ):
 
                 try:
 
                     result[symbol].append(
                         {
-                            "timestamp": b.get("t"),
+                            "timestamp":
+                                b.get("t"),
 
-                            "open": float(
-                                b.get("o", 0)
-                            ),
+                            "open":
+                                float(
+                                    b.get(
+                                        "o",
+                                        0
+                                    )
+                                ),
 
-                            "high": float(
-                                b.get("h", 0)
-                            ),
+                            "high":
+                                float(
+                                    b.get(
+                                        "h",
+                                        0
+                                    )
+                                ),
 
-                            "low": float(
-                                b.get("l", 0)
-                            ),
+                            "low":
+                                float(
+                                    b.get(
+                                        "l",
+                                        0
+                                    )
+                                ),
 
-                            "close": float(
-                                b.get("c", 0)
-                            ),
+                            "close":
+                                float(
+                                    b.get(
+                                        "c",
+                                        0
+                                    )
+                                ),
 
-                            "volume": float(
-                                b.get("v", 0)
-                            ),
+                            "volume":
+                                float(
+                                    b.get(
+                                        "v",
+                                        0
+                                    )
+                                ),
                         }
                     )
 
                 except Exception as e:
 
                     log(
-                        f"[DATA PARSE ERROR] "
+                        f"[PARSE ERROR] "
                         f"{symbol}: {e}"
                     )
 
@@ -415,18 +614,28 @@ def fetch_all_bars(symbols):
 
             continue
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(
+            rows
+        )
 
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"],
-            utc=True
+        df["timestamp"] = (
+            pd.to_datetime(
+                df["timestamp"],
+                utc=True
+            )
         )
 
         df = (
             df
-            .drop_duplicates("timestamp")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+            .drop_duplicates(
+                "timestamp"
+            )
+            .sort_values(
+                "timestamp"
+            )
+            .reset_index(
+                drop=True
+            )
         )
 
         frames[symbol] = df
@@ -440,42 +649,67 @@ def fetch_all_bars(symbols):
 
 def report_data_health(frames):
 
-    log_section("DATA HEALTH")
+    section(
+        "DATA HEALTH"
+    )
 
-    total_ok = 0
+    ok = 0
 
     for symbol in ALL_SYMBOLS:
 
-        df = frames.get(symbol)
+        df = frames.get(
+            symbol
+        )
 
-        if df is None or df.empty:
+        if (
+            df is None
+            or df.empty
+        ):
 
             log(
                 f"[DATA] {symbol}: "
-                f"❌ NO DATA"
+                "❌ NO DATA"
             )
+
+            continue
+
+        last_ts = (
+            df["timestamp"]
+            .iloc[-1]
+        )
+
+        age_min = (
+            datetime.now(
+                timezone.utc
+            )
+            -
+            last_ts.to_pydatetime()
+        ).total_seconds() / 60
+
+        if age_min <= MAX_DATA_AGE_MINUTES:
+
+            status = "✓ FRESH"
 
         else:
 
-            rows = len(df)
-
-            last_ts = (
-                df["timestamp"].iloc[-1]
-                if "timestamp" in df.columns
-                else None
+            status = (
+                f"⚠ STALE "
+                f"{age_min:.1f}m"
             )
 
-            log(
-                f"[DATA] {symbol}: "
-                f"✓ {rows:,} bars | "
-                f"last={last_ts}"
-            )
+        log(
+            f"[DATA] {symbol}: "
+            f"{len(df):,} bars | "
+            f"last={last_ts} | "
+            f"{status}"
+        )
 
-            total_ok += 1
+        ok += 1
 
     log(
         f"[DATA SUMMARY] "
-        f"{total_ok}/{len(ALL_SYMBOLS)} symbols OK"
+        f"{ok}/{len(ALL_SYMBOLS)} "
+        "symbols available"
     )
 
 
@@ -483,44 +717,90 @@ def report_data_health(frames):
 # INDICATORS
 # ============================================================
 
-def rsi(series, period=14):
+def rsi(
+    series,
+    period=14
+):
 
     delta = series.diff()
 
-    gain = delta.clip(lower=0)
+    gain = (
+        delta.clip(
+            lower=0
+        )
+    )
 
-    loss = -delta.clip(upper=0)
+    loss = (
+        -delta.clip(
+            upper=0
+        )
+    )
 
-    avg_gain = gain.rolling(period).mean()
+    avg_gain = (
+        gain
+        .rolling(period)
+        .mean()
+    )
 
     avg_loss = (
         loss
         .rolling(period)
         .mean()
-        .replace(0, np.nan)
+        .replace(
+            0,
+            np.nan
+        )
     )
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain /
+        avg_loss
+    )
 
-    return 100 - (
-        100 / (1 + rs)
+    return (
+        100 -
+        (
+            100 /
+            (1 + rs)
+        )
     )
 
 
-def atr(df, period=14):
+def atr(
+    df,
+    period=14
+):
 
-    prev = df["close"].shift(1)
+    prev = (
+        df["close"]
+        .shift(1)
+    )
 
     tr = pd.concat(
         [
-            df["high"] - df["low"],
-            (df["high"] - prev).abs(),
-            (df["low"] - prev).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+            df["high"] -
+            df["low"],
 
-    return tr.rolling(period).mean()
+            (
+                df["high"] -
+                prev
+            ).abs(),
+
+            (
+                df["low"] -
+                prev
+            ).abs(),
+        ],
+        axis=1
+    ).max(
+        axis=1
+    )
+
+    return (
+        tr
+        .rolling(period)
+        .mean()
+    )
 
 
 # ============================================================
@@ -537,14 +817,29 @@ def make_features(
 
     close = x["close"]
 
-    x["ret_1"] = close.pct_change(1)
-    x["ret_3"] = close.pct_change(3)
-    x["ret_6"] = close.pct_change(6)
-    x["ret_12"] = close.pct_change(12)
+    x["ret_1"] = (
+        close.pct_change(1)
+    )
 
-    x["rsi"] = rsi(close, 14)
+    x["ret_3"] = (
+        close.pct_change(3)
+    )
 
-    x["atr"] = atr(x, 14)
+    x["ret_6"] = (
+        close.pct_change(6)
+    )
+
+    x["ret_12"] = (
+        close.pct_change(12)
+    )
+
+    x["rsi"] = rsi(
+        close
+    )
+
+    x["atr"] = atr(
+        x
+    )
 
     x["atr_pct"] = (
         x["atr"] /
@@ -552,7 +847,10 @@ def make_features(
     )
 
     x["range_pct"] = (
-        (x["high"] - x["low"]) /
+        (
+            x["high"] -
+            x["low"]
+        ) /
         close
     )
 
@@ -581,15 +879,18 @@ def make_features(
     )
 
     x["ma9_dist"] = (
-        close / x["ma_9"] - 1
+        close /
+        x["ma_9"] - 1
     )
 
     x["ma20_dist"] = (
-        close / x["ma_20"] - 1
+        close /
+        x["ma_20"] - 1
     )
 
     x["ma50_dist"] = (
-        close / x["ma_50"] - 1
+        close /
+        x["ma_50"] - 1
     )
 
     x["momentum"] = (
@@ -602,25 +903,32 @@ def make_features(
         x["ret_3"].shift(3)
     )
 
-    vol_m = (
+    vol_mean = (
         x["volume"]
         .rolling(30)
         .mean()
     )
 
-    vol_s = (
+    vol_std = (
         x["volume"]
         .rolling(30)
         .std()
     )
 
     x["volume_z"] = (
-        (x["volume"] - vol_m) /
-        vol_s.replace(0, np.nan)
+        (
+            x["volume"] -
+            vol_mean
+        )
+        /
+        vol_std.replace(
+            0,
+            np.nan
+        )
     )
 
     # --------------------------------------------------------
-    # MARKET FEATURES
+    # MARKET
     # --------------------------------------------------------
 
     if (
@@ -630,22 +938,29 @@ def make_features(
 
         m = (
             market_df[
-                ["timestamp", "close"]
+                [
+                    "timestamp",
+                    "close"
+                ]
             ]
             .rename(
                 columns={
                     "close":
-                    "market_close"
+                        "market_close"
                 }
             )
-            .sort_values("timestamp")
+            .sort_values(
+                "timestamp"
+            )
         )
 
         x = pd.merge_asof(
-            x.sort_values("timestamp"),
+            x.sort_values(
+                "timestamp"
+            ),
             m,
             on="timestamp",
-            direction="backward",
+            direction="backward"
         )
 
         x["market_ret_3"] = (
@@ -665,12 +980,20 @@ def make_features(
 
     else:
 
-        x["market_ret_3"] = 0.0
-        x["market_ret_12"] = 0.0
-        x["relative_strength"] = 0.0
+        x[
+            "market_ret_3"
+        ] = 0.0
+
+        x[
+            "market_ret_12"
+        ] = 0.0
+
+        x[
+            "relative_strength"
+        ] = 0.0
 
     # --------------------------------------------------------
-    # QQQ FEATURES
+    # QQQ
     # --------------------------------------------------------
 
     if (
@@ -680,27 +1003,31 @@ def make_features(
 
         q = (
             qqq_df[
-                ["timestamp", "close"]
+                [
+                    "timestamp",
+                    "close"
+                ]
             ]
             .rename(
                 columns={
                     "close":
-                    "qqq_close"
+                        "qqq_close"
                 }
             )
-            .sort_values("timestamp")
+            .sort_values(
+                "timestamp"
+            )
         )
 
         x = pd.merge_asof(
-            x.sort_values("timestamp"),
+            x.sort_values(
+                "timestamp"
+            ),
             q,
             on="timestamp",
-            direction="backward",
+            direction="backward"
         )
 
-        # FIX:
-        # Calculate from merged x,
-        # not from original q dataframe.
         x["qqq_ret_3"] = (
             x["qqq_close"]
             .pct_change(3)
@@ -713,11 +1040,16 @@ def make_features(
 
     else:
 
-        x["qqq_ret_3"] = 0.0
-        x["qqq_ret_12"] = 0.0
+        x[
+            "qqq_ret_3"
+        ] = 0.0
+
+        x[
+            "qqq_ret_12"
+        ] = 0.0
 
     # --------------------------------------------------------
-    # TIME FEATURES
+    # TIME
     # --------------------------------------------------------
 
     local_time = (
@@ -732,12 +1064,22 @@ def make_features(
         local_time.dt.minute
     )
 
-    x["time_sin"] = np.sin(
-        2 * np.pi * mins / 1440
+    x["time_sin"] = (
+        np.sin(
+            2 *
+            np.pi *
+            mins /
+            1440
+        )
     )
 
-    x["time_cos"] = np.cos(
-        2 * np.pi * mins / 1440
+    x["time_cos"] = (
+        np.cos(
+            2 *
+            np.pi *
+            mins /
+            1440
+        )
     )
 
     # --------------------------------------------------------
@@ -752,8 +1094,10 @@ def make_features(
                 HORIZON + 1
             )
         ],
-        axis=1,
-    ).max(axis=1)
+        axis=1
+    ).max(
+        axis=1
+    )
 
     future_low = pd.concat(
         [
@@ -763,17 +1107,23 @@ def make_features(
                 HORIZON + 1
             )
         ],
-        axis=1,
-    ).min(axis=1)
+        axis=1
+    ).min(
+        axis=1
+    )
 
     up_hit = (
         future_high >=
-        close + x["atr"] * ATR_TARGET
+        close +
+        x["atr"] *
+        ATR_TARGET
     )
 
     down_hit = (
         future_low <=
-        close - x["atr"] * ATR_TARGET
+        close -
+        x["atr"] *
+        ATR_TARGET
     )
 
     x["target"] = np.where(
@@ -828,15 +1178,18 @@ FEATURE_COLUMNS = [
 
 
 # ============================================================
-# MODEL TRAINING
+# TRAIN
 # ============================================================
 
-def train_model(feature_df):
+def train_model(
+    feature_df
+):
 
     if (
         feature_df is None
         or feature_df.empty
     ):
+
         return None
 
     clean = (
@@ -849,7 +1202,12 @@ def train_model(feature_df):
         .copy()
     )
 
-    if len(clean) < MIN_TRAIN_ROWS:
+    if (
+        len(clean)
+        <
+        MIN_TRAIN_ROWS
+    ):
+
         return None
 
     clean["target"] = (
@@ -877,14 +1235,20 @@ def train_model(feature_df):
 
     if (
         train["target"]
-        .nunique() < 2
+        .nunique()
+        <
+        2
     ):
+
         return None
 
     if (
         test["target"]
-        .nunique() < 2
+        .nunique()
+        <
+        2
     ):
+
         return None
 
     models = []
@@ -907,16 +1271,24 @@ def train_model(feature_df):
         )
 
         model.fit(
-            train[FEATURE_COLUMNS],
+            train[
+                FEATURE_COLUMNS
+            ],
             train["target"]
         )
 
-        models.append(model)
+        models.append(
+            model
+        )
 
     probs = [
+
         model.predict_proba(
-            test[FEATURE_COLUMNS]
+            test[
+                FEATURE_COLUMNS
+            ]
         )[:, 1]
+
         for model in models
     ]
 
@@ -945,14 +1317,20 @@ def train_model(feature_df):
     )
 
     return {
-        "models": models,
-        "auc": auc,
-        "rows": len(clean),
+
+        "models":
+            models,
+
+        "auc":
+            auc,
+
+        "rows":
+            len(clean),
     }
 
 
 # ============================================================
-# PREDICTION
+# PREDICT
 # ============================================================
 
 def predict(
@@ -961,16 +1339,19 @@ def predict(
 ):
 
     if not model_info:
+
         return None
 
     clean = (
         feature_df
         .dropna(
-            subset=FEATURE_COLUMNS
+            subset=
+            FEATURE_COLUMNS
         )
     )
 
     if clean.empty:
+
         return None
 
     latest = clean.iloc[-1]
@@ -981,11 +1362,15 @@ def predict(
                 FEATURE_COLUMNS
             ].values
         ],
-        columns=FEATURE_COLUMNS,
+        columns=FEATURE_COLUMNS
     )
 
     probs = [
-        model.predict_proba(X)[0][1]
+
+        model.predict_proba(
+            X
+        )[0][1]
+
         for model in
         model_info["models"]
     ]
@@ -994,7 +1379,10 @@ def predict(
         np.mean(probs)
     )
 
-    p_down = 1.0 - p_up
+    p_down = (
+        1.0 -
+        p_up
+    )
 
     if p_up >= MIN_PROBABILITY:
 
@@ -1026,55 +1414,269 @@ def predict(
 
     return {
 
-        "signal": signal,
+        "signal":
+            signal,
 
-        "p_up": p_up,
-
-        "p_down": p_down,
-
-        "confidence": max(
+        "p_up":
             p_up,
-            p_down
-        ),
 
-        "price": float(
-            latest["close"]
-        ),
+        "p_down":
+            p_down,
 
-        "atr": float(
-            latest["atr"]
-        ),
+        "confidence":
+            max(
+                p_up,
+                p_down
+            ),
 
-        "rsi": float(
-            latest["rsi"]
-        ),
+        "price":
+            float(
+                latest["close"]
+            ),
 
-        "momentum": float(
-            latest["momentum"]
-        ),
+        "atr":
+            float(
+                latest["atr"]
+            ),
 
-        "volatility": vol,
+        "rsi":
+            float(
+                latest["rsi"]
+            ),
 
-        "volume_z": float(
-            latest["volume_z"]
-        ),
+        "momentum":
+            float(
+                latest["momentum"]
+            ),
 
-        "relative_strength": float(
-            latest[
-                "relative_strength"
-            ]
-        ),
+        "volatility":
+            vol,
 
-        "auc": model_info["auc"],
+        "volume_z":
+            float(
+                latest["volume_z"]
+            ),
 
-        "rows": model_info["rows"],
+        "relative_strength":
+            float(
+                latest[
+                    "relative_strength"
+                ]
+            ),
 
-        "regime": regime,
+        "auc":
+            model_info["auc"],
+
+        "rows":
+            model_info["rows"],
+
+        "regime":
+            regime,
     }
 
 
 # ============================================================
-# OPTIONS CONTRACTS
+# MARKET CONFIRMATION
+# ============================================================
+
+def calculate_confirmation(
+    pred_map
+):
+
+    call_votes = 0
+    put_votes = 0
+
+    total = 0
+
+    details = []
+
+    for symbol in (
+        ["SPY", "QQQ"] +
+        STOCKS
+    ):
+
+        p = pred_map.get(
+            symbol
+        )
+
+        if not p:
+            continue
+
+        if p["signal"] == "CALL":
+
+            call_votes += 1
+            total += 1
+
+            details.append(
+                f"{symbol}:CALL"
+            )
+
+        elif p["signal"] == "PUT":
+
+            put_votes += 1
+            total += 1
+
+            details.append(
+                f"{symbol}:PUT"
+            )
+
+    if total == 0:
+
+        return {
+            "bias":
+                "NEUTRAL",
+
+            "strength":
+                0.0,
+
+            "calls":
+                0,
+
+            "puts":
+                0,
+
+            "total":
+                0,
+
+            "details":
+                [],
+        }
+
+    if call_votes > put_votes:
+
+        bias = "BULLISH"
+
+        strength = (
+            call_votes /
+            total
+        )
+
+    elif put_votes > call_votes:
+
+        bias = "BEARISH"
+
+        strength = (
+            put_votes /
+            total
+        )
+
+    else:
+
+        bias = "NEUTRAL"
+
+        strength = (
+            max(
+                call_votes,
+                put_votes
+            )
+            /
+            total
+        )
+
+    return {
+
+        "bias":
+            bias,
+
+        "strength":
+            float(strength),
+
+        "calls":
+            call_votes,
+
+        "puts":
+            put_votes,
+
+        "total":
+            total,
+
+        "details":
+            details,
+    }
+
+
+# ============================================================
+# SPX SIGNAL FILTER
+# ============================================================
+
+def validate_spx_signal(
+    spx_pred,
+    confirmation
+):
+
+    if not spx_pred:
+
+        return False, (
+            "NO_SPX_PREDICTION"
+        )
+
+    if spx_pred["signal"] not in (
+        "CALL",
+        "PUT"
+    ):
+
+        return False, "ML_WAIT"
+
+    if (
+        spx_pred["auc"]
+        < MIN_AUC
+    ):
+
+        return False, (
+            f"AUC_{spx_pred['auc']:.2f}"
+        )
+
+    if (
+        spx_pred["confidence"]
+        < MIN_PROBABILITY
+    ):
+
+        return False, (
+            "LOW_CONFIDENCE"
+        )
+
+    if (
+        abs(
+            spx_pred["momentum"]
+        )
+        < 0.001
+    ):
+
+        return False, (
+            "WEAK_MOMENTUM"
+        )
+
+    desired_bias = (
+        "BULLISH"
+        if spx_pred["signal"]
+        == "CALL"
+        else
+        "BEARISH"
+    )
+
+    if (
+        confirmation["bias"]
+        != desired_bias
+    ):
+
+        return False, (
+            "MARKET_NOT_ALIGNED"
+        )
+
+    if (
+        confirmation["strength"]
+        < 0.50
+    ):
+
+        return False, (
+            "WEAK_CONFIRMATION"
+        )
+
+    return True, "OK"
+
+
+# ============================================================
+# OPTION CONTRACTS
 # ============================================================
 
 def get_option_contracts(
@@ -1095,24 +1697,31 @@ def get_option_contracts(
             expiration,
 
         "type":
-            option_type.lower(),
+            option_type,
 
         "limit":
             10000,
     }
 
+    log(
+        f"[OPTIONS REQUEST] "
+        f"{underlying} "
+        f"{option_type.upper()} "
+        f"expiration={expiration}"
+    )
+
     data = alpaca_get(
         OPTIONS_CONTRACTS_URL,
         params=params,
-        timeout=30,
+        timeout=30
     )
 
-    if not data:
+    if data is None:
 
         log(
             f"[OPTIONS] "
-            f"{underlying} {option_type}: "
-            f"NO CONTRACT RESPONSE"
+            f"{underlying}: "
+            "❌ API RESPONSE FAILED"
         )
 
         return []
@@ -1121,8 +1730,7 @@ def get_option_contracts(
         data.get(
             "option_contracts"
         )
-        or
-        data.get(
+        or data.get(
             "contracts"
         )
         or []
@@ -1130,7 +1738,8 @@ def get_option_contracts(
 
     log(
         f"[OPTIONS] "
-        f"{underlying} {option_type}: "
+        f"{underlying} "
+        f"{option_type.upper()}: "
         f"{len(contracts)} contracts"
     )
 
@@ -1138,12 +1747,64 @@ def get_option_contracts(
 
 
 # ============================================================
+# SPXW CONTRACT FILTER
+# ============================================================
+
+def filter_spxw_contracts(
+    contracts
+):
+
+    result = []
+
+    for c in contracts:
+
+        symbol = str(
+            c.get(
+                "symbol",
+                ""
+            )
+        ).upper()
+
+        root = str(
+            c.get(
+                "root_symbol",
+                ""
+            )
+        ).upper()
+
+        # SPXW must be present
+        if (
+            "SPXW" not in symbol
+            and
+            "SPXW" not in root
+        ):
+
+            continue
+
+        if not c.get(
+            "tradable",
+            True
+        ):
+
+            continue
+
+        result.append(
+            c
+        )
+
+    return result
+
+
+# ============================================================
 # OPTION QUOTES
 # ============================================================
 
-def get_option_quotes(symbols):
+def get_option_quotes(
+    symbols
+):
 
     if not symbols:
+
         return {}
 
     result = {}
@@ -1159,9 +1820,14 @@ def get_option_quotes(symbols):
         ]
 
         params = {
+
             "symbols":
                 ",".join(batch),
 
+            # Try indicative.
+            # If the account has no valid
+            # options feed, diagnostics
+            # will expose the problem.
             "feed":
                 "indicative",
         }
@@ -1169,14 +1835,14 @@ def get_option_quotes(symbols):
         data = alpaca_get(
             OPTIONS_LATEST_QUOTES_URL,
             params=params,
-            timeout=30,
+            timeout=30
         )
 
-        if not data:
+        if data is None:
 
             log(
                 "[OPTIONS QUOTES] "
-                "No response"
+                "API FAILED"
             )
 
             continue
@@ -1186,21 +1852,25 @@ def get_option_quotes(symbols):
             {}
         )
 
-        for symbol, q in quotes.items():
-
-            bid = q.get("bp")
-            ask = q.get("ap")
-
-            if (
-                bid is None
-                or ask is None
-            ):
-                continue
+        for symbol, q in (
+            quotes.items()
+        ):
 
             try:
 
-                bid = float(bid)
-                ask = float(ask)
+                bid = float(
+                    q.get(
+                        "bp",
+                        0
+                    )
+                )
+
+                ask = float(
+                    q.get(
+                        "ap",
+                        0
+                    )
+                )
 
             except Exception:
 
@@ -1209,12 +1879,18 @@ def get_option_quotes(symbols):
             if (
                 bid <= 0
                 or ask <= 0
+                or ask < bid
             ):
+
                 continue
 
             mid = (
                 bid + ask
             ) / 2
+
+            if mid <= 0:
+
+                continue
 
             spread_pct = (
                 ask - bid
@@ -1222,20 +1898,22 @@ def get_option_quotes(symbols):
 
             result[symbol] = {
 
-                "bid": bid,
+                "bid":
+                    bid,
 
-                "ask": ask,
+                "ask":
+                    ask,
 
-                "mid": mid,
+                "mid":
+                    mid,
 
                 "spread_pct":
                     spread_pct,
             }
 
     log(
-        f"[OPTIONS QUOTES] "
-        f"Valid quotes: "
-        f"{len(result)}"
+        "[OPTIONS QUOTES] "
+        f"Valid={len(result)}"
     )
 
     return result
@@ -1245,38 +1923,36 @@ def get_option_quotes(symbols):
 # OPTION SCORE
 # ============================================================
 
-def score_option(
+def score_spx_option(
     pred,
-    contract,
-    quote
+    confirmation,
+    quote,
+    distance
 ):
-
-    if (
-        not pred
-        or not contract
-        or not quote
-    ):
-        return 0
 
     score = 0.0
 
     # --------------------------------------------------------
-    # ML CONFIDENCE
+    # ML confidence: 35
     # --------------------------------------------------------
 
+    confidence = (
+        pred["confidence"]
+    )
+
     score += min(
-        30,
+        35,
         max(
             0,
             (
-                pred["confidence"]
-                - 0.50
+                confidence -
+                0.50
             ) * 100
-        ) * 0.75
+        ) * 0.875
     )
 
     # --------------------------------------------------------
-    # AUC
+    # AUC: 15
     # --------------------------------------------------------
 
     score += min(
@@ -1284,67 +1960,80 @@ def score_option(
         max(
             0,
             (
-                pred["auc"]
-                - 0.50
+                pred["auc"] -
+                0.50
             ) * 100
         ) * 0.75
     )
 
     # --------------------------------------------------------
-    # SPREAD
+    # Market confirmation: 20
     # --------------------------------------------------------
 
-    sp_pct = quote[
-        "spread_pct"
-    ]
+    score += min(
+        20,
+        confirmation["strength"]
+        * 20
+    )
 
-    if sp_pct <= 0.05:
+    # --------------------------------------------------------
+    # Spread: 15
+    # --------------------------------------------------------
 
-        score += 20
+    spread = (
+        quote["spread_pct"]
+    )
 
-    elif sp_pct <= 0.08:
+    if spread <= 0.04:
 
-        score += 16
+        score += 15
 
-    elif sp_pct <= 0.12:
+    elif spread <= 0.06:
+
+        score += 13
+
+    elif spread <= 0.08:
 
         score += 10
 
-    elif (
-        sp_pct
-        <= MAX_SPREAD_PERCENT
-    ):
+    elif spread <= 0.10:
 
-        score += 4
+        score += 6
 
-    else:
-
-        return 0
-
-    # --------------------------------------------------------
-    # PREMIUM
-    # --------------------------------------------------------
-
-    if (
-        quote["mid"]
-        < MIN_OPTION_PREMIUM
-    ):
-        return 0
-
-    if quote["mid"] >= 1:
-
-        score += 8
-
-    elif quote["mid"] >= 0.50:
-
-        score += 5
-
-    else:
+    elif spread <= 0.12:
 
         score += 2
 
+    else:
+
+        return 0
+
     # --------------------------------------------------------
-    # MOMENTUM
+    # Distance: 10
+    # --------------------------------------------------------
+
+    if distance <= 5:
+
+        score += 10
+
+    elif distance <= 10:
+
+        score += 8
+
+    elif distance <= 20:
+
+        score += 6
+
+    elif distance <= 30:
+
+        score += 3
+
+    else:
+
+        score += 1
+
+    # --------------------------------------------------------
+    # Momentum: 5
     # --------------------------------------------------------
 
     momentum = abs(
@@ -1353,41 +2042,21 @@ def score_option(
 
     if momentum >= 0.004:
 
-        score += 8
+        score += 5
 
     elif momentum >= 0.002:
 
-        score += 5
+        score += 3
 
     else:
 
         score += 1
 
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    volume_z = pred[
-        "volume_z"
-    ]
-
-    if volume_z >= 2:
-
-        score += 8
-
-    elif volume_z >= 1:
-
-        score += 5
-
-    else:
-
-        score += 2
-
     return int(
-        max(
-            0,
-            min(
-                100,
+        min(
+            100,
+            max(
+                0,
                 round(score)
             )
         )
@@ -1395,41 +2064,54 @@ def score_option(
 
 
 # ============================================================
-# CHOOSE CONTRACT
+# CHOOSE SPXW 0DTE CONTRACT
 # ============================================================
 
-def choose_best_contract(
-    symbol,
+def choose_spx_contract(
     signal,
-    underlying_price
+    spx_price,
+    pred,
+    confirmation
 ):
 
-    today = (
-        now_ny()
-        .date()
-        .isoformat()
-    )
+    expiration = today_ny()
 
     option_type = (
         "call"
         if signal == "CALL"
-        else "put"
+        else
+        "put"
     )
 
     contracts = get_option_contracts(
-        symbol,
+        "SPX",
         option_type,
-        today
+        expiration
+    )
+
+    if not contracts:
+
+        return None, (
+            "NO_0DTE_CONTRACTS"
+        )
+
+    contracts = (
+        filter_spxw_contracts(
+            contracts
+        )
     )
 
     if not contracts:
 
         log(
-            f"[REJECT] {symbol} {signal}: "
-            f"NO 0DTE CONTRACTS"
+            "[SPXW] "
+            "API returned contracts, "
+            "but no SPXW contracts found."
         )
 
-        return None, "NO_CONTRACTS"
+        return None, (
+            "NO_SPXW_CONTRACTS"
+        )
 
     candidates = []
 
@@ -1447,43 +2129,17 @@ def choose_best_contract(
 
             continue
 
-        if not c.get(
-            "tradable",
-            True
-        ):
-            continue
-
-        if symbol == "SPX":
-
-            root = str(
-                c.get(
-                    "root_symbol",
-                    ""
-                )
-            ).upper()
-
-            c_sym = str(
-                c.get(
-                    "symbol",
-                    ""
-                )
-            ).upper()
-
-            if (
-                "SPXW" not in root
-                and "SPXW" not in c_sym
-            ):
-                continue
-
         distance = abs(
             strike -
-            underlying_price
+            spx_price
         )
 
         if (
             distance
-            > MAX_STRIKE_DISTANCE
+            >
+            MAX_SPX_STRIKE_DISTANCE
         ):
+
             continue
 
         candidates.append(
@@ -1496,27 +2152,36 @@ def choose_best_contract(
     if not candidates:
 
         log(
-            f"[REJECT] {symbol} {signal}: "
-            f"NO STRIKE WITHIN "
-            f"{MAX_STRIKE_DISTANCE}"
+            "[SPXW] "
+            "No strike within "
+            f"${MAX_SPX_STRIKE_DISTANCE}"
         )
 
-        return None, "NO_STRIKE"
+        return None, (
+            "NO_SPXW_STRIKE"
+        )
 
     candidates.sort(
         key=lambda x: x[0]
     )
 
+    # More than one candidate
+    # so we do not blindly take
+    # the first strike.
     selected = [
         c
         for _, c
-        in candidates[:25]
+        in candidates[:30]
     ]
 
     symbols = [
-        c.get("symbol")
+        c.get(
+            "symbol"
+        )
         for c in selected
-        if c.get("symbol")
+        if c.get(
+            "symbol"
+        )
     ]
 
     quotes = get_option_quotes(
@@ -1525,168 +2190,186 @@ def choose_best_contract(
 
     if not quotes:
 
-        log(
-            f"[REJECT] {symbol} {signal}: "
-            f"NO VALID OPTION QUOTES"
+        return None, (
+            "NO_OPTION_QUOTES"
         )
 
-        return None, "NO_QUOTES"
-
     best = None
-    best_score = -999
+    best_score = -1
 
     rejected_spread = 0
     rejected_premium = 0
 
     for c in selected:
 
-        sym = c.get("symbol")
+        symbol = c.get(
+            "symbol"
+        )
 
-        if sym not in quotes:
+        quote = quotes.get(
+            symbol
+        )
+
+        if not quote:
 
             continue
 
-        q = quotes[sym]
+        premium = quote[
+            "mid"
+        ]
+
+        spread = quote[
+            "spread_pct"
+        ]
 
         if (
-            q["mid"]
-            < MIN_OPTION_PREMIUM
+            premium
+            <
+            MIN_OPTION_PREMIUM
         ):
 
             rejected_premium += 1
             continue
 
         if (
-            q["spread_pct"]
-            > MAX_SPREAD_PERCENT
+            spread
+            >
+            MAX_SPREAD_PERCENT
         ):
 
             rejected_spread += 1
             continue
 
+        try:
+
+            strike = float(
+                c.get(
+                    "strike_price"
+                )
+            )
+
+        except Exception:
+
+            continue
+
         distance = abs(
-            float(
-                c["strike_price"]
-            )
-            -
-            underlying_price
+            strike -
+            spx_price
         )
 
-        candidate_score = (
-            20
-            -
-            min(
-                20,
-                q["spread_pct"] * 100
-            )
-            -
-            (
-                distance /
-                max(
-                    underlying_price,
-                    1
-                ) * 100
-            )
+        score = score_spx_option(
+            pred,
+            confirmation,
+            quote,
+            distance
         )
 
-        if (
-            candidate_score
-            > best_score
-        ):
+        if score > best_score:
 
-            best_score = (
-                candidate_score
-            )
+            best_score = score
 
             best = {
-                "contract": c,
-                "quote": q,
+
+                "contract":
+                    c,
+
+                "quote":
+                    quote,
+
+                "score":
+                    score,
+
+                "distance":
+                    distance,
             }
 
-    if not best:
+    if best is None:
 
         log(
-            f"[REJECT] {symbol} {signal}: "
-            f"NO LIQUID CONTRACT | "
-            f"premium rejects="
+            "[SPXW REJECT] "
+            "No liquid contract | "
+            f"premium_rejects="
             f"{rejected_premium} | "
-            f"spread rejects="
+            f"spread_rejects="
             f"{rejected_spread}"
         )
 
-        return None, "NO_LIQUID_CONTRACT"
+        return None, (
+            "NO_LIQUID_SPXW"
+        )
+
+    if (
+        best["score"]
+        <
+        MIN_SPX_SCORE
+    ):
+
+        log(
+            "[SPXW REJECT] "
+            f"Score={best['score']}/100 "
+            f"< {MIN_SPX_SCORE}"
+        )
+
+        return None, (
+            f"SCORE_{best['score']}"
+        )
 
     return best, "OK"
 
 
 # ============================================================
-# BUILD OPPORTUNITY
+# BUILD SPX OPPORTUNITY
 # ============================================================
 
-def build_opportunity(
-    symbol,
-    display_symbol,
-    pred
+def build_spx_opportunity(
+    pred,
+    confirmation
 ):
 
     if not pred:
 
-        return None, "NO_PREDICTION"
-
-    if pred["signal"] not in (
-        "CALL",
-        "PUT"
-    ):
-
         return None, (
-            f"ML_{pred['signal']}"
+            "NO_SPX_PREDICTION"
         )
 
-    contract_data, reason = (
-        choose_best_contract(
-            symbol,
-            pred["signal"],
-            pred["price"]
+    valid, reason = (
+        validate_spx_signal(
+            pred,
+            confirmation
         )
     )
 
-    if not contract_data:
+    if not valid:
 
         return None, reason
 
-    contract = (
-        contract_data["contract"]
-    )
-
-    quote = (
-        contract_data["quote"]
-    )
-
-    score = score_option(
-        pred,
-        contract,
-        quote
-    )
-
-    if score < MIN_OPTION_SCORE:
-
-        log(
-            f"[REJECT] {display_symbol} "
-            f"{pred['signal']} | "
-            f"Score={score}/100 < "
-            f"{MIN_OPTION_SCORE}"
+    result, reason = (
+        choose_spx_contract(
+            pred["signal"],
+            pred["price"],
+            pred,
+            confirmation
         )
+    )
 
-        return None, (
-            f"SCORE_{score}"
-        )
+    if not result:
 
-    entry = quote["mid"]
+        return None, reason
+
+    c = result[
+        "contract"
+    ]
+
+    q = result[
+        "quote"
+    ]
+
+    entry = q["mid"]
 
     return {
 
         "symbol":
-            display_symbol,
+            "SPX",
 
         "signal":
             pred["signal"],
@@ -1694,34 +2377,31 @@ def build_opportunity(
         "confidence":
             pred["confidence"],
 
-        "price":
-            pred["price"],
-
         "auc":
             pred["auc"],
 
-        "regime":
-            pred["regime"],
+        "spx_price":
+            pred["price"],
 
         "score":
-            score,
+            result["score"],
 
         "contract_symbol":
-            contract.get(
+            c.get(
                 "symbol",
                 "UNKNOWN"
             ),
 
         "strike":
             float(
-                contract.get(
+                c.get(
                     "strike_price",
                     0
                 )
             ),
 
         "expiration":
-            contract.get(
+            c.get(
                 "expiration_date",
                 ""
             ),
@@ -1736,203 +2416,177 @@ def build_opportunity(
             entry * 0.70,
 
         "bid":
-            quote["bid"],
+            q["bid"],
 
         "ask":
-            quote["ask"],
+            q["ask"],
 
         "spread_pct":
-            quote["spread_pct"],
+            q["spread_pct"],
+
+        "confirmation":
+            confirmation,
+
+        "regime":
+            pred["regime"],
+
+        "momentum":
+            pred["momentum"],
     }, "OK"
 
 
 # ============================================================
-# CONSENSUS
+# DUPLICATE
 # ============================================================
 
-def market_consensus(
-    predictions
+def is_duplicate(
+    opportunity
 ):
 
-    valid = [
-        p
-        for p in predictions
-        if p is not None
-    ]
-
-    if not valid:
-
-        return {
-            "bias": "NEUTRAL",
-            "strength": 0,
-        }
-
-    call_c = sum(
-        1
-        for p in valid
-        if p["signal"] == "CALL"
-    )
-
-    put_c = sum(
-        1
-        for p in valid
-        if p["signal"] == "PUT"
-    )
-
-    call_p = np.mean(
-        [
-            p["p_up"]
-            for p in valid
+    key = (
+        opportunity[
+            "contract_symbol"
+        ]
+        +
+        "_"
+        +
+        opportunity[
+            "signal"
         ]
     )
 
-    put_p = np.mean(
-        [
-            p["p_down"]
-            for p in valid
+    last = (
+        STATE[
+            "last_sent"
+        ].get(
+            key
+        )
+    )
+
+    if last is None:
+
+        return False
+
+    elapsed = (
+        time.time() -
+        last
+    ) / 60
+
+    return (
+        elapsed
+        <
+        SIGNAL_COOLDOWN_MINUTES
+    )
+
+
+def mark_sent(
+    opportunity
+):
+
+    key = (
+        opportunity[
+            "contract_symbol"
+        ]
+        +
+        "_"
+        +
+        opportunity[
+            "signal"
         ]
     )
 
-    if call_c > put_c:
-
-        return {
-            "bias": "BULLISH",
-            "strength":
-                float(call_p),
-        }
-
-    if put_c > call_c:
-
-        return {
-            "bias": "BEARISH",
-            "strength":
-                float(put_p),
-        }
-
-    return {
-        "bias": "NEUTRAL",
-        "strength":
-            float(
-                max(
-                    call_p,
-                    put_p
-                )
-            ),
-    }
+    STATE[
+        "last_sent"
+    ][key] = time.time()
 
 
 # ============================================================
-# FORMAT TELEGRAM
+# TELEGRAM FORMAT
 # ============================================================
 
-def format_opportunity(
-    o,
-    rank
+def format_spx_alert(
+    opportunity
 ):
+
+    signal = (
+        opportunity[
+            "signal"
+        ]
+    )
 
     emoji = (
-        "🥇"
-        if rank == 1
-        else "🥈"
-        if rank == 2
-        else "🥉"
+        "🟢"
+        if signal == "CALL"
+        else
+        "🔴"
     )
 
-    sig_emoji = (
-        "🟢"
-        if o["signal"] == "CALL"
-        else "🔴"
+    confirmation = (
+        opportunity[
+            "confirmation"
+        ]
     )
 
     return (
 
-        f"{emoji} "
-        f"<b>{o['symbol']} "
-        f"{sig_emoji} "
-        f"{o['signal']}</b>\n"
+        f"🚨 <b>SPX 0DTE "
+        f"{emoji} {signal}</b>\n"
 
         f"━━━━━━━━━━━━━━━━━━\n"
 
         f"🔥 القوة: "
-        f"<b>{o['score']}/100</b>\n"
+        f"<b>{opportunity['score']}/100</b>\n"
 
-        f"🧠 الثقة: "
-        f"<b>{o['confidence']*100:.1f}%</b>\n"
+        f"🧠 ML: "
+        f"<b>{opportunity['confidence']*100:.1f}%</b>\n"
 
         f"📊 AUC: "
-        f"{o['auc']:.2f}\n"
+        f"<b>{opportunity['auc']:.2f}</b>\n"
 
-        f"💵 السعر: "
-        f"<b>${o['price']:.2f}</b>\n"
+        f"📈 SPX: "
+        f"<b>{opportunity['spx_price']:.2f}</b>\n"
 
-        f"🎯 السترايك: "
-        f"<b>{o['strike']:.2f}</b>\n"
+        f"🎯 Strike: "
+        f"<b>{opportunity['strike']:.2f}</b>\n"
 
-        f"📜 العقد: "
-        f"<code>{o['contract_symbol']}</code>\n"
+        f"📜 العقد:\n"
+        f"<code>"
+        f"{opportunity['contract_symbol']}"
+        f"</code>\n"
 
         f"💰 دخول: "
-        f"<b>${o['entry']:.2f}</b>\n"
+        f"<b>${opportunity['entry']:.2f}</b>\n"
 
-        f"🎯 هدف: "
-        f"<b>${o['target']:.2f}</b>\n"
+        f"🎯 هدف +40%: "
+        f"<b>${opportunity['target']:.2f}</b>\n"
 
-        f"🛑 وقف: "
-        f"<b>${o['stop']:.2f}</b>\n"
+        f"🛑 وقف -30%: "
+        f"<b>${opportunity['stop']:.2f}</b>\n"
 
         f"↔️ السبريد: "
-        f"{o['spread_pct']*100:.1f}%\n"
+        f"{opportunity['spread_pct']*100:.1f}%\n"
 
         f"🌡️ النظام: "
-        f"{o['regime']}\n"
+        f"{opportunity['regime']}\n"
+
+        f"📊 تأكيد السوق: "
+        f"<b>{confirmation['bias']}</b>\n"
+
+        f"🟢 CALL: "
+        f"{confirmation['calls']} | "
+        f"🔴 PUT: "
+        f"{confirmation['puts']}\n"
+
+        f"📈 قوة التأكيد: "
+        f"{confirmation['strength']*100:.1f}%\n"
+
+        f"⚠️ <i>Recommendation only — "
+        f"لا يوجد تنفيذ أوامر</i>"
     )
 
 
 # ============================================================
-# DUPLICATE CHECK
-# ============================================================
-
-def is_duplicate(
-    o
-):
-
-    key = (
-        f"{o['contract_symbol']}_"
-        f"{o['signal']}"
-    )
-
-    now = time.time()
-
-    if (
-        key in STATE["last_sent"]
-        and
-        (
-            now -
-            STATE["last_sent"][key]
-        ) / 60
-        <
-        SIGNAL_COOLDOWN_MINUTES
-    ):
-
-        return True
-
-    return False
-
-
-def mark_sent(o):
-
-    key = (
-        f"{o['contract_symbol']}_"
-        f"{o['signal']}"
-    )
-
-    STATE["last_sent"][key] = (
-        time.time()
-    )
-
-
-# ============================================================
-# PREDICTION DIAGNOSTICS
+# PRINT PREDICTION
 # ============================================================
 
 def print_prediction(
@@ -1944,7 +2598,7 @@ def print_prediction(
 
         log(
             f"[ML] {symbol}: "
-            f"NO PREDICTION"
+            "NO PREDICTION"
         )
 
         return
@@ -1969,9 +2623,25 @@ def print_prediction(
 
 def main():
 
+    section(
+        f"SPX 0DTE AI ADVISOR "
+        f"{VERSION}"
+    )
+
     log(
-        f"SPX & STOCKS AI ADVISOR "
-        f"{VERSION} STARTING"
+        "🚀 Starting..."
+    )
+
+    log(
+        "🎯 PRIMARY = SPX/SPXW 0DTE"
+    )
+
+    log(
+        "🧠 STOCKS = MARKET CONFIRMATION"
+    )
+
+    log(
+        "🛡️ Recommendation Only"
     )
 
     # --------------------------------------------------------
@@ -1981,8 +2651,8 @@ def main():
     if not ALPACA_API_KEY:
 
         log(
-            "[FATAL] Missing "
-            "ALPACA_API_KEY"
+            "[FATAL] "
+            "Missing ALPACA_API_KEY"
         )
 
         return
@@ -1990,46 +2660,44 @@ def main():
     if not ALPACA_SECRET_KEY:
 
         log(
-            "[FATAL] Missing "
-            "ALPACA_SECRET_KEY"
+            "[FATAL] "
+            "Missing ALPACA_SECRET_KEY"
         )
 
         return
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        log(
-            "[WARNING] "
-            "Missing TELEGRAM_BOT_TOKEN"
-        )
-
-    if not TELEGRAM_CHAT_ID:
-
-        log(
-            "[WARNING] "
-            "Missing TELEGRAM_CHAT_ID"
-        )
 
     log(
         f"[CONFIG] "
         f"Feed={DATA_FEED} | "
         f"Timeframe={TIMEFRAME} | "
-        f"History={HISTORY_DAYS}d | "
+        f"History={HISTORY_DAYS}d"
+    )
+
+    log(
+        f"[CONFIG] "
         f"MinProb={MIN_PROBABILITY} | "
-        f"MinScore={MIN_OPTION_SCORE}"
+        f"MinAUC={MIN_AUC} | "
+        f"MinScore={MIN_SPX_SCORE}"
+    )
+
+    log(
+        f"[CONFIG] "
+        f"MaxSpread="
+        f"{MAX_SPREAD_PERCENT*100:.1f}%"
     )
 
     # --------------------------------------------------------
-    # START TELEGRAM
+    # START MESSAGE
     # --------------------------------------------------------
 
     telegram_send(
-        f"🤖 <b>AI ADVISOR "
+        "🤖 <b>SPX 0DTE AI ADVISOR "
         f"{VERSION}</b>\n\n"
-        f"🚀 بدأ التشغيل.\n"
-        f"📊 الوضع: Recommendation Only\n"
-        f"🛡️ لا يوجد تنفيذ أوامر.\n"
-        f"🔍 Diagnostic Mode: ON"
+        "🚀 بدأ التشغيل.\n"
+        "🎯 التركيز: SPXW 0DTE\n"
+        "🧠 الأسهم: تأكيد للسوق\n"
+        "🛡️ لا يوجد تنفيذ أوامر\n"
+        "🔎 Patient Mode: ON"
     )
 
     cycle = 0
@@ -2038,7 +2706,7 @@ def main():
 
         cycle += 1
 
-        log_section(
+        section(
             f"SCAN #{cycle}"
         )
 
@@ -2066,8 +2734,7 @@ def main():
                 continue
 
             log(
-                "[MARKET] ✓ "
-                "Market open"
+                "[MARKET] ✓ OPEN"
             )
 
             # ------------------------------------------------
@@ -2097,12 +2764,7 @@ def main():
 
                 log(
                     "[FATAL DATA] "
-                    "SPY has no bars."
-                )
-
-                log(
-                    "[HINT] Check Alpaca "
-                    "data subscription/feed."
+                    "SPY unavailable"
                 )
 
                 time.sleep(
@@ -2112,21 +2774,25 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # MODELS
+            # TRAIN MODELS
             # ------------------------------------------------
 
             models = {}
 
             # ------------------------------------------------
-            # SPX PROXY
+            # SPX MODEL
             # ------------------------------------------------
             #
             # IMPORTANT:
-            # This is NOT real SPX data.
-            # It is SPY x 10 proxy.
+            # We DO NOT call SPY×10 "real SPX".
+            #
+            # Until a real SPX data source is available,
+            # SPY is used only as an INDEX-MARKET PROXY.
+            #
+            # This model is therefore labeled honestly.
             # ------------------------------------------------
 
-            spx = spy.copy()
+            spx_proxy = spy.copy()
 
             for col in [
                 "open",
@@ -2135,23 +2801,26 @@ def main():
                 "close"
             ]:
 
-                spx[col] *= 10
+                spx_proxy[
+                    col
+                ] *= 10
 
-            spx_feat = make_features(
-                spx,
+            spx_features = make_features(
+                spx_proxy,
                 market_df=spy,
                 qqq_df=qqq
             )
 
             spx_model = train_model(
-                spx_feat
+                spx_features
             )
 
             if spx_model:
 
                 models["SPX"] = {
+
                     "features":
-                        spx_feat,
+                        spx_features,
 
                     "model":
                         spx_model,
@@ -2159,18 +2828,19 @@ def main():
 
                 log(
                     "[MODEL] SPX "
-                    "(SPY×10 proxy): ✓"
+                    "proxy model: ✓ "
+                    f"AUC={spx_model['auc']:.2f}"
                 )
 
             else:
 
                 log(
-                    "[MODEL] SPX: "
-                    "❌ training failed"
+                    "[MODEL] SPX "
+                    "proxy: ❌ failed"
                 )
 
             # ------------------------------------------------
-            # STOCKS
+            # STOCK MODELS
             # ------------------------------------------------
 
             for symbol in STOCKS:
@@ -2187,26 +2857,27 @@ def main():
                     log(
                         f"[MODEL] "
                         f"{symbol}: "
-                        f"❌ no data"
+                        "NO DATA"
                     )
 
                     continue
 
-                feat = make_features(
+                features = make_features(
                     df,
                     market_df=spy,
                     qqq_df=qqq
                 )
 
                 model = train_model(
-                    feat
+                    features
                 )
 
                 if model:
 
                     models[symbol] = {
+
                         "features":
-                            feat,
+                            features,
 
                         "model":
                             model,
@@ -2215,25 +2886,15 @@ def main():
                     log(
                         f"[MODEL] "
                         f"{symbol}: "
-                        f"✓ rows="
-                        f"{model['rows']} "
-                        f"AUC="
-                        f"{model['auc']:.2f}"
+                        f"AUC={model['auc']:.2f} "
+                        f"rows={model['rows']}"
                     )
 
-                else:
-
-                    log(
-                        f"[MODEL] "
-                        f"{symbol}: "
-                        f"❌ training failed"
-                    )
-
-            if not models:
+            if "SPX" not in models:
 
                 log(
                     "[FATAL] "
-                    "No models available."
+                    "SPX model unavailable"
                 )
 
                 time.sleep(
@@ -2246,15 +2907,15 @@ def main():
             # PREDICTIONS
             # ------------------------------------------------
 
-            log_section(
+            section(
                 "ML PREDICTIONS"
             )
 
-            predictions = []
-
             pred_map = {}
 
-            for sym, info in models.items():
+            for symbol, info in (
+                models.items()
+            ):
 
                 pred = predict(
                     info["model"],
@@ -2263,267 +2924,220 @@ def main():
 
                 if pred:
 
-                    pred_map[sym] = pred
-
-                    predictions.append(
-                        pred
-                    )
+                    pred_map[
+                        symbol
+                    ] = pred
 
                     print_prediction(
-                        sym,
+                        symbol,
                         pred
                     )
 
+            spx_pred = pred_map.get(
+                "SPX"
+            )
+
+            if not spx_pred:
+
+                log(
+                    "[SPX] "
+                    "NO PREDICTION"
+                )
+
+                time.sleep(
+                    POLL_SECONDS
+                )
+
+                continue
+
             # ------------------------------------------------
-            # CONSENSUS
+            # MARKET CONFIRMATION
             # ------------------------------------------------
 
-            consensus = (
-                market_consensus(
-                    predictions
+            section(
+                "MARKET CONFIRMATION"
+            )
+
+            confirmation = (
+                calculate_confirmation(
+                    pred_map
                 )
             )
 
             log(
-                f"[CONSENSUS] "
-                f"{consensus['bias']} | "
+                f"[CONFIRMATION] "
+                f"{confirmation['bias']} | "
                 f"strength="
-                f"{consensus['strength']*100:.1f}%"
+                f"{confirmation['strength']*100:.1f}% | "
+                f"CALL="
+                f"{confirmation['calls']} | "
+                f"PUT="
+                f"{confirmation['puts']}"
+            )
+
+            log(
+                "[CONFIRMATION DETAILS] "
+                +
+                " | ".join(
+                    confirmation[
+                        "details"
+                    ]
+                )
             )
 
             # ------------------------------------------------
-            # OPTIONS
+            # SPX VALIDATION
             # ------------------------------------------------
 
-            log_section(
-                "OPTION ANALYSIS"
+            section(
+                "SPX SIGNAL VALIDATION"
             )
 
-            raw_opportunities = []
+            valid, reason = (
+                validate_spx_signal(
+                    spx_pred,
+                    confirmation
+                )
+            )
 
-            rejection_summary = {}
+            if not valid:
 
-            for sym, pred in pred_map.items():
-
-                if pred["signal"] not in (
-                    "CALL",
-                    "PUT"
-                ):
-
-                    reason = (
-                        f"ML_{pred['signal']}"
-                    )
-
-                    rejection_summary[
-                        reason
-                    ] = (
-                        rejection_summary.get(
-                            reason,
-                            0
-                        ) + 1
-                    )
-
-                    log(
-                        f"[OPTION SKIP] "
-                        f"{sym}: "
-                        f"{reason}"
-                    )
-
-                    continue
-
-                underlying = (
-                    "SPX"
-                    if sym == "SPX"
-                    else sym
+                log(
+                    f"[SPX] "
+                    f"❌ WAIT | "
+                    f"reason={reason}"
                 )
 
-                opp, reason = (
-                    build_opportunity(
-                        underlying,
-                        sym,
-                        pred
-                    )
+                log(
+                    "⏳ Patient Mode: "
+                    "لا توجد فرصة مؤكدة."
                 )
 
-                if opp:
+                time.sleep(
+                    POLL_SECONDS
+                )
 
-                    raw_opportunities.append(
-                        opp
-                    )
+                continue
 
-                    log(
-                        f"[CANDIDATE] "
-                        f"{sym} "
-                        f"{pred['signal']} | "
-                        f"score="
-                        f"{opp['score']}/100 | "
-                        f"confidence="
-                        f"{opp['confidence']*100:.1f}%"
-                    )
-
-                else:
-
-                    rejection_summary[
-                        reason
-                    ] = (
-                        rejection_summary.get(
-                            reason,
-                            0
-                        ) + 1
-                    )
-
-            # ------------------------------------------------
-            # SORT
-            # ------------------------------------------------
-
-            raw_opportunities.sort(
-                key=lambda x: (
-                    x["score"],
-                    x["confidence"]
-                ),
-                reverse=True,
+            log(
+                f"[SPX] "
+                f"✓ {spx_pred['signal']} "
+                f"passed signal filters"
             )
 
             # ------------------------------------------------
-            # REMOVE DUPLICATES
-            # WITHOUT MARKING AS SENT
+            # OPTION ANALYSIS
             # ------------------------------------------------
 
-            opportunities = []
+            section(
+                "SPXW 0DTE OPTION ANALYSIS"
+            )
 
-            for opp in raw_opportunities:
+            opportunity, reason = (
+                build_spx_opportunity(
+                    spx_pred,
+                    confirmation
+                )
+            )
 
-                if is_duplicate(
-                    opp
-                ):
+            if not opportunity:
 
-                    log(
-                        f"[COOLDOWN] "
-                        f"{opp['symbol']} "
-                        f"{opp['contract_symbol']}"
-                    )
-
-                    continue
-
-                opportunities.append(
-                    opp
+                log(
+                    f"[SPXW] "
+                    f"❌ WAIT | "
+                    f"reason={reason}"
                 )
 
-                if (
-                    len(opportunities)
-                    >= MAX_TELEGRAM_OPPORTUNITIES
-                ):
-                    break
+                log(
+                    "⏳ No high-quality "
+                    "SPX 0DTE contract."
+                )
+
+                time.sleep(
+                    POLL_SECONDS
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # DUPLICATE
+            # ------------------------------------------------
+
+            if is_duplicate(
+                opportunity
+            ):
+
+                log(
+                    "[COOLDOWN] "
+                    f"{opportunity['contract_symbol']} "
+                    "already sent recently"
+                )
+
+                time.sleep(
+                    POLL_SECONDS
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # FINAL
+            # ------------------------------------------------
+
+            log(
+                "🔥 "
+                "HIGH QUALITY SPX 0DTE "
+                "OPPORTUNITY FOUND"
+            )
+
+            log(
+                f"[FINAL] "
+                f"{opportunity['signal']} | "
+                f"score="
+                f"{opportunity['score']}/100 | "
+                f"confidence="
+                f"{opportunity['confidence']*100:.1f}% | "
+                f"strike="
+                f"{opportunity['strike']} | "
+                f"entry="
+                f"${opportunity['entry']:.2f}"
+            )
 
             # ------------------------------------------------
             # TELEGRAM
             # ------------------------------------------------
 
-            if opportunities:
+            message = (
+                format_spx_alert(
+                    opportunity
+                )
+            )
 
-                msg_lines = [
+            sent = telegram_send(
+                message
+            )
 
-                    "🚨 "
-                    "<b>AI OPTIONS "
-                    "& SPX ALERT</b>",
+            if sent:
 
-                    (
-                        f"🕒 "
-                        f"{now_ny().strftime('%H:%M:%S')} "
-                        f"NY"
-                    ),
-
-                    (
-                        f"📈 الاتجاه: "
-                        f"<b>{consensus['bias']}</b> "
-                        f"("
-                        f"{consensus['strength']*100:.1f}%"
-                        f")"
-                    ),
-
-                    "",
-                ]
-
-                for i, opp in enumerate(
-                    opportunities,
-                    1
-                ):
-
-                    msg_lines.append(
-                        format_opportunity(
-                            opp,
-                            i
-                        )
-                    )
-
-                message = (
-                    "\n".join(
-                        msg_lines
-                    )
+                mark_sent(
+                    opportunity
                 )
 
-                sent = telegram_send(
-                    message
+                log(
+                    "[TELEGRAM] "
+                    "✓ SPX ALERT SENT"
                 )
-
-                if sent:
-
-                    for opp in opportunities:
-
-                        mark_sent(
-                            opp
-                        )
-
-                    log(
-                        f"[TELEGRAM] "
-                        f"✓ Sent "
-                        f"{len(opportunities)} "
-                        f"opportunities"
-                    )
-
-                else:
-
-                    log(
-                        "[TELEGRAM] "
-                        "❌ SEND FAILED"
-                    )
 
             else:
 
                 log(
                     "[TELEGRAM] "
-                    "SILENT"
+                    "❌ SEND FAILED"
                 )
-
-                if rejection_summary:
-
-                    log(
-                        "[REJECTION SUMMARY]"
-                    )
-
-                    for reason, count in sorted(
-                        rejection_summary.items(),
-                        key=lambda x: x[1],
-                        reverse=True,
-                    ):
-
-                        log(
-                            f"  - "
-                            f"{reason}: "
-                            f"{count}"
-                        )
-
-                else:
-
-                    log(
-                        "[REJECTION SUMMARY] "
-                        "No qualifying ML signals."
-                    )
 
         except Exception as e:
 
             log(
-                f"[MAIN ERROR] "
+                "[MAIN ERROR] "
                 f"{type(e).__name__}: {e}"
             )
 
@@ -2537,4 +3151,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
