@@ -1,6 +1,6 @@
 # ============================================================
 # SPX 0DTE ADVISOR v14.3 HONEST INSTITUTIONAL ENGINE
-# (Direct SPX Bars via Alpaca API)
+# (Direct SPX Bars via Alpaca API - Fixed Syntax)
 # ============================================================
 
 import os
@@ -154,7 +154,6 @@ def _download_alpaca_bars(symbol, timeframe="5Min", limit=10000):
         why(f"مفاتيح Alpaca غير موجودة لجلب بيانات {symbol}")
         return None
     
-    # محاولة جلب الشموع للمؤشرات أو الأسهم المتاحة في Alpaca
     url = f"{APCA_DATA_URL}/v2/stocks/bars"
     params = {
         "symbols": symbol,
@@ -177,7 +176,7 @@ def _download_alpaca_bars(symbol, timeframe="5Min", limit=10000):
             "timestamp": df["timestamp"],
             "open": pd.to_numeric(df["o"], errors="coerce"),
             "high": pd.to_numeric(df["h"], errors="coerce"),
-            "low": pd.0 if "l" not in df else pd.to_numeric(df["l"], errors="coerce"),
+            "low": 0.0 if "l" not in df else pd.to_numeric(df["l"], errors="coerce"),
             "close": pd.to_numeric(df["c"], errors="coerce"),
             "volume": pd.to_numeric(df["v"], errors="coerce") if "v" in df else 0.0
         })
@@ -187,10 +186,8 @@ def _download_alpaca_bars(symbol, timeframe="5Min", limit=10000):
         return None
 
 def update_local_database():
-    # جلب بيانات SPX مباشرة ومؤشر VIX من Alpaca
     spx_df = _download_alpaca_bars("SPX", timeframe="5Min", limit=10000)
     if spx_df is None or spx_df.empty:
-        # كبديل في حال كانت نقطة نهاية مؤشر SPX تتطلب مساراً مختلفاً للبيانات
         spx_df = _download_alpaca_bars("SPXW", timeframe="5Min", limit=10000)
 
     vix_df = _download_alpaca_bars("VIX", timeframe="5Min", limit=10000)
@@ -206,7 +203,6 @@ def update_local_database():
     df["spx_low"] = spx_df["low"]
     df["spx_close"] = spx_df["close"]
     
-    # استخدام بيانات SPX كبديل لـ SPY لتجنب أي تشتت
     df["spy_close"] = spx_df["close"]
     df["spy_volume"] = spx_df["volume"]
 
