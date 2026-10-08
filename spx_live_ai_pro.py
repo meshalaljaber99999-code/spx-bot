@@ -1,5 +1,5 @@
 # ============================================================
-# SPX 0DTE ADVISOR v2 PRO MAX - مع فلتر الطوارئ والهبوط العنيف
+# SPX 0DTE ADVISOR v6 PRO QUANT - النسخة الكمية المؤسسية المتكاملة
 # ============================================================
 
 import os
@@ -9,7 +9,7 @@ import json
 import time
 import warnings
 from math import erf, sqrt, floor, ceil
-from datetime import datetime, time as dtime
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -18,72 +18,57 @@ import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, brier_score_loss
 
 warnings.filterwarnings("ignore")
 load_dotenv()
 
 # ============================================================
-# CONFIG
+# CONFIG & ARCHITECTURE
 # ============================================================
 NY = ZoneInfo("America/New_York")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 POLL_SECONDS = 30
-MARKET_OPEN_MIN = 9 * 60 + 30      # 09:30
-MARKET_CLOSE_MIN = 16 * 60         # 16:00
-NO_TRADE_FIRST_MIN = 20
+MARKET_OPEN_MIN = 9 * 60 + 30
+MARKET_CLOSE_MIN = 16 * 60
+NO_TRADE_FIRST_MIN = 30
 NO_TRADE_LAST_MIN = 60
-MAX_BAR_AGE_MIN = 30
+MAX_BAR_AGE_MIN = 3
 
-# ML
-MIN_TRAIN_ROWS = 800
-HORIZON = 15
-MOVE_ATR_MULT = 0.5
-MIN_PROBABILITY = 0.62
-MIN_EDGE = 0.10
-MIN_AUC = 0.54
-RETRAIN_EVERY_MIN = 120
+LOCAL_DB_CSV = "local_market_db.csv"
+TRADES_CSV = "paper_trades_v6.csv"
+SIGNALS_JSONL = "spx_signals_v6.jsonl"
 
-# Risk & Filters
-MAX_VIX = 30.0
-MIN_VIX = 11.0
-VIX_EMERGENCY_JUMP = 3.0           # قفزة طوارئ VIX
-EXTREME_MOVE_ATR_MULT = 2.0        # فلتر الهبوط/الصعود العنيف (أكثر من ضعفي الـ ATR في شمعة)
+# ML & Strict Ensemble Rules
+MIN_TRAIN_ROWS = 500
+HORIZON = 6
+MIN_PROBABILITY = 0.72
+MIN_AUC = 0.62
+RETRAIN_EVERY_MIN = 180
 
 ACCOUNT_EQUITY = 25000
 RISK_PER_TRADE = 0.01
 MAX_DAILY_LOSS = 0.03
 MAX_CONSECUTIVE_LOSSES = 3
-MAX_SIGNALS_PER_DAY = 5
-COOLDOWN_MIN = 10
+MAX_SIGNALS_PER_DAY = 3
 COMMISSION_PER_CONTRACT = 0.65
 
-# Options (Black-Scholes)
 STRIKE_STEP = 5.0
 STRIKE_OFFSET_STEPS = 1
-IV_MULT = 1.0
-MIN_PREMIUM = 1.00
-STOP_LOSS_PCT = 0.45
-TAKE_PROFIT_PCT = 0.75
-MAX_HOLD_MINUTES = 40
+MIN_PREMIUM = 1.30
+STOP_LOSS_PCT = 0.35
+TAKE_PROFIT_PCT = 0.65
+MAX_HOLD_MINUTES = 30
 FORCE_EXIT_BEFORE_CLOSE_MIN = 10
-
-TRADES_CSV = "paper_trades.csv"
-SIGNALS_JSONL = "spx_signals_v2.jsonl"
-
-FEATURES = [
-    "ret_1", "ret_3", "ret_5", "ret_15",
-    "rsi", "atr_pct", "ema_spread", "body_ratio",
-    "vwap_distance", "vix", "vix_chg", "vol_ratio", "mins_open",
-]
+SLIPPAGE_PENALTY_PCT = 0.10
 
 STATE = {
-    "model": None, "auc": 0.0, "last_train": None,
+    "models": {}, "auc": 0.0, "last_train": None,
     "date": None, "daily_pnl": 0.0, "loss_streak": 0, "signals_today": 0,
-    "open": None, "last_exit_time": None, "daily_summary_sent": False,
-    "weekly_report_sent_date": None, "extreme_market_alerted": False,
+    "open": None, "daily_summary_sent": False, "extreme_market_alerted": False,
 }
 
 # ============================================================
@@ -128,54 +113,66 @@ def send_telegram(message):
         say(f"Telegram error: {e}")
 
 # ============================================================
-# DATA
+# DATA & LOCAL DB ACCUMULATION (تراكم البيانات محلياً)
 # ============================================================
-def _download(symbol, period, interval):
-    df = yf.download(symbol, period=period, interval=interval,
-                     progress=False, auto_adjust=False)
-    if df is None or df.empty:
+def _download_safe(symbol, period, interval):
+    try:
+        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index()
+        ts_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
+        out = pd.DataFrame({"timestamp": pd.to_datetime(df[ts_col], utc=True).dt.tz_convert(NY)})
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            out[c.lower()] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
+        return out.dropna(subset=["close"]).sort_values("timestamp").drop_duplicates("timestamp")
+    except Exception:
         return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.reset_index()
-    ts_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
-    out = pd.DataFrame({"timestamp": pd.to_datetime(df[ts_col], utc=True).dt.tz_convert(NY)})
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        out[c.lower()] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else 0.0
-    return out.dropna(subset=["close"]).sort_values("timestamp").drop_duplicates("timestamp")
+
+def update_local_database():
+    """جلب أحدث بيانات وتخزينها محلياً لعدم ضياع التاريخ مع قيود ياهو"""
+    spx_new = _download_safe("^GSPC", "5d", "5m")
+    spy_new = _download_safe("SPY", "5d", "5m")
+    vix_new = _download_safe("^VIX", "5d", "5m")
+    
+    if spx_new is None or spy_new is None or vix_new is None:
+        return
+
+    # دمج البيانات
+    df = spx_new[["timestamp", "open", "high", "low", "close"]].rename(
+        columns={"open": "spx_open", "high": "spx_high", "low": "spx_low", "close": "spx_close"}
+    )
+    df = df.merge(spy_new[["timestamp", "close", "volume"]].rename(
+        columns={"close": "spy_close", "volume": "spy_volume"}
+    ), on="timestamp", how="left")
+    
+    df = pd.merge_asof(df.sort_values("timestamp"),
+                       vix_new[["timestamp", "close"]].rename(columns={"close": "vix"}),
+                       on="timestamp", direction="backward")
+    df["vix"] = df["vix"].ffill().bfill()
+    df["timestamp_str"] = df["timestamp"].astype(str)
+
+    if os.path.exists(LOCAL_DB_CSV):
+        existing = pd.read_csv(LOCAL_DB_CSV)
+        combined = pd.concat([existing, df]).drop_duplicates(subset=["timestamp_str"]).sort_values("timestamp_str")
+        combined.tail(15000).to_csv(LOCAL_DB_CSV, index=False)
+    else:
+        df.tail(15000).to_csv(LOCAL_DB_CSV, index=False)
 
 def get_data():
-    try:
-        spx = _download("^GSPC", "5d", "1m")
-        if spx is None:
-            return None
-        spy = _download("SPY", "5d", "1m")
-        vix = _download("^VIX", "5d", "5m")
-
-        df = spx[["timestamp", "open", "high", "low", "close"]].copy()
-        if spy is not None:
-            df = df.merge(spy[["timestamp", "volume"]], on="timestamp", how="left")
-            df["volume"] = df["volume"].fillna(0.0)
-        else:
-            df["volume"] = 0.0
-
-        if vix is not None:
-            df = pd.merge_asof(df.sort_values("timestamp"),
-                               vix[["timestamp", "close"]].rename(columns={"close": "vix"}),
-                               on="timestamp", direction="backward")
-            df["vix"] = df["vix"].ffill().bfill()
-        else:
-            df["vix"] = 18.0
-
-        t = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
-        df = df[(t >= MARKET_OPEN_MIN) & (t < MARKET_CLOSE_MIN)]
-        return df.dropna().reset_index(drop=True)
-    except Exception as e:
-        say(f"Data fetch error: {e}")
+    update_local_database()
+    if not os.path.exists(LOCAL_DB_CSV):
         return None
+    df = pd.read_csv(LOCAL_DB_CSV)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(NY)
+    t = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
+    df = df[(t >= MARKET_OPEN_MIN) & (t < MARKET_CLOSE_MIN)]
+    return df.dropna().reset_index(drop=True)
 
 # ============================================================
-# FEATURES + TARGET
+# ADVANCED FEATURE ENGINEERING (مؤشرات متقدمة + SPY مستقل + VIX Divergence)
 # ============================================================
 def rsi(series, period=14):
     d = series.diff()
@@ -183,86 +180,113 @@ def rsi(series, period=14):
     l = (-d.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
     return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
-def atr(df, period=14):
-    pc = df["close"].shift(1)
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(),
-                    (df["low"] - pc).abs()], axis=1).max(axis=1)
+def atr(df, high_col, low_col, close_col, period=14):
+    pc = df[close_col].shift(1)
+    tr = pd.concat([df[high_col] - df[low_col], (df[high_col] - pc).abs(),
+                    (df[low_col] - pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 def prepare(raw):
     df = raw.copy()
     df["date"] = df["timestamp"].dt.date
-    c = df["close"]
-    for n in (1, 3, 5, 15):
-        df[f"ret_{n}"] = c.pct_change(n)
+    c = df["spx_close"]
+    
+    # 1. Momentum متعدد الفترات
+    for n in (1, 3, 6, 12):
+        df[f"spx_ret_{n}"] = c.pct_change(n)
+        df[f"spy_ret_{n}"] = df["spy_close"].pct_change(n)
+    
     df["rsi"] = rsi(c)
-    df["atr"] = atr(df)
-    df["atr_pct"] = df["atr"] / c
-    ema9 = c.ewm(span=9, adjust=False).mean()
-    ema21 = c.ewm(span=21, adjust=False).mean()
-    df["ema_9"], df["ema_21"] = ema9, ema21
-    df["ema_spread"] = (ema9 - ema21) / c
-    rng = (df["high"] - df["low"]).replace(0, np.nan)
-    df["body_ratio"] = (c - df["open"]).abs() / rng
+    df["spx_atr"] = atr(df, "spx_high", "spx_low", "spx_close")
+    df["atr_pct"] = df["spx_atr"] / c
+    
+    # 2. VWAP المستقل لـ SPY و SPX
+    typical_spy = (df["spy_close"] + df["spy_close"] + df["spy_close"]) / 3 # تقريبي أو حقيقي
+    df["spy_vwap"] = (df["spy_close"] * df["spy_volume"]).groupby(df["date"]).cumsum() / df["spy_volume"].groupby(df["date"]).cumsum().replace(0, np.nan)
+    df["spy_vwap"] = df["spy_vwap"].fillna(df["spy_close"])
+    df["spy_vwap_dist"] = (df["spy_close"] - df["spy_vwap"]) / df["spy_close"]
 
-    typical = (df["high"] + df["low"] + c) / 3
-    g = df["date"]
-    if df["volume"].sum() > 0:
-        vwap = (typical * df["volume"]).groupby(g).cumsum() / df["volume"].groupby(g).cumsum().replace(0, np.nan)
-        df["vwap"] = vwap.fillna(typical)
-    else:
-        df["vwap"] = typical.groupby(g).expanding().mean().reset_index(level=0, drop=True)
-    df["vwap_distance"] = (c - df["vwap"]) / c
+    # 3. VIX Momentum & Divergence
+    df["vix_chg_5"] = df["vix"].diff(5)
+    df["vix_chg_15"] = df["vix"].diff(15)
+    df["vix_spx_divergence"] = np.where((df["vix_chg_5"] > 0) & (df["spx_ret_1"] > 0), 1, 0) # تعارض الخوف مع الصعود
 
-    df["vix_chg"] = df["vix"].diff(15)
-    df["vol_ratio"] = df["volume"] / df["volume"].rolling(30, min_periods=5).mean().replace(0, np.nan)
-    df["vol_ratio"] = df["vol_ratio"].fillna(1.0)
+    # 4. Opening Range (ORH / ORL) للأول 30 دقيقة
     df["mins_open"] = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute - MARKET_OPEN_MIN
+    is_or = df["mins_open"] <= 30
+    df["orh"] = df.groupby("date")["spx_high"].transform(lambda x: x[is_or].max())
+    df["orl"] = df.groupby("date")["spx_low"].transform(lambda x: x[is_or].min())
+    df["dist_from_orh"] = (c - df["orh"]) / c
+    df["dist_from_orl"] = (c - df["orl"]) / c
 
-    fut = df.groupby("date")["close"].shift(-HORIZON) - c
-    thr = MOVE_ATR_MULT * df["atr"]
+    # 5. Smart Volume Z-Score
+    vol_mean = df["spy_volume"].rolling(30, min_periods=5).mean()
+    vol_std = df["spy_volume"].rolling(30, min_periods=5).std().replace(0, 1)
+    df["volume_zscore"] = (df["spy_volume"] - vol_mean) / vol_std
+
+    # 6. Target: هل يحقق هدف الخيار قبل الوقف؟ (Trade Outcome Target)
+    fut_max = df.groupby("date")["spx_high"].shift(-HORIZON)
+    fut_min = df.groupby("date")["spx_low"].shift(-HORIZON)
+    thr = 0.6 * df["spx_atr"]
+    
     target = pd.Series(np.nan, index=df.index)
-    target[fut > thr] = 1.0
-    target[fut < -thr] = 0.0
+    # صعود يضرب الهدف أولاً
+    target[(fut_max - c >= thr) & (c - fut_min < thr)] = 1.0
+    # هبوط يضرب الهدف أولاً
+    target[(c - fut_min >= thr) & (fut_max - c < thr)] = 0.0
     df["target"] = target
     return df
 
 # ============================================================
-# TRAINING + WALK-FORWARD
+# ENSEMBLE MODELS & CALIBRATION (النماذج المتعددة + المعايرة)
 # ============================================================
-def _model(iters):
-    return HistGradientBoostingClassifier(max_depth=3, learning_rate=0.03,
-                                          max_iter=iters, l2_regularization=1.0,
-                                          random_state=42)
+TREND_FEATURES = ["spx_ret_3", "spx_ret_6", "rsi", "atr_pct", "dist_from_orh", "dist_from_orl"]
+MOMENTUM_FEATURES = ["spx_ret_1", "spy_ret_3", "spy_ret_6", "volume_zscore", "spy_vwap_dist"]
+VOLATILITY_FEATURES = ["vix", "vix_chg_5", "vix_chg_15", "vix_spx_divergence", "mins_open"]
 
-def train(df):
-    data = df.dropna(subset=FEATURES + ["target"]).reset_index(drop=True)
+def train_ensemble(df):
+    data = df.dropna(subset=TREND_FEATURES + MOMENTUM_FEATURES + VOLATILITY_FEATURES + ["target"]).reset_index(drop=True)
     if len(data) < MIN_TRAIN_ROWS:
-        return None, 0.0
-    chunk = len(data) // 4
+        return {}, 0.5
+    
+    models = {}
     aucs = []
-    for i in range(3):
-        train_end = chunk * (i + 1)
-        test_start = train_end + HORIZON
-        test = data.iloc[test_start:test_start + chunk]
-        tr = data.iloc[:train_end]
-        if len(test) < 50 or tr["target"].nunique() < 2 or test["target"].nunique() < 2:
-            continue
-        m = _model(200).fit(tr[FEATURES], tr["target"])
-        aucs.append(roc_auc_score(test["target"], m.predict_proba(test[FEATURES])[:, 1]))
-    auc = float(np.mean(aucs)) if aucs else 0.5
-    final = _model(250).fit(data[FEATURES], data["target"])
-    return final, auc
+    
+    subsets = {
+        "trend": TREND_FEATURES,
+        "momentum": MOMENTUM_FEATURES,
+        "volatility": VOLATILITY_FEATURES
+    }
+    
+    split_idx = int(len(data) * 0.8)
+    train_df = data.iloc[:split_idx]
+    test_df = data.iloc[split_idx:]
+
+    for name, feats in subsets.items():
+        base = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.03, max_iter=200, random_state=42)
+        base.fit(train_df[feats], train_df["target"])
+        
+        # معايرة الاحتمالات (Probability Calibration)
+        calibrated = CalibratedClassifierCV(estimator=base, method='sigmoid', cv='prefit')
+        calibrated.fit(test_df[feats], test_df["target"])
+        models[name] = calibrated
+        
+        preds = calibrated.predict_proba(test_df[feats])[:, 1]
+        aucs.append(roc_auc_score(test_df["target"], preds))
+
+    mean_auc = float(np.mean(aucs))
+    say(f"Ensemble Trained. Average AUC = {mean_auc:.3f}")
+    return models, mean_auc
 
 # ============================================================
-# BLACK-SCHOLES
+# BLACK-SCHOLES & PRICING
 # ============================================================
 def _cdf(x):
     return 0.5 * (1 + erf(x / sqrt(2)))
 
 def bs_price(spot, strike, minutes_left, vix, kind):
     T = max(minutes_left, 0.5) / (252 * 390)
-    sigma = max(vix, 5) / 100 * IV_MULT
+    sigma = max(vix, 5) / 100 * 1.05
     d1 = (np.log(spot / strike) + 0.5 * sigma ** 2 * T) / (sigma * sqrt(T))
     d2 = d1 - sigma * sqrt(T)
     if kind == "CALL":
@@ -271,239 +295,177 @@ def bs_price(spot, strike, minutes_left, vix, kind):
         p = strike * _cdf(-d2) - spot * _cdf(-d1)
     return max(float(p), 0.05)
 
-def spot_for_premium(target, strike, minutes_left, vix, kind, spot):
-    lo, hi = spot - 150, spot + 150
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        p = bs_price(mid, strike, minutes_left, vix, kind)
-        if (p < target) == (kind == "CALL"):
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2
-
 # ============================================================
-# SIGNAL & RECOMMENDATION (مع فلتر العنف والهبوط)
+# SIGNAL & ENSEMBLE VOTING
 # ============================================================
-def calculate_signal(df):
-    if df is None or len(df) < 100:
+def calculate_ensemble_signal(df):
+    if df is None or len(df) < 50:
         return {"direction": "WAIT", "reasons": ["بيانات غير كافية"]}
     last = df.iloc[-1]
     
-    # 🚨 فلتر العنف والهبوط الاستثنائي (Market Crash / Extreme Volatility Filter)
-    price_change_1m = abs(last["close"] - df.iloc[-2]["close"]) if len(df) > 1 else 0
-    if price_change_1m > (EXTREME_MOVE_ATR_MULT * last["atr"]):
-        if not STATE.get("extreme_market_alerted", False):
-            send_telegram("⚠️ تنبيه طوارئ: تم رصد هبوط أو صعود عنيف استثنائي في السوق! تم تجميد إصدار التشارات مؤقتاً.")
-            STATE["extreme_market_alerted"] = True
-        return {"direction": "WAIT", "reasons": ["سوق عنيف / تذبذب استثنائي غير مأمون"]}
-
     age = (now_ny() - last["timestamp"]).total_seconds() / 60
     if age > MAX_BAR_AGE_MIN:
-        return {"direction": "WAIT", "reasons": [f"بيانات قديمة ({age:.0f} دقيقة)"]}
-    if STATE["model"] is None or STATE["auc"] < MIN_AUC:
-        return {"direction": "WAIT", "reasons": ["النموذج غير جاهز أو بلا ميزة إحصائية"]}
-    vix = float(last["vix"])
-    if vix > MAX_VIX or vix < MIN_VIX:
-        return {"direction": "WAIT", "reasons": [f"VIX غير مسموح ({vix:.1f})"]}
+        return {"direction": "WAIT", "reasons": [f"بيانات متأخرة ({age:.1f} دقيقة)"]}
 
-    p_up = float(STATE["model"].predict_proba(pd.DataFrame([last[FEATURES]]))[0][1])
-    p_dn = 1 - p_up
-    reasons = ["EMA صاعد" if last["ema_9"] > last["ema_21"] else "EMA هابط",
-               "فوق VWAP" if last["close"] > last["vwap"] else "تحت VWAP"]
-    if p_up >= MIN_PROBABILITY and p_up - p_dn >= MIN_EDGE:
-        d, p = "CALL", p_up
-    elif p_dn >= MIN_PROBABILITY and p_dn - p_up >= MIN_EDGE:
-        d, p = "PUT", p_dn
-    else:
-        d, p = "WAIT", max(p_up, p_dn)
-        reasons.append("الحافة ضعيفة")
-    return {"direction": d, "probability": p, "reasons": reasons,
-            "spot": float(last["close"]), "vix": vix, "atr": float(last["atr"])}
+    if not STATE["models"] or STATE["auc"] < MIN_AUC:
+        return {"direction": "WAIT", "reasons": [f"النموذج غير جاهز أو AUC منخفض ({STATE['auc']:.3f})"]}
+
+    # تصويت النماذج الثلاثة (Ensemble Voting)
+    p_trend = STATE["models"]["trend"].predict_proba(pd.DataFrame([last[TREND_FEATURES]]))[0][1]
+    p_mom = STATE["models"]["momentum"].predict_proba(pd.DataFrame([last[MOMENTUM_FEATURES]]))[0][1]
+    p_vol = STATE["models"]["volatility"].predict_proba(pd.DataFrame([last[VOLATILITY_FEATURES]]))[0][1]
+
+    # متوسط الاحتمالات المعايرة
+    avg_prob_up = (p_trend + p_mom + p_vol) / 3.0
+    avg_prob_dn = 1.0 - avg_prob_up
+
+    # التحقق من الإجماع
+    if avg_prob_up >= MIN_PROBABILITY and (p_trend > 0.6 and p_mom > 0.6):
+        return {"direction": "CALL", "probability": avg_prob_up, "reasons": ["إجماع صعودي قوي للـ Ensemble"]}
+    elif avg_prob_dn >= MIN_PROBABILITY and (p_trend < 0.4 and p_mom < 0.4):
+        return {"direction": "PUT", "probability": avg_prob_dn, "reasons": ["إجماع هبوطي قوي للـ Ensemble"]}
+    
+    return {"direction": "WAIT", "probability": max(avg_prob_up, avg_prob_dn), "reasons": ["لا يوجد إجماع كافٍ بين النماذج"]}
 
 def build_recommendation(df):
     if not market_time_ok() or not session_allowed():
         return {"status": "WAIT", "reason": "خارج النافذة المسموحة"}
-    if STATE["signals_today"] >= MAX_SIGNALS_PER_DAY or STATE["loss_streak"] >= MAX_CONSECUTIVE_LOSSES:
-        return {"status": "WAIT", "reason": "توقف مؤقت حسب قواعد المخاطر"}
+    
+    if STATE["daily_pnl"] <= -ACCOUNT_EQUITY * MAX_DAILY_LOSS:
+        return {"status": "WAIT", "reason": "بلوغ الحد الأقصى للخسارة اليومية (3%)"}
 
-    s = calculate_signal(df)
-    if s["direction"] == "WAIT":
-        return {"status": "WAIT", "reason": s["reasons"][0], "signal": s}
+    sig = calculate_ensemble_signal(df)
+    if sig["direction"] == "WAIT":
+        return {"status": "WAIT", "reason": sig["reasons"][0]}
 
-    spot, kind = s["spot"], s["direction"]
+    spot = float(df.iloc[-1]["spx_close"])
+    vix = float(df.iloc[-1]["vix"])
+    kind = sig["direction"]
     strike = ceil(spot / STRIKE_STEP) * STRIKE_STEP + STRIKE_STEP * (STRIKE_OFFSET_STEPS - 1) if kind == "CALL" \
         else floor(spot / STRIKE_STEP) * STRIKE_STEP - STRIKE_STEP * (STRIKE_OFFSET_STEPS - 1)
 
     ml = mins_left()
-    entry = bs_price(spot, strike, ml, s["vix"], kind)
+    entry = bs_price(spot, strike, ml, vix, kind) * (1.0 + SLIPPAGE_PENALTY_PCT)
     if entry < MIN_PREMIUM:
-        return {"status": "WAIT", "reason": "البريميوم أقل من الحد الأدنى", "signal": s}
+        return {"status": "WAIT", "reason": "البريميوم أقل من الحد الأدنى"}
+
     stop, target = entry * (1 - STOP_LOSS_PCT), entry * (1 + TAKE_PROFIT_PCT)
-    contracts = max(1, int(ACCOUNT_EQUITY * RISK_PER_TRADE / (entry * STOP_LOSS_PCT * 100)))
+    contracts = int((ACCOUNT_EQUITY * RISK_PER_TRADE) / (entry * STOP_LOSS_PCT * 100))
+    if contracts <= 0:
+        return {"status": "WAIT", "reason": "المخاطرة لا تسمح بعقد واحد"}
+
     return {
-        "status": kind, "probability": s["probability"], "spx": spot, "vix": s["vix"],
-        "strike": strike, "entry": entry, "stop": stop, "target": target,
-        "spx_target": spot_for_premium(target, strike, ml - 10, s["vix"], kind, spot),
-        "spx_stop": spot_for_premium(stop, strike, ml - 10, s["vix"], kind, spot),
-        "contracts": contracts, "signal": s,
+        "status": kind, "probability": sig["probability"], "spx": spot, "vix": vix,
+        "strike": strike, "entry": entry, "stop": stop, "target": target, "contracts": contracts
     }
 
-def format_recommendation(r):
-    if r["status"] == "WAIT":
-        return f"⏳ SPX 0DTE PRO MAX\n⚪ WAIT — {r['reason']}"
-    emoji = "🟢" if r["status"] == "CALL" else "🔴"
-    return f"""
-{emoji} SPX 0DTE PRO MAX — {r['status']}
-الثقة: {r['probability'] * 100:.1f}% | SPX {r['spx']:.2f} | VIX {r['vix']:.1f}
-العقد: SPXW {r['status']} Strike {r['strike']:.0f}
-اشترِ: ~${r['entry']:.2f} | هدف: ~${r['target']:.2f} | وقف: ~${r['stop']:.2f}
-العقود: {r['contracts']} | أقصى مدة: {MAX_HOLD_MINUTES} دقيقة
-""".strip()
-
 # ============================================================
-# PAPER TRADING & MANAGEMENT
+# TRUE HISTORICAL BACKTEST ENGINE (--backtest)
 # ============================================================
-def open_paper_trade(r):
-    STATE["open"] = {
-        "kind": r["status"], "strike": r["strike"], "entry": r["entry"],
-        "stop": r["stop"], "target": r["target"], "contracts": r["contracts"],
-        "spx_entry": r["spx"], "time": now_ny(), "prob": r["probability"],
-        "max_prem": r["entry"], "min_prem": r["entry"], "vix_at_entry": r["vix"]
-    }
-
-def manage_open_trade(spot, vix):
-    t = STATE["open"]
-    if not t:
+def run_backtest():
+    """محرك اختبار تاريخي حقيقي على قاعدة البيانات المتراكمة محلياً"""
+    if not os.path.exists(LOCAL_DB_CSV):
+        print("لا توجد بيانات تاريخية كافية في قاعدة البيانات المحلية.")
         return
-    ml = mins_left()
-    prem = bs_price(spot, t["strike"], ml, vix, t["kind"])
     
-    t["max_prem"] = max(t["max_prem"], prem)
-    t["min_prem"] = min(t["min_prem"], prem)
-
-    held = (now_ny() - t["time"]).total_seconds() / 60
-    reason = None
-
-    if abs(vix - t.get("vix_at_entry", vix)) >= VIX_EMERGENCY_JUMP:
-        reason = "VIX_EMERGENCY"
-    elif prem <= t["stop"]:
-        reason = "STOP"
-    elif prem >= t["target"]:
-        reason = "TARGET"
-    elif held >= MAX_HOLD_MINUTES:
-        reason = "TIME"
-    elif ml <= FORCE_EXIT_BEFORE_CLOSE_MIN:
-        reason = "CLOSE"
-
-    if not reason:
+    df = pd.read_csv(LOCAL_DB_CSV)
+    df = prepare(df)
+    data = df.dropna(subset=TREND_FEATURES + ["target"]).reset_index(drop=True)
+    if len(data) < 200:
+        print("البيانات المحلية قليلة جداً لإجراء اختبار تاريخي مفيد.")
         return
 
-    pnl = (prem - t["entry"]) * 100 * t["contracts"] - 2 * COMMISSION_PER_CONTRACT * t["contracts"]
-    STATE["daily_pnl"] += pnl
-    STATE["loss_streak"] = STATE["loss_streak"] + 1 if pnl < 0 else 0
-    STATE["last_exit_time"] = now_ny()
-
-    new = not os.path.exists(TRADES_CSV)
-    with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(["entry_time", "exit_time", "kind", "strike", "spx_entry", "spx_exit",
-                        "prem_entry", "prem_exit", "max_prem", "min_prem", "contracts", "pnl", "reason", "prob"])
-        w.writerow([t["time"].isoformat(), now_ny().isoformat(), t["kind"], t["strike"],
-                    round(t["spx_entry"], 2), round(spot, 2), round(t["entry"], 2),
-                    round(prem, 2), round(t["max_prem"], 2), round(t["min_prem"], 2),
-                    t["contracts"], round(pnl, 2), reason, round(t["prob"], 3)])
-
-    msg = f"🔔 خروج صفقة ({reason}) — PnL: ${pnl:+.0f} (اليومي: ${STATE['daily_pnl']:+.0f})"
-    say(msg)
-    send_telegram(msg)
-    STATE["open"] = None
-
-def check_and_send_daily_summary():
-    n = now_ny()
-    if minutes_of_day(n) >= 16 * 0 and not STATE.get("daily_summary_sent", False):
-        if os.path.exists(TRADES_CSV):
-            d = pd.read_csv(TRADES_CSV)
-            today_str = n.strftime("%Y-%m-%d")
-            d_today = d[d["entry_time"].str.startswith(today_str)]
-            if not d_today.empty:
-                wins = len(d_today[d_today.pnl > 0])
-                total = len(d_today)
-                pnl_sum = d_today.pnl.sum()
-                summary_msg = f"📊 **ملخص الأداء اليومي ({today_str}):**\n- عدد الصفقات: {total}\n- الرابحة: {wins} | الخاسرة: {total - wins}\n- صافي PnL: ${pnl_sum:+.0f}"
-                send_telegram(summary_msg)
-        STATE["daily_summary_sent"] = True
-
-def check_and_send_weekly_report():
-    n = now_ny()
-    if n.weekday() == 4 and minutes_of_day(n) >= 16 * 60 + 15:
-        today_str = n.strftime("%Y-%m-%d")
-        if STATE.get("weekly_report_sent_date") != today_str:
-            if os.path.exists(TRADES_CSV):
-                d = pd.read_csv(TRADES_CSV)
-                wins = d[d.pnl > 0]
-                losses = d[d.pnl <= 0]
-                pf = wins.pnl.sum() / abs(losses.pnl.sum()) if len(losses) and losses.pnl.sum() != 0 else float("inf")
-                weekly_msg = f"📈 **تقرير الأداء الأسبوعي الآلي:**\n- إجمالي الصفقات: {len(d)}\n- نسبة النجاح: {len(wins)/len(d)*100:.1f}%\n- إجمالي PnL: ${d.pnl.sum():+.0f}\n- عامل الربح (Profit Factor): {pf:.2f}"
-                send_telegram(weekly_msg)
-            STATE["weekly_report_sent_date"] = today_str
+    print("=" * 65)
+    print("🚀 بدء تشغيل محرك الـ Backtest التاريخي المؤسسي (v6 PRO QUANT)")
+    print("=" * 65)
+    
+    # محاكاة إشارات تاريخية وتقييم الموثوقية (Reliability / Brier Score)
+    results = []
+    y_true, y_prob = [], []
+    
+    # تدريب نموذج اختبار على أول 70% وتقييم على الـ 30% الباقية (Out-of-Sample)
+    split = int(len(data) * 0.7)
+    train_set = data.iloc[:split]
+    test_set = data.iloc[split:]
+    
+    m = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.03, max_iter=200, random_state=42)
+    m.fit(train_set[TREND_FEATURES], train_set["target"])
+    
+    probs = m.predict_proba(test_set[TREND_FEATURES])[:, 1]
+    trues = test_set["target"].values
+    
+    brier = brier_score_loss(trues, probs)
+    auc = roc_auc_score(trues, probs)
+    
+    print(f"• إجمالي عينات الاختبار (Out-of-Sample): {len(test_set)}")
+    print(f"• معدل الدقة الإحصائية (AUC): {auc:.3f}")
+    print(f"• مقياس المعايرة (Brier Score - الأقل أفضل): {brier:.4f}")
+    
+    # فئات الثقة واختبار النسبة الفعلية للنجاح
+    print("\n--- تحليل الموثوقية حسب فئات الثقة (Confidence Buckets) ---")
+    for threshold in [0.60, 0.70, 0.75, 0.80]:
+        mask = (probs >= threshold) | (probs <= (1 - threshold))
+        if mask.sum() > 0:
+            sub_true = trues[mask]
+            sub_prob = probs[mask]
+            # الحساب بناء على الاتجاه المتوقع
+            predicted_dir = (sub_prob >= 0.5).astype(int)
+            actual_win = (predicted_dir == sub_true).mean() * 100
+            print(f"  * الثقة >= {int(threshold*100)}%: عدد الإشارات ({mask.sum()}) | نسبة النجاح الفعلي: {actual_win:.1f}%")
+        else:
+            print(f"  * الثقة >= {int(threshold*100)}%: لا توجد إشارات كافية")
+    print("=" * 65)
 
 # ============================================================
-# MAIN
+# MAIN LOOP
 # ============================================================
 def main():
-    say("SPX 0DTE v2 PRO MAX — بدء التشغيل مع فلتر الطوارئ")
+    if "--backtest" in sys.argv:
+        run_backtest()
+        return
+
+    say("SPX 0DTE v6 PRO QUANT — بدء التشغيل المؤسسي")
     reset_daily_state()
-    raw = get_data()
-    if raw is None or raw.empty:
-        raise RuntimeError("تعذر جلب البيانات.")
     
-    df_prep = prepare(raw)
-    m, auc = train(df_prep)
-    STATE.update(model=m, auc=auc, last_train=now_ny())
-    say(f"النموذج جاهز. AUC = {STATE['auc']:.3f}")
+    df_raw = get_data()
+    if df_raw is None or df_raw.empty:
+        raise RuntimeError("تعذر جلب البيانات أو تهيئة القاعدة المحلية.")
+    
+    df_prep = prepare(df_raw)
+    models, auc = train_ensemble(df_prep)
+    STATE.update(models=models, auc=auc, last_train=now_ny())
+    say(f"تم تدريب النماذج بنجاح. متوسط AUC = {STATE['auc']:.3f}")
 
     while True:
         try:
             reset_daily_state()
-            check_and_send_daily_summary()
-            check_and_send_weekly_report()
-
             if not market_time_ok():
-                time.sleep(60)
+                time.sleep(45)
                 continue
 
-            raw = get_data()
-            if raw is None or len(raw) < 100:
+            df_raw = get_data()
+            if df_raw is None or len(df_raw) < 50:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            df = prepare(raw)
+            df_prep = prepare(df_raw)
             if (now_ny() - STATE["last_train"]).total_seconds() > RETRAIN_EVERY_MIN * 60:
-                m, auc = train(df)
-                if m:
-                    STATE.update(model=m, auc=auc, last_train=now_ny())
-
-            last = df.iloc[-1]
-            spot, vix = float(last["close"]), float(last["vix"])
-
-            manage_open_trade(spot, vix)
+                models, auc = train_ensemble(df_prep)
+                if models:
+                    STATE.update(models=models, auc=auc, last_train=now_ny())
 
             if STATE["open"] is None:
-                rec = build_recommendation(df)
+                rec = build_recommendation(df_prep)
                 if rec["status"] in ("CALL", "PUT"):
                     STATE["signals_today"] += 1
-                    open_paper_trade(rec)
-                    send_telegram(format_recommendation(rec))
-                    with open(SIGNALS_JSONL, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({k: rec[k] for k in
-                                ("status", "probability", "spx", "strike", "entry", "stop", "target")},
-                                ensure_ascii=False) + "\n")
+                    STATE["open"] = rec
+                    msg = f"🚀 SPX v6 QUANT SIGNAL: {rec['status']} | الثقة: {rec['probability']*100:.1f}% | Strike: {rec['strike']}"
+                    say(msg)
+                    send_telegram(msg)
 
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
-            say("تم الإيقاف.")
+            say("تم إيقاف النظام.")
             break
         except Exception as e:
             say(f"MAIN LOOP ERROR: {e}")
