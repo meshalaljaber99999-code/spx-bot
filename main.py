@@ -1,15 +1,14 @@
 
 # ============================================================
-# SPX 0DTE AI ADVISOR v18.1
-# REAL ^GSPC DATA | SPXW OPTIONS | TELEGRAM
-# RECOMMENDATIONS ONLY — NO AUTOMATIC ORDER EXECUTION
+# SPX 0DTE AI ADVISOR v18.2
+# Recommendation Only — NO automatic order execution
 # ============================================================
 
 import os
 import time
 import logging
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -18,902 +17,897 @@ import requests
 import yfinance as yf
 
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.pipeline import make_pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import accuracy_score, roc_auc_score
 
 warnings.filterwarnings("ignore")
 
-# ========================= CONFIG ============================
+# ======================== SETTINGS ==========================
 
 NY = ZoneInfo("America/New_York")
-UTC = ZoneInfo("UTC")
+UTC = timezone.utc
 
-ALPACA_KEY = (
+API_KEY = (
     os.getenv("ALPACA_API_KEY")
     or os.getenv("APCA_API_KEY_ID")
     or ""
-)
-ALPACA_SECRET = (
+).strip()
+
+API_SECRET = (
     os.getenv("ALPACA_SECRET_KEY")
     or os.getenv("APCA_API_SECRET_KEY")
     or ""
-)
+).strip()
 
-ALPACA_DATA_URL = os.getenv(
-    "ALPACA_DATA_URL",
-    "https://data.alpaca.markets"
-).rstrip("/")
-
-ALPACA_TRADE_URL = os.getenv(
+# Keep paper trading as the default.
+TRADE_URL = os.getenv(
     "ALPACA_TRADE_URL",
     "https://paper-api.alpaca.markets"
 ).rstrip("/")
 
-STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
-OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative")
+DATA_URL = os.getenv(
+    "ALPACA_DATA_URL",
+    "https://data.alpaca.markets"
+).rstrip("/")
 
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").lower()
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-MAX_SPX_AGE_MIN = float(os.getenv("MAX_SPX_AGE_MIN", "12"))
-MAX_STOCK_AGE_MIN = float(os.getenv("MAX_STOCK_AGE_MIN", "15"))
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-MIN_MODEL_AUC = float(os.getenv("MIN_MODEL_AUC", "0.52"))
-MIN_MODEL_CONFIDENCE = float(
-    os.getenv("MIN_MODEL_CONFIDENCE", "0.56")
-)
+MIN_AUC = float(os.getenv("MIN_MODEL_AUC", "0.52"))
+MIN_CONFIDENCE = float(os.getenv("MIN_MODEL_CONFIDENCE", "0.56"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.20"))
 
-MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "2"))
-MIN_RR = float(os.getenv("MIN_RR", "1.25"))
-
-# عدد الشموع المستقبلية المستخدمة في تعريف الهدف التدريبي.
+SCAN_SECONDS = max(20, int(os.getenv("SCAN_SECONDS", "60")))
 LABEL_HORIZON = 3
-
-STOCKS = [
-    "SPY", "QQQ", "NVDA", "AAPL", "MSFT",
-    "AMD", "AMZN", "META", "GOOGL", "TSLA"
-]
+MAX_BARS = 5000
+MAX_CONTRACTS_TO_CHECK = 15
 
 FEATURES = [
     "ret_1", "ret_3", "ret_6",
     "rsi", "ema_spread", "ema_long_spread",
     "atr_pct", "range_pct", "body_ratio",
-    "volatility", "momentum_accel"
+    "volatility", "momentum_accel",
+    "spy_ret_1", "spy_ret_3", "spy_ema_spread", "spy_rsi",
+    "qqq_ret_1", "qqq_ret_3", "qqq_ema_spread", "qqq_rsi",
 ]
-
-# ========================= LOGGING ===========================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s EDT | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("SPX_ADVISOR")
+
+HTTP = requests.Session()
 
 
-def logmsg(message):
-    log.info(message)
+def log(message, level="info"):
+    getattr(logging, level, logging.info)(message)
 
 
-# ========================= TIME ==============================
+def utc_now():
+    return datetime.now(UTC)
 
-def now_ny():
+
+def ny_now():
     return datetime.now(NY)
 
 
-def today_ny():
-    return now_ny().date().isoformat()
-
-
-def normalize_time(df, column="timestamp"):
-    """
-    توحيد التوقيت إلى datetime64[ns, UTC].
-    هذا يعالج اختلاف datetime64[s, UTC] و datetime64[us, UTC].
-    """
-    if df is None or df.empty or column not in df.columns:
-        return df
-
-    out = df.copy()
-    out[column] = pd.to_datetime(
-        out[column], utc=True, errors="coerce"
-    )
-
-    out = out.dropna(subset=[column])
-
-    # تثبيت الدقة لتفادي MergeError بين مصادر البيانات.
-    out[column] = out[column].astype("datetime64[ns, UTC]")
-
-    return out.sort_values(column).reset_index(drop=True)
-
-
-def market_is_open():
-    now = now_ny()
-
-    if now.weekday() >= 5:
-        return False
-
-    open_time = now.replace(
-        hour=9, minute=30, second=0, microsecond=0
-    )
-    close_time = now.replace(
-        hour=16, minute=0, second=0, microsecond=0
-    )
-
-    return open_time <= now <= close_time
-
-
-# ========================= TELEGRAM ==========================
-
-def send_telegram(message):
-    if not TG_TOKEN or not TG_CHAT:
-        logmsg("Telegram not configured; message printed locally.")
-        logmsg(message.replace("\n", " | "))
-        return False
-
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-
-    try:
-        response = requests.post(
-            url,
-            json={
-                "chat_id": TG_CHAT,
-                "text": message,
-                "disable_web_page_preview": True
-            },
-            timeout=15
-        )
-
-        if response.status_code != 200:
-            logmsg(
-                f"Telegram error {response.status_code}: "
-                f"{response.text[:300]}"
-            )
-            return False
-
-        return True
-
-    except Exception as exc:
-        logmsg(f"Telegram exception: {exc}")
-        return False
-
-
-# ========================= ALPACA REQUESTS ===================
-
 def alpaca_headers():
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError(
+            "Missing Alpaca keys. Set ALPACA_API_KEY and "
+            "ALPACA_SECRET_KEY in Railway Variables."
+        )
     return {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET
+        "APCA-API-KEY-ID": API_KEY,
+        "APCA-API-SECRET-KEY": API_SECRET,
     }
 
 
-def alpaca_get(url, params=None, timeout=20):
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        raise RuntimeError(
-            "Missing Alpaca keys. Set ALPACA_API_KEY and "
-            "ALPACA_SECRET_KEY in your deployment environment."
+def normalize_bars(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"], utc=True, errors="coerce"
         )
-
-    response = requests.get(
-        url,
-        headers=alpaca_headers(),
-        params=params,
-        timeout=timeout
-    )
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Alpaca HTTP {response.status_code}: "
-            f"{response.text[:500]}"
+        df = df.dropna(subset=["timestamp"])
+        df = df.set_index("timestamp")
+    else:
+        df.index = pd.to_datetime(
+            df.index, utc=True, errors="coerce"
         )
+        df = df.loc[~df.index.isna()]
 
-    return response.json()
-
-
-# ========================= REAL SPX DATA ====================
-
-def fetch_real_spx():
-    """
-    يستخدم ^GSPC من Yahoo Finance.
-    هذه بيانات المؤشر، وليست أسعار عقود SPXW.
-    قد تتأخر البيانات أو تتوقف حسب توفر المصدر.
-    """
-    ticker = yf.Ticker("^GSPC")
-
-    raw = ticker.history(
-        period="60d",
-        interval="5m",
-        auto_adjust=False,
-        prepost=False
+    df.index = pd.DatetimeIndex(
+        pd.to_datetime(df.index, utc=True)
     )
-
-    if raw is None or raw.empty:
-        raise RuntimeError("Yahoo returned no ^GSPC bars.")
-
-    raw = raw.reset_index()
-
-    time_col = "Datetime" if "Datetime" in raw.columns else "Date"
-
-    raw = raw.rename(columns={
-        time_col: "timestamp",
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Volume": "volume"
-    })
-
-    raw["timestamp"] = pd.to_datetime(
-        raw["timestamp"], utc=True, errors="coerce"
-    )
+    df.index.name = "timestamp"
+    df = df[~df.index.duplicated(keep="last")].sort_index()
 
     for col in ["open", "high", "low", "close", "volume"]:
-        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    raw = raw.dropna(
-        subset=["timestamp", "open", "high", "low", "close"]
-    )
+    required = [
+        col for col in ["open", "high", "low", "close"]
+        if col in df.columns
+    ]
+    if required:
+        df = df.dropna(subset=required)
 
-    raw = normalize_time(raw)
+    return df
 
-    if raw.empty:
-        raise RuntimeError("No valid ^GSPC rows after normalization.")
 
-    latest = raw["timestamp"].iloc[-1]
-    age = (
-        pd.Timestamp.now(tz="UTC") - latest
-    ).total_seconds() / 60.0
+# ======================== MARKET DATA =======================
 
-    logmsg(
-        f"[SPX DATA] ^GSPC bars={len(raw)} | "
-        f"last={latest} | age={age:.1f}m"
-    )
-
-    if age > MAX_SPX_AGE_MIN:
-        raise RuntimeError(
-            f"SPX data stale: age={age:.1f} minutes"
+def get_spx_bars():
+    """SPX index bars from Yahoo Finance, not SPY multiplied by 10."""
+    try:
+        raw = yf.download(
+            "^GSPC",
+            period="60d",
+            interval="5m",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
         )
 
-    return raw
+        if raw is None or raw.empty:
+            raise RuntimeError("Yahoo returned no ^GSPC data")
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        raw = raw.rename(columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        })
+
+        raw = normalize_bars(raw)
+
+        raw = raw[
+            ["open", "high", "low", "close"]
+        ].tail(MAX_BARS)
+
+        if len(raw) < 300:
+            raise RuntimeError(f"Too few SPX bars: {len(raw)}")
+
+        age = (
+            utc_now() - raw.index[-1].to_pydatetime()
+        ).total_seconds() / 60
+
+        log(
+            f"[SPX DATA] ^GSPC bars={len(raw)} "
+            f"| last={raw.index[-1]} | age={age:.1f}m"
+        )
+        return raw
+
+    except Exception as exc:
+        log(f"[SPX DATA ERROR] {exc}", "error")
+        return pd.DataFrame()
 
 
-# ========================= STOCK DATA ========================
+def get_stock_bars(symbol):
+    """Fetch 5-minute bars for SPY or QQQ from Alpaca."""
+    try:
+        end = utc_now()
+        start = end - timedelta(days=10)
 
-def fetch_stock_bars(symbol, limit=1000):
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-
-    end = datetime.now(UTC)
-    start = end - timedelta(days=10)
-
-    payload = alpaca_get(
-        url,
-        params={
+        params = {
             "timeframe": "5Min",
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "limit": limit,
+            "start": start.isoformat().replace("+00:00", "Z"),
+            "end": end.isoformat().replace("+00:00", "Z"),
+            "limit": 10000,
             "adjustment": "raw",
-            "feed": STOCK_FEED,
-            "sort": "asc"
+            "feed": DATA_FEED,
+            "sort": "asc",
         }
-    )
 
-    rows = payload.get("bars", [])
-
-    if not rows:
-        raise RuntimeError(
-            f"No stock bars for {symbol}. "
-            f"Check Alpaca data-feed permissions."
+        response = HTTP.get(
+            f"{DATA_URL}/v2/stocks/{symbol}/bars",
+            headers=alpaca_headers(),
+            params=params,
+            timeout=25,
         )
 
-    df = pd.DataFrame(rows)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Alpaca HTTP {response.status_code}: "
+                f"{response.text[:250]}"
+            )
 
-    df = df.rename(columns={
-        "t": "timestamp",
-        "o": "open",
-        "h": "high",
-        "l": "low",
-        "c": "close",
-        "v": "volume"
-    })
+        rows = response.json().get("bars", [])
+        if not rows:
+            raise RuntimeError(
+                f"No {symbol} bars; feed={DATA_FEED}"
+            )
 
-    df = normalize_time(df)
+        df = pd.DataFrame(rows).rename(columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+        })
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = normalize_bars(df)
+        df = df[
+            ["open", "high", "low", "close"]
+        ].tail(MAX_BARS)
 
-    return df.dropna(
-        subset=["open", "high", "low", "close"]
-    ).reset_index(drop=True)
+        if len(df) < 100:
+            raise RuntimeError(
+                f"Too few {symbol} bars: {len(df)}"
+            )
+
+        age = (
+            utc_now() - df.index[-1].to_pydatetime()
+        ).total_seconds() / 60
+
+        log(
+            f"[DATA] {symbol}: {len(df)} bars "
+            f"| last={df.index[-1]} | age={age:.1f}m"
+        )
+        return df
+
+    except Exception as exc:
+        log(f"[DATA ERROR] {symbol}: {exc}", "error")
+        return pd.DataFrame()
 
 
-# ========================= FEATURES ==========================
+# ======================== INDICATORS =======================
 
-def add_indicators(df):
-    """
-    حساب المؤشرات على بيانات مصدر واحد.
-    جميع العمليات الزمنية تستخدم timestamp موحدًا.
-    """
-    df = normalize_time(df)
-
-    if df is None or len(df) < 80:
-        raise RuntimeError("Insufficient bars to calculate indicators.")
-
-    out = df.copy()
-
-    close = out["close"].astype(float)
-    high = out["high"].astype(float)
-    low = out["low"].astype(float)
-    open_ = out["open"].astype(float)
-
-    out["ret_1"] = close.pct_change(1)
-    out["ret_3"] = close.pct_change(3)
-    out["ret_6"] = close.pct_change(6)
-
+def calc_rsi(close, period=14):
     delta = close.diff()
+
     gain = delta.clip(lower=0).ewm(
-        alpha=1 / 14, adjust=False
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
     ).mean()
+
     loss = (-delta.clip(upper=0)).ewm(
-        alpha=1 / 14, adjust=False
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
     ).mean()
 
     rs = gain / loss.replace(0, np.nan)
-    out["rsi"] = 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + rs))
 
-    ema9 = close.ewm(span=9, adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
 
-    out["ema_spread"] = (ema9 - ema21) / close
-    out["ema_long_spread"] = (ema21 - ema50) / close
+def build_features(bars, prefix=""):
+    df = normalize_bars(bars)
 
-    previous_close = close.shift(1)
+    if df.empty:
+        return pd.DataFrame()
 
-    tr = pd.concat([
-        high - low,
-        (high - previous_close).abs(),
-        (low - previous_close).abs()
+    o = df["open"]
+    h = df["high"]
+    low = df["low"]
+    c = df["close"]
+
+    result = pd.DataFrame(index=df.index)
+
+    result[f"{prefix}ret_1"] = c.pct_change(1)
+    result[f"{prefix}ret_3"] = c.pct_change(3)
+    result[f"{prefix}ret_6"] = c.pct_change(6)
+
+    result[f"{prefix}rsi"] = calc_rsi(c)
+
+    ema9 = c.ewm(span=9, adjust=False).mean()
+    ema21 = c.ewm(span=21, adjust=False).mean()
+    ema50 = c.ewm(span=50, adjust=False).mean()
+
+    result[f"{prefix}ema_spread"] = (
+        (ema9 - ema21) / c.replace(0, np.nan)
+    )
+
+    result[f"{prefix}ema_long_spread"] = (
+        (ema21 - ema50) / c.replace(0, np.nan)
+    )
+
+    previous_close = c.shift(1)
+
+    true_range = pd.concat([
+        h - low,
+        (h - previous_close).abs(),
+        (low - previous_close).abs(),
     ], axis=1).max(axis=1)
 
-    atr = tr.rolling(14).mean()
-    out["atr_pct"] = atr / close
-    out["range_pct"] = (high - low) / close
+    atr = true_range.rolling(14).mean()
 
-    candle_range = (high - low).replace(0, np.nan)
-    out["body_ratio"] = (close - open_).abs() / candle_range
-
-    out["volatility"] = out["ret_1"].rolling(15).std()
-    out["momentum_accel"] = out["ret_3"].diff(3)
-
-    return out.replace([np.inf, -np.inf], np.nan)
-
-
-# ========================= FIXED MERGE =======================
-
-def make_features(spx_df, spy_df, qqq_df):
-    """
-    يدمج SPX مع SPY وQQQ باستخدام merge_asof.
-    قبل الدمج:
-      1) تحويل التوقيت إلى UTC.
-      2) توحيد الدقة إلى ns.
-      3) حذف التوقيتات المفقودة.
-      4) ترتيب البيانات تصاعديًا.
-    """
-    spx = add_indicators(spx_df)
-    spy = add_indicators(spy_df)
-    qqq = add_indicators(qqq_df)
-
-    spx = normalize_time(spx)
-    spy = normalize_time(spy)
-    qqq = normalize_time(qqq)
-
-    # اختيار أعمدة السوق التي نحتاجها فقط لتجنب تضارب الأسماء.
-    spy_cols = spy[[
-        "timestamp", "ret_1", "ret_3",
-        "ema_spread", "rsi"
-    ]].rename(columns={
-        "ret_1": "spy_ret_1",
-        "ret_3": "spy_ret_3",
-        "ema_spread": "spy_ema_spread",
-        "rsi": "spy_rsi"
-    })
-
-    qqq_cols = qqq[[
-        "timestamp", "ret_1", "ret_3",
-        "ema_spread", "rsi"
-    ]].rename(columns={
-        "ret_1": "qqq_ret_1",
-        "ret_3": "qqq_ret_3",
-        "ema_spread": "qqq_ema_spread",
-        "rsi": "qqq_rsi"
-    })
-
-    # تثبيت النوع قبل كل عملية merge_asof.
-    for frame in (spx, spy_cols, qqq_cols):
-        frame["timestamp"] = pd.to_datetime(
-            frame["timestamp"], utc=True
-        ).astype("datetime64[ns, UTC]")
-        frame.sort_values("timestamp", inplace=True)
-        frame.reset_index(drop=True, inplace=True)
-
-    merged = pd.merge_asof(
-        spx,
-        spy_cols,
-        on="timestamp",
-        direction="backward",
-        tolerance=pd.Timedelta("15min")
+    result[f"{prefix}atr_pct"] = (
+        atr / c.replace(0, np.nan)
     )
 
-    merged["timestamp"] = pd.to_datetime(
-        merged["timestamp"], utc=True
-    ).astype("datetime64[ns, UTC]")
-
-    qqq_cols["timestamp"] = pd.to_datetime(
-        qqq_cols["timestamp"], utc=True
-    ).astype("datetime64[ns, UTC]")
-
-    merged = pd.merge_asof(
-        merged.sort_values("timestamp"),
-        qqq_cols.sort_values("timestamp"),
-        on="timestamp",
-        direction="backward",
-        tolerance=pd.Timedelta("15min")
+    result[f"{prefix}range_pct"] = (
+        (h - low) / c.replace(0, np.nan)
     )
 
+    result[f"{prefix}body_ratio"] = (
+        (c - o) / (h - low).replace(0, np.nan)
+    )
+
+    result[f"{prefix}volatility"] = (
+        c.pct_change().rolling(20).std()
+    )
+
+    result[f"{prefix}momentum_accel"] = (
+        c.pct_change().diff(3)
+    )
+
+    return result.replace([np.inf, -np.inf], np.nan)
+
+
+def make_features(spx, spy, qqq):
+    spx = normalize_bars(spx)
+    spy = normalize_bars(spy)
+    qqq = normalize_bars(qqq)
+
+    if spx.empty or spy.empty or qqq.empty:
+        raise RuntimeError("SPX, SPY or QQQ data is missing")
+
+    spx_features = build_features(spx)
+    spy_features = build_features(spy, "spy_")
+    qqq_features = build_features(qqq, "qqq_")
+
+    spy_features = spy_features[
+        [
+            "spy_ret_1", "spy_ret_3",
+            "spy_ema_spread", "spy_rsi",
+        ]
+    ]
+
+    qqq_features = qqq_features[
+        [
+            "qqq_ret_1", "qqq_ret_3",
+            "qqq_ema_spread", "qqq_rsi",
+        ]
+    ]
+
+    # Normalize timestamps to the same UTC representation.
+    for frame in [spx_features, spy_features, qqq_features]:
+        frame.index = pd.DatetimeIndex(
+            pd.to_datetime(frame.index, utc=True)
+        )
+        frame.index.name = "timestamp"
+
+    merged = spx_features.join(
+        spy_features, how="inner"
+    ).join(
+        qqq_features, how="inner"
+    )
+
+    merged = merged.join(spx[["close"]], how="inner")
     merged = merged.replace([np.inf, -np.inf], np.nan)
-    merged = merged.sort_values("timestamp").reset_index(drop=True)
+    merged = merged.dropna(subset=FEATURES + ["close"])
 
-    return merged
-
-
-# ========================= ML TRAINING =======================
-
-def train_model(features_df):
-    """
-    نموذج تصنيف اتجاهي بسيط.
-    لا يمثل ضمانًا للربح، ولا يستخدم تقسيمًا عشوائيًا للزمن.
-    """
-    df = features_df.copy()
-
-    # الهدف: هل الإغلاق بعد LABEL_HORIZON شموع أعلى من الحالي؟
-    future_close = df["close"].shift(-LABEL_HORIZON)
-    df["target"] = np.where(
-        future_close.notna(),
-        (future_close > df["close"]).astype(int),
-        np.nan
-    )
-
-    # إزالة آخر الصفوف التي لا تملك هدفًا مستقبليًا.
-    df = df.iloc[:-LABEL_HORIZON].copy()
-
-    feature_cols = FEATURES
-
-    df = df.dropna(subset=feature_cols + ["target"])
-
-    if len(df) < 250:
+    if len(merged) < 400:
         raise RuntimeError(
-            f"Not enough clean training rows: {len(df)}"
+            f"Not enough aligned feature rows: {len(merged)}"
         )
 
-    X = df[feature_cols].astype(float)
-    y = df["target"].astype(int)
+    return merged.sort_index()
 
-    split = int(len(df) * 0.80)
 
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+# ======================== MACHINE LEARNING ==================
 
-    if y_train.nunique() < 2 or y_test.nunique() < 2:
-        raise RuntimeError(
-            "Training/test labels contain only one class."
-        )
-
-    model = make_pipeline(
+def new_model():
+    return make_pipeline(
         SimpleImputer(strategy="median"),
         HistGradientBoostingClassifier(
             max_iter=120,
             learning_rate=0.06,
             max_leaf_nodes=15,
             l2_regularization=1.0,
-            random_state=42
-        )
+            random_state=42,
+        ),
     )
 
-    model.fit(X_train, y_train)
 
-    probabilities = model.predict_proba(X_test)[:, 1]
+def train_model(df):
+    feature_cols = FEATURES.copy()
+    data = df.sort_index().copy()
+
+    future_close = data["close"].shift(-LABEL_HORIZON)
+    valid = future_close.notna()
+
+    X = data.loc[valid, feature_cols].replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+    y = (
+        future_close.loc[valid] > data.loc[valid, "close"]
+    ).astype(int)
+
+    if len(X) < 500:
+        raise RuntimeError(f"Not enough model rows: {len(X)}")
+
+    # Chronological split. Purge the label horizon before test data.
+    split = int(len(X) * 0.80)
+    train_end = split - LABEL_HORIZON
+
+    if train_end < 200 or len(X) - split < 100:
+        raise RuntimeError("Insufficient train/test data")
+
+    X_train = X.iloc[:train_end]
+    y_train = y.iloc[:train_end]
+
+    X_test = X.iloc[split:]
+    y_test = y.iloc[split:]
+
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        raise RuntimeError(
+            "Train or test labels contain only one class"
+        )
+
+    evaluator = new_model()
+    evaluator.fit(X_train, y_train)
+
+    probabilities = evaluator.predict_proba(X_test)[:, 1]
     predictions = (probabilities >= 0.5).astype(int)
 
-    accuracy = accuracy_score(y_test, predictions)
-    auc = roc_auc_score(y_test, probabilities)
-
-    logmsg(
-        f"[MODEL] rows={len(df)} | "
-        f"test_accuracy={accuracy:.3f} | test_auc={auc:.3f}"
+    accuracy = float(
+        accuracy_score(y_test, predictions)
+    )
+    auc = float(
+        roc_auc_score(y_test, probabilities)
     )
 
-    return model, feature_cols, float(auc), float(accuracy)
+    baseline_class = int(y_train.mean() >= 0.5)
+    baseline_accuracy = float(
+        (y_test == baseline_class).mean()
+    )
+
+    log(
+        f"[MODEL] rows={len(df)} "
+        f"| train={len(X_train)} | test={len(X_test)} "
+        f"| accuracy={accuracy:.3f} "
+        f"| AUC={auc:.3f} "
+        f"| baseline={baseline_accuracy:.3f}"
+    )
+
+    # Fit the live model on all available labeled rows.
+    live_model = new_model()
+    live_model.fit(X, y)
+
+    return live_model, feature_cols, auc, accuracy
 
 
-# ========================= MARKET CONFIRMATION ===============
+def calculate_signal(df, model, feature_cols, auc):
+    if auc < MIN_AUC:
+        return (
+            "WAIT",
+            0.0,
+            f"AUC {auc:.3f} below threshold {MIN_AUC:.3f}",
+        )
 
-def get_confirmation(spx_row, spy_row, qqq_row):
-    votes = []
+    latest = df.iloc[-1]
+    live_x = latest[feature_cols].to_frame().T
 
-    def vote(row, label):
-        rsi = float(row.get("rsi", 50))
-        ema = float(row.get("ema_spread", 0))
-        ret = float(row.get("ret_3", 0))
+    probability_up = float(
+        model.predict_proba(live_x)[0, 1]
+    )
+    probability_down = 1.0 - probability_up
 
-        if ema > 0 and ret > 0 and rsi >= 50:
-            votes.append((label, "BULLISH"))
-        elif ema < 0 and ret < 0 and rsi <= 50:
-            votes.append((label, "BEARISH"))
-        else:
-            votes.append((label, "NEUTRAL"))
+    spx_up = (
+        latest["ret_1"] > 0
+        and latest["ema_spread"] > 0
+    )
+    spy_up = (
+        latest["spy_ret_1"] > 0
+        and latest["spy_ema_spread"] > 0
+    )
+    qqq_up = (
+        latest["qqq_ret_1"] > 0
+        and latest["qqq_ema_spread"] > 0
+    )
 
-    vote(spx_row, "SPX")
-    vote(spy_row, "SPY")
-    vote(qqq_row, "QQQ")
+    up_votes = sum([bool(spx_up), bool(spy_up), bool(qqq_up)])
+    down_votes = 3 - up_votes
 
-    bullish = sum(v == "BULLISH" for _, v in votes)
-    bearish = sum(v == "BEARISH" for _, v in votes)
+    if (
+        probability_up >= MIN_CONFIDENCE
+        and up_votes >= 2
+    ):
+        return (
+            "CALL",
+            probability_up,
+            f"P(up)={probability_up:.1%}; votes={up_votes}/3",
+        )
 
-    return votes, bullish, bearish
+    if (
+        probability_down >= MIN_CONFIDENCE
+        and down_votes >= 2
+    ):
+        return (
+            "PUT",
+            probability_down,
+            f"P(down)={probability_down:.1%}; votes={down_votes}/3",
+        )
+
+    return (
+        "WAIT",
+        max(probability_up, probability_down),
+        f"No aligned setup; P(up)={probability_up:.1%}; "
+        f"P(down)={probability_down:.1%}; "
+        f"votes up/down={up_votes}/{down_votes}",
+    )
 
 
-# ========================= SPXW CONTRACTS ====================
+# ======================== TELEGRAM ==========================
 
-def get_spxw_contracts(option_type):
-    """
-    يحاول جلب عقود SPXW من واجهة Alpaca.
-    قد لا تكون عقود SPX/SPXW متاحة لحسابك أو عبر هذا المزود.
-    لا يستخدم SPY كبديل لعقد SPXW.
-    """
-    url = f"{ALPACA_TRADE_URL}/v2/options/contracts"
+def send_telegram(message):
+    if not TG_TOKEN or not TG_CHAT:
+        log("[TELEGRAM] Token or chat ID missing", "warning")
+        return False
 
-    params = {
-        "underlying_symbols": "SPX",
-        "expiration_date": today_ny(),
-        "type": option_type,
-        "status": "active",
-        "limit": 1000
-    }
+    try:
+        response = HTTP.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={
+                "chat_id": TG_CHAT,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
 
-    payload = alpaca_get(url, params=params)
-    contracts = payload.get("option_contracts", [])
+        if response.status_code >= 400:
+            log(
+                f"[TELEGRAM ERROR] {response.status_code}: "
+                f"{response.text[:200]}",
+                "error",
+            )
+            return False
 
-    results = []
+        if not response.json().get("ok", False):
+            log("[TELEGRAM ERROR] API returned ok=false", "error")
+            return False
 
-    for contract in contracts:
-        symbol = str(contract.get("symbol", "")).upper()
-        root = str(contract.get("root_symbol", "")).upper()
-        underlying = str(
-            contract.get("underlying_symbol", "SPX")
-        ).upper()
+        log("[TELEGRAM] Message sent")
+        return True
 
-        if underlying != "SPX":
-            continue
+    except Exception as exc:
+        log(f"[TELEGRAM ERROR] {exc}", "error")
+        return False
 
-        # نريد SPXW فقط، لا عقود SPX القياسية.
-        if root == "SPXW" or symbol.startswith("SPXW"):
-            results.append(contract)
+
+# ======================== SPXW OPTIONS ======================
+
+def get_spxw_contracts(direction):
+    try:
+        params = {
+            "underlying_symbols": "SPX",
+            "expiration_date": ny_now().date().isoformat(),
+            "type": "call" if direction == "CALL" else "put",
+            "status": "active",
+            "limit": 1000,
+        }
+
+        response = HTTP.get(
+            f"{TRADE_URL}/v2/options/contracts",
+            headers=alpaca_headers(),
+            params=params,
+            timeout=25,
+        )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Contracts HTTP {response.status_code}: "
+                f"{response.text[:250]}"
+            )
+
+        payload = response.json()
+        contracts = payload.get(
+            "option_contracts",
+            payload.get("contracts", []),
+        ) or []
+
+        results = []
+
+        for contract in contracts:
+            symbol = contract.get("symbol", "")
+            root = contract.get("root_symbol", "")
+
+            if not symbol:
+                continue
+
+            if root != "SPXW" and not symbol.startswith("SPXW"):
+                continue
+
+            try:
+                strike = float(contract["strike_price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            results.append({
+                "symbol": symbol,
+                "strike": strike,
+                "expiration": contract.get("expiration_date", ""),
+            })
+
+        return results
+
+    except Exception as exc:
+        log(f"[CONTRACT ERROR] {exc}", "error")
+        return []
+
+
+def get_option_quotes(symbols):
+    results = {}
+    endpoint = f"{DATA_URL}/v1beta1/options/quotes/latest"
+
+    # Quote requests are batched, not sent once per contract.
+    for start in range(0, len(symbols), 100):
+        batch = symbols[start:start + 100]
+
+        try:
+            response = HTTP.get(
+                endpoint,
+                headers=alpaca_headers(),
+                params={
+                    "symbols": ",".join(batch),
+                    "feed": OPTIONS_FEED,
+                },
+                timeout=25,
+            )
+
+            if response.status_code >= 400:
+                log(
+                    f"[QUOTE ERROR] HTTP {response.status_code}: "
+                    f"{response.text[:200]}",
+                    "warning",
+                )
+                continue
+
+            payload = response.json()
+            quotes = payload.get("quotes", {}) or {}
+
+            if isinstance(quotes, dict):
+                results.update(quotes)
+
+        except Exception as exc:
+            log(f"[QUOTE ERROR] {exc}", "warning")
 
     return results
 
 
-def get_option_quote(symbol):
-    url = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+def number_from(quote, *keys):
+    for key in keys:
+        try:
+            value = quote.get(key)
+            if value is not None:
+                value = float(value)
+                if np.isfinite(value):
+                    return value
+        except (TypeError, ValueError):
+            pass
 
-    payload = alpaca_get(
-        url,
-        params={
-            "symbols": symbol,
-            "feed": OPTIONS_FEED
-        }
-    )
-
-    quotes = payload.get("quotes", {})
-    quote = quotes.get(symbol)
-
-    if quote is None and quotes:
-        quote = next(iter(quotes.values()))
-
-    if not quote:
-        return None
-
-    bid = float(quote.get("bp", 0) or 0)
-    ask = float(quote.get("ap", 0) or 0)
-    quote_time = quote.get("t")
-
-    if bid <= 0 or ask <= 0 or ask < bid:
-        return None
-
-    if quote_time:
-        qtime = pd.to_datetime(quote_time, utc=True)
-        age = (
-            pd.Timestamp.now(tz="UTC") - qtime
-        ).total_seconds()
-
-        if age > 180:
-            logmsg(
-                f"[OPTIONS] stale quote {symbol}: age={age:.0f}s"
-            )
-            return None
-
-    return {
-        "symbol": symbol,
-        "bid": bid,
-        "ask": ask,
-        "mid": (bid + ask) / 2.0,
-        "spread_pct": (ask - bid) / max((ask + bid) / 2.0, 0.01),
-        "timestamp": quote_time
-    }
+    return None
 
 
-def choose_contract(direction):
-    option_type = "call" if direction == "CALL" else "put"
-
-    try:
-        contracts = get_spxw_contracts(option_type)
-    except Exception as exc:
-        logmsg(f"[OPTIONS] Contract lookup failed: {exc}")
-        return None
+def choose_contract(direction, spot_price):
+    contracts = get_spxw_contracts(direction)
 
     if not contracts:
-        logmsg(
-            "[OPTIONS] No SPXW contracts returned. "
-            "Check account/API support and contract endpoint filters."
+        log("[CONTRACT] No SPXW contracts found", "warning")
+        return None
+
+    # Only inspect the 15 strikes closest to actual SPX spot.
+    contracts.sort(
+        key=lambda item: abs(item["strike"] - spot_price)
+    )
+    candidates = contracts[:MAX_CONTRACTS_TO_CHECK]
+
+    quotes = get_option_quotes(
+        [item["symbol"] for item in candidates]
+    )
+
+    viable = []
+
+    for contract in candidates:
+        quote = quotes.get(contract["symbol"])
+
+        if not isinstance(quote, dict):
+            continue
+
+        bid = number_from(quote, "bp", "bid_price", "bid")
+        ask = number_from(quote, "ap", "ask_price", "ask")
+
+        if (
+            bid is None or ask is None
+            or bid <= 0 or ask <= 0 or ask < bid
+        ):
+            continue
+
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+
+        if spread_pct > MAX_SPREAD_PCT:
+            continue
+
+        viable.append({
+            **contract,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread_pct": spread_pct,
+            "distance": abs(contract["strike"] - spot_price),
+        })
+
+    if not viable:
+        log(
+            "[CONTRACT] No nearby contract passed quote/spread checks",
+            "warning",
         )
         return None
 
-    # اختيار عقد قريب من السعر الحالي قدر الإمكان.
-    # إذا لم توفر البيانات strike واضحًا، لا نخترع قيمة.
-    candidates = []
-
-    for contract in contracts:
-        symbol = contract.get("symbol")
-        if not symbol:
-            continue
-
-        try:
-            strike = float(contract.get("strike_price"))
-        except (TypeError, ValueError):
-            continue
-
-        try:
-            quote = get_option_quote(symbol)
-        except Exception as exc:
-            logmsg(f"[OPTIONS] Quote failed for {symbol}: {exc}")
-            continue
-
-        if not quote:
-            continue
-
-        # نرفض الفارق السعري الكبير.
-        if quote["spread_pct"] > 0.20:
-            continue
-
-        candidates.append((strike, quote))
-
-    if not candidates:
-        logmsg("[OPTIONS] No suitable quoted SPXW contracts.")
-        return None
-
-    # لا يوجد هنا سعر SPX حالي لفرض strike معيّن؛
-    # نرتب وفق ضيق السبريد والسيولة السعرية المتاحة فقط.
-    candidates.sort(
+    # First prefer distance from SPX spot, then narrower spread.
+    viable.sort(
         key=lambda item: (
-            item[1]["spread_pct"],
-            item[1]["mid"]
+            item["distance"],
+            item["spread_pct"],
+            item["mid"],
         )
     )
 
-    return candidates[0][1]
+    selected = viable[0]
 
-
-# ========================= SIGNAL ENGINE =====================
-
-def calculate_signal(model, feature_cols, auc, features_df,
-                     spy_df, qqq_df):
-
-    if auc < MIN_MODEL_AUC:
-        return {
-            "direction": "WAIT",
-            "reason": f"Model AUC below threshold ({auc:.3f})"
-        }
-
-    latest = features_df.iloc[-1]
-
-    if latest[feature_cols].isna().any():
-        return {
-            "direction": "WAIT",
-            "reason": "Latest feature row contains missing values"
-        }
-
-    X_latest = latest[feature_cols].astype(float).to_frame().T
-    prob_up = float(model.predict_proba(X_latest)[0, 1])
-    prob_down = 1.0 - prob_up
-
-    spy = add_indicators(spy_df).iloc[-1]
-    qqq = add_indicators(qqq_df).iloc[-1]
-
-    votes, bullish, bearish = get_confirmation(
-        latest, spy, qqq
+    log(
+        f"[CONTRACT] {selected['symbol']} "
+        f"| strike={selected['strike']:.2f} "
+        f"| bid={selected['bid']:.2f} "
+        f"| ask={selected['ask']:.2f} "
+        f"| spread={selected['spread_pct']:.1%} "
+        f"| SPX={spot_price:.2f}"
     )
 
-    logmsg(
-        f"[MODEL] prob_up={prob_up:.3f} | "
-        f"prob_down={prob_down:.3f} | AUC={auc:.3f}"
+    return selected
+
+
+# ======================== SCANNER ===========================
+
+def market_is_open():
+    now = ny_now()
+
+    if now.weekday() >= 5:
+        return False
+
+    minutes = now.hour * 60 + now.minute
+
+    return (
+        9 * 60 + 30 <= minutes < 16 * 60
     )
 
-    logmsg(
-        "[CONFIRMATION] " +
-        " | ".join(f"{name}:{value}" for name, value in votes)
-    )
-
-    if (
-        prob_up >= MIN_MODEL_CONFIDENCE
-        and bullish >= MIN_CONFIRMATIONS
-    ):
-        return {
-            "direction": "CALL",
-            "probability": prob_up,
-            "auc": auc,
-            "votes": votes,
-            "reason": "Model and market confirmation bullish"
-        }
-
-    if (
-        prob_down >= MIN_MODEL_CONFIDENCE
-        and bearish >= MIN_CONFIRMATIONS
-    ):
-        return {
-            "direction": "PUT",
-            "probability": prob_down,
-            "auc": auc,
-            "votes": votes,
-            "reason": "Model and market confirmation bearish"
-        }
-
-    return {
-        "direction": "WAIT",
-        "probability": max(prob_up, prob_down),
-        "auc": auc,
-        "votes": votes,
-        "reason": "No aligned model + confirmation signal"
-    }
-
-
-# ========================= MAIN SCAN ========================
 
 def run_scan():
-    logmsg("[SCAN] Starting scan.")
+    log("========== NEW SCAN ==========")
 
-    if not market_is_open():
-        logmsg("[MARKET] WAIT | السوق خارج ساعات التداول المعتادة.")
+    spx = get_spx_bars()
+    spy = get_stock_bars("SPY")
+    qqq = get_stock_bars("QQQ")
+
+    if spx.empty or spy.empty or qqq.empty:
+        log("[SIGNAL] WAIT | Market data unavailable", "warning")
         return
-
-    spx = fetch_real_spx()
-
-    stock_data = {}
-
-    for symbol in ["SPY", "QQQ"]:
-        try:
-            df = fetch_stock_bars(symbol)
-            latest_time = df["timestamp"].iloc[-1]
-            age = (
-                pd.Timestamp.now(tz="UTC") - latest_time
-            ).total_seconds() / 60.0
-
-            logmsg(
-                f"[DATA] {symbol}: {len(df)} bars | "
-                f"last={latest_time} | age={age:.1f}m"
-            )
-
-            if age > MAX_STOCK_AGE_MIN:
-                raise RuntimeError(
-                    f"{symbol} bars stale: {age:.1f} minutes"
-                )
-
-            stock_data[symbol] = df
-
-        except Exception as exc:
-            logmsg(f"[DATA ERROR] {symbol}: {exc}")
-            logmsg("[SCAN] WAIT | Market confirmation data unavailable.")
-            return
 
     try:
-        merged = make_features(
-            spx,
-            stock_data["SPY"],
-            stock_data["QQQ"]
+        merged = make_features(spx, spy, qqq)
+
+        model, columns, auc, accuracy = train_model(merged)
+
+        direction, confidence, reason = calculate_signal(
+            merged, model, columns, auc
         )
 
-        model, feature_cols, auc, accuracy = train_model(merged)
-
-        signal = calculate_signal(
-            model,
-            feature_cols,
-            auc,
-            merged,
-            stock_data["SPY"],
-            stock_data["QQQ"]
+        log(
+            f"[SIGNAL] {direction} "
+            f"| confidence={confidence:.1%} "
+            f"| {reason}"
         )
+
+        if direction == "WAIT":
+            return
+
+        # This is the ^GSPC index level, not SPY x 10.
+        spot_price = float(merged.iloc[-1]["close"])
+
+        contract = choose_contract(direction, spot_price)
+
+        if contract is None:
+            send_telegram(
+                "⚠️ SPX 0DTE AI ADVISOR v18.2\n"
+                f"Signal: {direction}\n"
+                f"Confidence: {confidence:.1%}\n"
+                f"SPX: {spot_price:,.2f}\n"
+                f"Model AUC: {auc:.3f}\n"
+                "No contract passed quote and spread filters.\n"
+                "Recommendation only — no order was placed."
+            )
+            return
+
+        message = (
+            "📊 SPX 0DTE AI ADVISOR v18.2\n\n"
+            f"Signal: {direction}\n"
+            f"Model confidence: {confidence:.1%}\n"
+            f"SPX index: {spot_price:,.2f}\n"
+            f"Contract: {contract['symbol']}\n"
+            f"Strike: {contract['strike']:,.2f}\n"
+            f"Bid / Ask: {contract['bid']:.2f} / "
+            f"{contract['ask']:.2f}\n"
+            f"Mid estimate: {contract['mid']:.2f}\n"
+            f"Spread: {contract['spread_pct']:.1%}\n"
+            f"Model AUC: {auc:.3f}\n"
+            f"Test accuracy: {accuracy:.3f}\n"
+            f"Reason: {reason}\n\n"
+            "⚠️ Recommendation only. No order was placed. "
+            "0DTE options can lose value rapidly."
+        )
+
+        send_telegram(message)
 
     except Exception as exc:
-        logmsg(f"[ANALYSIS ERROR] {type(exc).__name__}: {exc}")
-        return
-
-    direction = signal.get("direction", "WAIT")
-
-    if direction == "WAIT":
-        logmsg(f"[SIGNAL] WAIT | {signal.get('reason', '')}")
-        return
-
-    contract = choose_contract(direction)
-
-    if not contract:
-        logmsg(
-            f"[SIGNAL] {direction} detected, but no verified "
-            "SPXW quote was available. No contract recommendation sent."
+        log(
+            f"[SCAN ERROR] {type(exc).__name__}: {exc}",
+            "error",
         )
-        return
 
-    probability = signal.get("probability", 0.0)
-
-    message = (
-        f"📊 SPX 0DTE AI ADVISOR v18.1\n\n"
-        f"الاتجاه: {direction}\n"
-        f"العقد: {contract['symbol']}\n"
-        f"Bid: {contract['bid']:.2f}\n"
-        f"Ask: {contract['ask']:.2f}\n"
-        f"Mid: {contract['mid']:.2f}\n"
-        f"Spread: {contract['spread_pct'] * 100:.1f}%\n\n"
-        f"Model probability: {probability * 100:.1f}%\n"
-        f"Test AUC: {signal.get('auc', 0):.3f}\n"
-        f"Reason: {signal.get('reason', '')}\n\n"
-        f"⚠️ توصية آلية تجريبية، وليست ضمانًا للربح.\n"
-        f"لا يتم تنفيذ أي أمر شراء أو بيع تلقائيًا."
-    )
-
-    logmsg(
-        f"[SIGNAL] {direction} | contract={contract['symbol']} | "
-        f"mid={contract['mid']:.2f}"
-    )
-
-    send_telegram(message)
-
-
-# ========================= STARTUP ===========================
 
 def main():
-    logmsg("=" * 60)
-    logmsg("SPX 0DTE AI ADVISOR v18.1 STARTING")
-    logmsg("Real ^GSPC source | SPXW contract attempt")
-    logmsg("Recommendation only | No order execution")
-    logmsg(f"Stock feed={STOCK_FEED} | Options feed={OPTIONS_FEED}")
-    logmsg("=" * 60)
+    log("SPX 0DTE AI ADVISOR v18.2 starting")
+    log("MODE: RECOMMENDATION ONLY — NO ORDER EXECUTION")
+    log(
+        f"Data feed={DATA_FEED} | Options feed={OPTIONS_FEED} "
+        f"| Min AUC={MIN_AUC:.3f} "
+        f"| Min confidence={MIN_CONFIDENCE:.2f}"
+    )
 
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        raise RuntimeError(
-            "Missing Alpaca keys. Add ALPACA_API_KEY and "
-            "ALPACA_SECRET_KEY to the deployment environment."
+    if not API_KEY or not API_SECRET:
+        log(
+            "Missing Alpaca API credentials in Railway Variables",
+            "error",
+        )
+
+    if not TG_TOKEN or not TG_CHAT:
+        log(
+            "Telegram credentials missing; alerts will not be sent",
+            "warning",
         )
 
     while True:
         try:
-            run_scan()
+            if market_is_open():
+                run_scan()
+            else:
+                log(
+                    "[MARKET] Closed | New York time "
+                    + ny_now().strftime("%Y-%m-%d %H:%M:%S %Z")
+                )
+
         except KeyboardInterrupt:
-            logmsg("Stopped by user.")
+            log("Stopped by user")
             break
+
         except Exception as exc:
-            logmsg(
-                f"[MAIN ERROR] {type(exc).__name__}: {exc}"
+            log(
+                f"[FATAL LOOP ERROR] {type(exc).__name__}: {exc}",
+                "error",
             )
 
-        time.sleep(POLL_SECONDS)
+        time.sleep(SCAN_SECONDS)
 
 
 if __name__ == "__main__":
