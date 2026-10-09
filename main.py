@@ -1,7 +1,8 @@
 
 # ============================================================
-# SPX 0DTE AI ADVISOR v18.2
-# Recommendation Only — NO automatic order execution
+# SPX 0DTE AI ADVISOR v18.2 ARABIC
+# توصيات خيارات SPX فقط — لا ينفذ أوامر شراء أو بيع
+# جميع رسائل تيليجرام باللغة العربية
 # ============================================================
 
 import os
@@ -23,7 +24,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 
 warnings.filterwarnings("ignore")
 
-# ======================== SETTINGS ==========================
+# ======================== الإعدادات =========================
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -40,7 +41,7 @@ API_SECRET = (
     or ""
 ).strip()
 
-# Keep paper trading as the default.
+# الوضع الافتراضي: حساب Alpaca التجريبي
 TRADE_URL = os.getenv(
     "ALPACA_TRADE_URL",
     "https://paper-api.alpaca.markets"
@@ -62,6 +63,7 @@ MIN_CONFIDENCE = float(os.getenv("MIN_MODEL_CONFIDENCE", "0.56"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.20"))
 
 SCAN_SECONDS = max(20, int(os.getenv("SCAN_SECONDS", "60")))
+
 LABEL_HORIZON = 3
 MAX_BARS = 5000
 MAX_CONTRACTS_TO_CHECK = 15
@@ -98,9 +100,11 @@ def ny_now():
 def alpaca_headers():
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
-            "Missing Alpaca keys. Set ALPACA_API_KEY and "
-            "ALPACA_SECRET_KEY in Railway Variables."
+            "مفاتيح Alpaca غير موجودة. "
+            "أضف ALPACA_API_KEY وALPACA_SECRET_KEY "
+            "في متغيرات Railway."
         )
+
     return {
         "APCA-API-KEY-ID": API_KEY,
         "APCA-API-SECRET-KEY": API_SECRET,
@@ -139,16 +143,17 @@ def normalize_bars(df):
         col for col in ["open", "high", "low", "close"]
         if col in df.columns
     ]
+
     if required:
         df = df.dropna(subset=required)
 
     return df
 
 
-# ======================== MARKET DATA =======================
+# ======================== بيانات السوق ======================
 
 def get_spx_bars():
-    """SPX index bars from Yahoo Finance, not SPY multiplied by 10."""
+    """جلب بيانات مؤشر SPX من Yahoo Finance."""
     try:
         raw = yf.download(
             "^GSPC",
@@ -160,7 +165,9 @@ def get_spx_bars():
         )
 
         if raw is None or raw.empty:
-            raise RuntimeError("Yahoo returned no ^GSPC data")
+            raise RuntimeError(
+                "لم تصل بيانات مؤشر SPX من Yahoo Finance"
+            )
 
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
@@ -174,31 +181,32 @@ def get_spx_bars():
         })
 
         raw = normalize_bars(raw)
-
-        raw = raw[
-            ["open", "high", "low", "close"]
-        ].tail(MAX_BARS)
+        raw = raw[["open", "high", "low", "close"]].tail(MAX_BARS)
 
         if len(raw) < 300:
-            raise RuntimeError(f"Too few SPX bars: {len(raw)}")
+            raise RuntimeError(
+                f"عدد شموع SPX غير كافٍ: {len(raw)}"
+            )
 
         age = (
             utc_now() - raw.index[-1].to_pydatetime()
         ).total_seconds() / 60
 
         log(
-            f"[SPX DATA] ^GSPC bars={len(raw)} "
-            f"| last={raw.index[-1]} | age={age:.1f}m"
+            f"[بيانات SPX] عدد الشموع={len(raw)} "
+            f"| آخر شمعة={raw.index[-1]} "
+            f"| عمر البيانات={age:.1f} دقيقة"
         )
+
         return raw
 
     except Exception as exc:
-        log(f"[SPX DATA ERROR] {exc}", "error")
+        log(f"[خطأ بيانات SPX] {exc}", "error")
         return pd.DataFrame()
 
 
 def get_stock_bars(symbol):
-    """Fetch 5-minute bars for SPY or QQQ from Alpaca."""
+    """جلب شموع SPY أو QQQ من Alpaca."""
     try:
         end = utc_now()
         start = end - timedelta(days=10)
@@ -222,14 +230,15 @@ def get_stock_bars(symbol):
 
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Alpaca HTTP {response.status_code}: "
+                f"خطأ Alpaca HTTP {response.status_code}: "
                 f"{response.text[:250]}"
             )
 
         rows = response.json().get("bars", [])
+
         if not rows:
             raise RuntimeError(
-                f"No {symbol} bars; feed={DATA_FEED}"
+                f"لا توجد بيانات {symbol}؛ مصدر البيانات={DATA_FEED}"
             )
 
         df = pd.DataFrame(rows).rename(columns={
@@ -242,13 +251,11 @@ def get_stock_bars(symbol):
         })
 
         df = normalize_bars(df)
-        df = df[
-            ["open", "high", "low", "close"]
-        ].tail(MAX_BARS)
+        df = df[["open", "high", "low", "close"]].tail(MAX_BARS)
 
         if len(df) < 100:
             raise RuntimeError(
-                f"Too few {symbol} bars: {len(df)}"
+                f"عدد شموع {symbol} غير كافٍ: {len(df)}"
             )
 
         age = (
@@ -256,17 +263,19 @@ def get_stock_bars(symbol):
         ).total_seconds() / 60
 
         log(
-            f"[DATA] {symbol}: {len(df)} bars "
-            f"| last={df.index[-1]} | age={age:.1f}m"
+            f"[البيانات] {symbol}: عدد الشموع={len(df)} "
+            f"| آخر شمعة={df.index[-1]} "
+            f"| عمر البيانات={age:.1f} دقيقة"
         )
+
         return df
 
     except Exception as exc:
-        log(f"[DATA ERROR] {symbol}: {exc}", "error")
+        log(f"[خطأ بيانات {symbol}] {exc}", "error")
         return pd.DataFrame()
 
 
-# ======================== INDICATORS =======================
+# ======================== المؤشرات الفنية ===================
 
 def calc_rsi(close, period=14):
     delta = close.diff()
@@ -284,6 +293,7 @@ def calc_rsi(close, period=14):
     ).mean()
 
     rs = gain / loss.replace(0, np.nan)
+
     return 100 - (100 / (1 + rs))
 
 
@@ -357,7 +367,9 @@ def make_features(spx, spy, qqq):
     qqq = normalize_bars(qqq)
 
     if spx.empty or spy.empty or qqq.empty:
-        raise RuntimeError("SPX, SPY or QQQ data is missing")
+        raise RuntimeError(
+            "بيانات SPX أو SPY أو QQQ غير متوفرة"
+        )
 
     spx_features = build_features(spx)
     spy_features = build_features(spy, "spy_")
@@ -377,7 +389,6 @@ def make_features(spx, spy, qqq):
         ]
     ]
 
-    # Normalize timestamps to the same UTC representation.
     for frame in [spx_features, spy_features, qqq_features]:
         frame.index = pd.DatetimeIndex(
             pd.to_datetime(frame.index, utc=True)
@@ -396,13 +407,13 @@ def make_features(spx, spy, qqq):
 
     if len(merged) < 400:
         raise RuntimeError(
-            f"Not enough aligned feature rows: {len(merged)}"
+            f"عدد صفوف البيانات المتطابقة غير كافٍ: {len(merged)}"
         )
 
     return merged.sort_index()
 
 
-# ======================== MACHINE LEARNING ==================
+# ======================== التعلم الآلي ======================
 
 def new_model():
     return make_pipeline(
@@ -433,14 +444,16 @@ def train_model(df):
     ).astype(int)
 
     if len(X) < 500:
-        raise RuntimeError(f"Not enough model rows: {len(X)}")
+        raise RuntimeError(
+            f"بيانات التدريب غير كافية: {len(X)} صفًا"
+        )
 
-    # Chronological split. Purge the label horizon before test data.
+    # تقسيم زمني مع استبعاد فترة أفق التنبؤ قبل الاختبار
     split = int(len(X) * 0.80)
     train_end = split - LABEL_HORIZON
 
     if train_end < 200 or len(X) - split < 100:
-        raise RuntimeError("Insufficient train/test data")
+        raise RuntimeError("بيانات التدريب أو الاختبار غير كافية")
 
     X_train = X.iloc[:train_end]
     y_train = y.iloc[:train_end]
@@ -450,7 +463,7 @@ def train_model(df):
 
     if y_train.nunique() < 2 or y_test.nunique() < 2:
         raise RuntimeError(
-            "Train or test labels contain only one class"
+            "بيانات التدريب أو الاختبار تحتوي على فئة واحدة فقط"
         )
 
     evaluator = new_model()
@@ -462,24 +475,27 @@ def train_model(df):
     accuracy = float(
         accuracy_score(y_test, predictions)
     )
+
     auc = float(
         roc_auc_score(y_test, probabilities)
     )
 
     baseline_class = int(y_train.mean() >= 0.5)
+
     baseline_accuracy = float(
         (y_test == baseline_class).mean()
     )
 
     log(
-        f"[MODEL] rows={len(df)} "
-        f"| train={len(X_train)} | test={len(X_test)} "
-        f"| accuracy={accuracy:.3f} "
+        f"[النموذج] الصفوف={len(df)} "
+        f"| التدريب={len(X_train)} "
+        f"| الاختبار={len(X_test)} "
+        f"| الدقة={accuracy:.3f} "
         f"| AUC={auc:.3f} "
-        f"| baseline={baseline_accuracy:.3f}"
+        f"| خط الأساس={baseline_accuracy:.3f}"
     )
 
-    # Fit the live model on all available labeled rows.
+    # تدريب النموذج النهائي على كل الصفوف المتاحة
     live_model = new_model()
     live_model.fit(X, y)
 
@@ -491,7 +507,7 @@ def calculate_signal(df, model, feature_cols, auc):
         return (
             "WAIT",
             0.0,
-            f"AUC {auc:.3f} below threshold {MIN_AUC:.3f}",
+            f"تقييم AUC={auc:.3f} أقل من الحد المطلوب {MIN_AUC:.3f}",
         )
 
     latest = df.iloc[-1]
@@ -500,22 +516,30 @@ def calculate_signal(df, model, feature_cols, auc):
     probability_up = float(
         model.predict_proba(live_x)[0, 1]
     )
+
     probability_down = 1.0 - probability_up
 
     spx_up = (
         latest["ret_1"] > 0
         and latest["ema_spread"] > 0
     )
+
     spy_up = (
         latest["spy_ret_1"] > 0
         and latest["spy_ema_spread"] > 0
     )
+
     qqq_up = (
         latest["qqq_ret_1"] > 0
         and latest["qqq_ema_spread"] > 0
     )
 
-    up_votes = sum([bool(spx_up), bool(spy_up), bool(qqq_up)])
+    up_votes = sum([
+        bool(spx_up),
+        bool(spy_up),
+        bool(qqq_up),
+    ])
+
     down_votes = 3 - up_votes
 
     if (
@@ -525,7 +549,8 @@ def calculate_signal(df, model, feature_cols, auc):
         return (
             "CALL",
             probability_up,
-            f"P(up)={probability_up:.1%}; votes={up_votes}/3",
+            f"احتمال الصعود={probability_up:.1%}؛ "
+            f"توافق المؤشرات={up_votes}/3",
         )
 
     if (
@@ -535,23 +560,28 @@ def calculate_signal(df, model, feature_cols, auc):
         return (
             "PUT",
             probability_down,
-            f"P(down)={probability_down:.1%}; votes={down_votes}/3",
+            f"احتمال الهبوط={probability_down:.1%}؛ "
+            f"توافق المؤشرات={down_votes}/3",
         )
 
     return (
         "WAIT",
         max(probability_up, probability_down),
-        f"No aligned setup; P(up)={probability_up:.1%}; "
-        f"P(down)={probability_down:.1%}; "
-        f"votes up/down={up_votes}/{down_votes}",
+        f"لا توجد إشارة متوافقة؛ "
+        f"احتمال الصعود={probability_up:.1%}؛ "
+        f"احتمال الهبوط={probability_down:.1%}؛ "
+        f"أصوات الصعود/الهبوط={up_votes}/{down_votes}",
     )
 
 
-# ======================== TELEGRAM ==========================
+# ======================== تيليجرام ==========================
 
 def send_telegram(message):
     if not TG_TOKEN or not TG_CHAT:
-        log("[TELEGRAM] Token or chat ID missing", "warning")
+        log(
+            "[تيليجرام] رمز البوت أو معرف المحادثة غير موجود",
+            "warning",
+        )
         return False
 
     try:
@@ -567,25 +597,28 @@ def send_telegram(message):
 
         if response.status_code >= 400:
             log(
-                f"[TELEGRAM ERROR] {response.status_code}: "
+                f"[خطأ تيليجرام] HTTP {response.status_code}: "
                 f"{response.text[:200]}",
                 "error",
             )
             return False
 
         if not response.json().get("ok", False):
-            log("[TELEGRAM ERROR] API returned ok=false", "error")
+            log(
+                "[خطأ تيليجرام] لم تؤكد واجهة تيليجرام إرسال الرسالة",
+                "error",
+            )
             return False
 
-        log("[TELEGRAM] Message sent")
+        log("[تيليجرام] تم إرسال الرسالة بنجاح")
         return True
 
     except Exception as exc:
-        log(f"[TELEGRAM ERROR] {exc}", "error")
+        log(f"[خطأ تيليجرام] {exc}", "error")
         return False
 
 
-# ======================== SPXW OPTIONS ======================
+# ======================== عقود SPXW =========================
 
 def get_spxw_contracts(direction):
     try:
@@ -606,11 +639,12 @@ def get_spxw_contracts(direction):
 
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Contracts HTTP {response.status_code}: "
+                f"خطأ جلب العقود HTTP {response.status_code}: "
                 f"{response.text[:250]}"
             )
 
         payload = response.json()
+
         contracts = payload.get(
             "option_contracts",
             payload.get("contracts", []),
@@ -642,7 +676,7 @@ def get_spxw_contracts(direction):
         return results
 
     except Exception as exc:
-        log(f"[CONTRACT ERROR] {exc}", "error")
+        log(f"[خطأ العقود] {exc}", "error")
         return []
 
 
@@ -650,7 +684,6 @@ def get_option_quotes(symbols):
     results = {}
     endpoint = f"{DATA_URL}/v1beta1/options/quotes/latest"
 
-    # Quote requests are batched, not sent once per contract.
     for start in range(0, len(symbols), 100):
         batch = symbols[start:start + 100]
 
@@ -667,7 +700,7 @@ def get_option_quotes(symbols):
 
             if response.status_code >= 400:
                 log(
-                    f"[QUOTE ERROR] HTTP {response.status_code}: "
+                    f"[خطأ الأسعار] HTTP {response.status_code}: "
                     f"{response.text[:200]}",
                     "warning",
                 )
@@ -680,7 +713,7 @@ def get_option_quotes(symbols):
                 results.update(quotes)
 
         except Exception as exc:
-            log(f"[QUOTE ERROR] {exc}", "warning")
+            log(f"[خطأ الأسعار] {exc}", "warning")
 
     return results
 
@@ -689,10 +722,13 @@ def number_from(quote, *keys):
     for key in keys:
         try:
             value = quote.get(key)
+
             if value is not None:
                 value = float(value)
+
                 if np.isfinite(value):
                     return value
+
         except (TypeError, ValueError):
             pass
 
@@ -703,13 +739,17 @@ def choose_contract(direction, spot_price):
     contracts = get_spxw_contracts(direction)
 
     if not contracts:
-        log("[CONTRACT] No SPXW contracts found", "warning")
+        log(
+            "[العقود] لم يتم العثور على عقود SPXW",
+            "warning",
+        )
         return None
 
-    # Only inspect the 15 strikes closest to actual SPX spot.
+    # فحص أقرب 15 سعر تنفيذ من مستوى المؤشر
     contracts.sort(
         key=lambda item: abs(item["strike"] - spot_price)
     )
+
     candidates = contracts[:MAX_CONTRACTS_TO_CHECK]
 
     quotes = get_option_quotes(
@@ -734,7 +774,10 @@ def choose_contract(direction, spot_price):
             continue
 
         mid = (bid + ask) / 2.0
-        spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+
+        spread_pct = (
+            (ask - bid) / mid if mid > 0 else 1.0
+        )
 
         if spread_pct > MAX_SPREAD_PCT:
             continue
@@ -750,12 +793,11 @@ def choose_contract(direction, spot_price):
 
     if not viable:
         log(
-            "[CONTRACT] No nearby contract passed quote/spread checks",
+            "[العقود] لا يوجد عقد قريب اجتاز فلاتر الأسعار وفارق السعر",
             "warning",
         )
         return None
 
-    # First prefer distance from SPX spot, then narrower spread.
     viable.sort(
         key=lambda item: (
             item["distance"],
@@ -767,18 +809,18 @@ def choose_contract(direction, spot_price):
     selected = viable[0]
 
     log(
-        f"[CONTRACT] {selected['symbol']} "
-        f"| strike={selected['strike']:.2f} "
-        f"| bid={selected['bid']:.2f} "
-        f"| ask={selected['ask']:.2f} "
-        f"| spread={selected['spread_pct']:.1%} "
+        f"[العقد المختار] {selected['symbol']} "
+        f"| سعر التنفيذ={selected['strike']:.2f} "
+        f"| العرض={selected['bid']:.2f} "
+        f"| الطلب={selected['ask']:.2f} "
+        f"| الفارق={selected['spread_pct']:.1%} "
         f"| SPX={spot_price:.2f}"
     )
 
     return selected
 
 
-# ======================== SCANNER ===========================
+# ======================== الماسح الرئيسي ====================
 
 def market_is_open():
     now = ny_now()
@@ -794,14 +836,17 @@ def market_is_open():
 
 
 def run_scan():
-    log("========== NEW SCAN ==========")
+    log("========== بدء فحص جديد ==========")
 
     spx = get_spx_bars()
     spy = get_stock_bars("SPY")
     qqq = get_stock_bars("QQQ")
 
     if spx.empty or spy.empty or qqq.empty:
-        log("[SIGNAL] WAIT | Market data unavailable", "warning")
+        log(
+            "[الإشارة] انتظار — بيانات السوق غير مكتملة",
+            "warning",
+        )
         return
 
     try:
@@ -814,76 +859,111 @@ def run_scan():
         )
 
         log(
-            f"[SIGNAL] {direction} "
-            f"| confidence={confidence:.1%} "
-            f"| {reason}"
+            f"[الإشارة] {direction} "
+            f"| الثقة={confidence:.1%} "
+            f"| السبب={reason}"
         )
 
+        # لا ترسل توصية عند عدم وجود إشارة
         if direction == "WAIT":
             return
 
-        # This is the ^GSPC index level, not SPY x 10.
         spot_price = float(merged.iloc[-1]["close"])
 
         contract = choose_contract(direction, spot_price)
 
+        signal_ar = (
+            "شراء كول (CALL)"
+            if direction == "CALL"
+            else "شراء بوت (PUT)"
+        )
+
+        # تنبيه عربي عند عدم وجود عقد مناسب
         if contract is None:
-            send_telegram(
-                "⚠️ SPX 0DTE AI ADVISOR v18.2\n"
-                f"Signal: {direction}\n"
-                f"Confidence: {confidence:.1%}\n"
-                f"SPX: {spot_price:,.2f}\n"
-                f"Model AUC: {auc:.3f}\n"
-                "No contract passed quote and spread filters.\n"
-                "Recommendation only — no order was placed."
+            message = (
+                "⚠️ تنبيه بوت خيارات SPX\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📍 الإشارة: {signal_ar}\n"
+                f"📊 ثقة النموذج: {confidence:.1%}\n"
+                f"💹 مستوى مؤشر SPX: {spot_price:,.2f}\n"
+                f"🧠 تقييم النموذج AUC: {auc:.3f}\n\n"
+                "لم يتم العثور على عقد مناسب اجتاز "
+                "فلاتر السعر وفارق العرض والطلب.\n\n"
+                "⛔ لم يتم تنفيذ أي صفقة.\n"
+                "ℹ️ هذه توصية فقط."
             )
+
+            send_telegram(message)
             return
 
+        # توضيح سبب الإشارة بالعربية
+        if direction == "CALL":
+            reason_ar = (
+                "النموذج يرجّح الصعود مع توافق اتجاه "
+                "المؤشر والأسواق المساندة."
+            )
+        else:
+            reason_ar = (
+                "النموذج يرجّح الهبوط مع توافق اتجاه "
+                "المؤشر والأسواق المساندة."
+            )
+
         message = (
-            "📊 SPX 0DTE AI ADVISOR v18.2\n\n"
-            f"Signal: {direction}\n"
-            f"Model confidence: {confidence:.1%}\n"
-            f"SPX index: {spot_price:,.2f}\n"
-            f"Contract: {contract['symbol']}\n"
-            f"Strike: {contract['strike']:,.2f}\n"
-            f"Bid / Ask: {contract['bid']:.2f} / "
-            f"{contract['ask']:.2f}\n"
-            f"Mid estimate: {contract['mid']:.2f}\n"
-            f"Spread: {contract['spread_pct']:.1%}\n"
-            f"Model AUC: {auc:.3f}\n"
-            f"Test accuracy: {accuracy:.3f}\n"
-            f"Reason: {reason}\n\n"
-            "⚠️ Recommendation only. No order was placed. "
-            "0DTE options can lose value rapidly."
+            "📊 توصية بوت خيارات SPX — الإصدار 18.2\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📍 نوع الإشارة: {signal_ar}\n"
+            f"📊 ثقة النموذج: {confidence:.1%}\n"
+            f"💹 مستوى مؤشر SPX: {spot_price:,.2f}\n\n"
+            "📑 تفاصيل العقد\n"
+            f"🔹 رمز العقد: {contract['symbol']}\n"
+            f"🎯 سعر التنفيذ: {contract['strike']:,.2f}\n"
+            f"🟢 سعر الطلب (Ask): {contract['ask']:.2f}\n"
+            f"🔴 سعر العرض (Bid): {contract['bid']:.2f}\n"
+            f"⚖️ متوسط السعر التقريبي: {contract['mid']:.2f}\n"
+            f"📉 فارق العرض والطلب: {contract['spread_pct']:.1%}\n\n"
+            "🧠 نتائج النموذج\n"
+            f"📈 تقييم النموذج AUC: {auc:.3f}\n"
+            f"🧪 دقة الاختبار التاريخي: {accuracy:.1%}\n"
+            f"📝 سبب الإشارة: {reason_ar}\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ تنبيه المخاطر:\n"
+            "هذه توصية وليست أمر شراء أو بيع.\n"
+            "البوت لا ينفذ الصفقات تلقائيًا.\n"
+            "خيارات يوم الانتهاء (0DTE) عالية المخاطر "
+            "وقد تفقد قيمتها بسرعة."
         )
 
         send_telegram(message)
 
     except Exception as exc:
         log(
-            f"[SCAN ERROR] {type(exc).__name__}: {exc}",
+            f"[خطأ الفحص] {type(exc).__name__}: {exc}",
             "error",
         )
 
 
+# ======================== التشغيل ===========================
+
 def main():
-    log("SPX 0DTE AI ADVISOR v18.2 starting")
-    log("MODE: RECOMMENDATION ONLY — NO ORDER EXECUTION")
+    log("بدء تشغيل بوت خيارات SPX — الإصدار 18.2")
+    log("الوضع: توصيات فقط — لا يوجد تنفيذ تلقائي للصفقات")
+
     log(
-        f"Data feed={DATA_FEED} | Options feed={OPTIONS_FEED} "
-        f"| Min AUC={MIN_AUC:.3f} "
-        f"| Min confidence={MIN_CONFIDENCE:.2f}"
+        f"مصدر البيانات={DATA_FEED} "
+        f"| مصدر أسعار الخيارات={OPTIONS_FEED} "
+        f"| الحد الأدنى AUC={MIN_AUC:.3f} "
+        f"| الحد الأدنى للثقة={MIN_CONFIDENCE:.2f}"
     )
 
     if not API_KEY or not API_SECRET:
         log(
-            "Missing Alpaca API credentials in Railway Variables",
+            "مفاتيح Alpaca غير موجودة في متغيرات Railway",
             "error",
         )
 
     if not TG_TOKEN or not TG_CHAT:
         log(
-            "Telegram credentials missing; alerts will not be sent",
+            "إعدادات تيليجرام غير مكتملة؛ لن يتم إرسال التنبيهات",
             "warning",
         )
 
@@ -893,17 +973,17 @@ def main():
                 run_scan()
             else:
                 log(
-                    "[MARKET] Closed | New York time "
+                    "[السوق] مغلق | توقيت نيويورك: "
                     + ny_now().strftime("%Y-%m-%d %H:%M:%S %Z")
                 )
 
         except KeyboardInterrupt:
-            log("Stopped by user")
+            log("تم إيقاف البوت")
             break
 
         except Exception as exc:
             log(
-                f"[FATAL LOOP ERROR] {type(exc).__name__}: {exc}",
+                f"[خطأ رئيسي] {type(exc).__name__}: {exc}",
                 "error",
             )
 
