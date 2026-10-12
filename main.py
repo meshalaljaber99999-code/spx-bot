@@ -116,6 +116,22 @@ def _s(name, default=""):
 APCA_API_KEY_ID = _s("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = _s("APCA_API_SECRET_KEY")
 
+APCA_API_KEY_ID = _s("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = _s("APCA_API_SECRET_KEY")
+
+log.info(
+    "ENV DEBUG | "
+    f"KEY_IN_ENV={bool(os.environ.get('APCA_API_KEY_ID'))} | "
+    f"SECRET_IN_ENV={bool(os.environ.get('APCA_API_SECRET_KEY'))} | "
+    f"KEY_LOADED={bool(APCA_API_KEY_ID)} | "
+    f"SECRET_LOADED={bool(APCA_API_SECRET_KEY)}"
+)
+
+ALPACA_DATA_URL = _s(
+    "ALPACA_DATA_URL",
+    "https://data.alpaca.markets",
+).rstrip("/")
+
 ALPACA_DATA_URL = _s(
     "ALPACA_DATA_URL",
     "https://data.alpaca.markets",
