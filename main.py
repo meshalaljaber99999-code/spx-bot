@@ -6212,3 +6212,12 @@ if __name__ == "__main__":
 # ============================================================
 # END OF PART 6/6
 # ============================================================
+def get_spot(symbol=PRIMARY_UNDERLYING, **kwargs):
+    """دالة لجلب أحدث سعر إغلاق لحظي للـ SPY"""
+    try:
+        bars = fetch_stock_bars(symbol, timeframe=TIMEFRAME, history_days=2, limit=5)
+        if bars is not None and not bars.empty:
+            return float(bars["close"].iloc[-1])
+    except Exception:
+        pass
+    return None
