@@ -6214,6 +6214,18 @@ def get_spot(symbol=PRIMARY_UNDERLYING, **kwargs):
         pass
     return None
 
+def fetch_latest_option_quotes(symbols, **kwargs):
+    """دالة جلب أسعار عقود الخيارات الحية"""
+    try:
+        # محاولة جلب البيانات عبر مكتبة Alpaca المتاحة في البوت
+        return rest.get_latest_option_quotes(symbols)
+    except Exception:
+        return {}
+
+# تعريف أسماء بديلة قد يبحث عنها البوت في هذه المرحلة:
+get_live_option_quote = fetch_latest_option_quotes
+fetch_option_quotes = fetch_latest_option_quotes
+
 if __name__ == "__main__":
     main()
 
