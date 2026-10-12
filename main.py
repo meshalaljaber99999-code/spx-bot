@@ -1746,40 +1746,52 @@ def build_model_feature_frame(
 # 21. TRAINING LABELS — FUTURE DATA ONLY IN THE TARGET
 # ============================================================
 
+
 def add_training_target(
     feature_frame: pd.DataFrame,
     horizon: int = HORIZON,
 ) -> pd.DataFrame:
     """
-    Add a binary training target.
+    Create a binary future-direction target.
 
-    Target = 1 if the close after `horizon` bars is higher than the
-    current close; otherwise 0.
-
-    IMPORTANT:
-    - This future close is used ONLY to form the historical label.
-    - It must NEVER be included as a model input feature.
-    - The latest rows have unknown targets and are removed from
-      the labeled training set.
+    1 = future close > current close
+    0 = future close <= current close
+    NaN = target unavailable or price invalid
     """
+
     if feature_frame is None or feature_frame.empty:
         raise ValueError("Cannot label an empty feature frame.")
 
-    if horizon < 1:
-        raise ValueError("horizon must be >= 1.")
+    if not isinstance(horizon, int) or horizon < 1:
+        raise ValueError("horizon must be a positive integer.")
 
     if "close" not in feature_frame.columns:
         raise ValueError("Feature frame must contain close.")
 
     result = feature_frame.copy().sort_index()
 
-    future_close = result["close"].shift(-horizon)
+    if not result.index.is_monotonic_increasing:
+        raise ValueError("Feature timestamps must be chronological.")
 
-    result["target"] = np.where(
-        future_close.notna(),
-        (future_close > result["close"]).astype(float),
+    close = pd.to_numeric(result["close"], errors="coerce")
+    close = close.where(np.isfinite(close) & (close > 0))
+
+    future_close = close.shift(-horizon)
+
+    valid = close.notna() & future_close.notna()
+
+    target = pd.Series(
         np.nan,
+        index=result.index,
+        dtype="float64",
+        name="target",
     )
+
+    target.loc[valid] = (
+        future_close.loc[valid] > close.loc[valid]
+    ).astype("int8")
+
+    result["target"] = target
 
     return result
 
