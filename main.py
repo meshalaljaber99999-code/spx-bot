@@ -506,7 +506,6 @@ HTTP.headers.update({
 })
 
 
-
 def alpaca_headers() -> dict[str, str]:
     """Create authenticated Alpaca market-data headers."""
 
@@ -527,12 +526,6 @@ def alpaca_headers() -> dict[str, str]:
         "Accept": "application/json",
     }
 
-
-    return {
-        "APCA-API-KEY-ID": APCA_API_KEY_ID,
-        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
-        "Accept": "application/json",
-    }
 
 
 def alpaca_get(
