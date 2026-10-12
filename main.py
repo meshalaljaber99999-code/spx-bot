@@ -744,82 +744,207 @@ def fetch_stock_bars(
 # 12. DATA FRESHNESS AND QUALITY CHECKS
 # ============================================================
 
-def latest_bar_timestamp(
-    bars: Optional[pd.DataFrame],
-) -> Optional[datetime]:
-    if bars is None or bars.empty:
-        return None
+
+def get_current_prediction():
+    """
+    Model Prediction Adapter
+    صَفاء التحليل — SPY 0DTE AI ADVISOR
+
+    Uses the actual Alpaca stock-bars function when available.
+    Recommendation-only; never submits orders.
+    """
+
+    # 1. Resolve market-data function.
+    bars_function = _resolve_callable(
+        "get_live_bars",
+        "get_market_bars",
+        "get_underlying_bars",
+        "fetch_stock_bars",  # FIX: actual function in Part 11
+    )
+
+    # 2. Resolve feature-engineering function.
+    feature_function = _resolve_callable(
+        "make_features",
+        "build_features",
+        "create_features",
+    )
+
+    # 3. Resolve model-training function.
+    training_function = _resolve_callable(
+        "train_model",
+        "train_direction_model",
+        "get_model",
+    )
+
+    # 4. Resolve prediction function.
+    prediction_function = _resolve_callable(
+        "predict_direction",
+        "calculate_prediction",
+    )
+
+    if bars_function is None:
+        return {
+            "ok": False,
+            "reason": "LIVE_BARS_FUNCTION_NOT_FOUND",
+        }
+
+    if feature_function is None:
+        return {
+            "ok": False,
+            "reason": "FEATURE_FUNCTION_NOT_FOUND",
+        }
+
+    if training_function is None:
+        return {
+            "ok": False,
+            "reason": "MODEL_TRAINING_FUNCTION_NOT_FOUND",
+        }
+
+    if prediction_function is None:
+        return {
+            "ok": False,
+            "reason": "PREDICTION_FUNCTION_NOT_FOUND",
+        }
 
     try:
-        return to_utc(bars.index[-1])
-    except Exception:
-        return None
+        # 5. Fetch historical market bars.
+        bars = _call_compatible(
+            bars_function,
+            symbol=PRIMARY_UNDERLYING,
+            timeframe=TIMEFRAME,
+            history_days=HISTORY_DAYS,
+            days=HISTORY_DAYS,
+        )
 
+        if not isinstance(bars, pd.DataFrame) or bars.empty:
+            return {
+                "ok": False,
+                "reason": "NO_LIVE_BARS",
+            }
 
-def bar_age_minutes(
-    bars: Optional[pd.DataFrame],
-    current_time: Optional[datetime] = None,
-) -> Optional[float]:
-    timestamp = latest_bar_timestamp(bars)
-    current = to_utc(current_time or now_utc())
+        # 6. Verify the latest bar timestamp.
+        latest_timestamp = None
 
-    if timestamp is None or current is None:
-        return None
+        for column in ("timestamp", "time", "datetime", "t"):
+            if column in bars.columns:
+                latest_timestamp = bars[column].iloc[-1]
+                break
 
-    # A future-dated bar is treated as invalid rather than fresh.
-    age = (current - timestamp).total_seconds() / 60.0
-    if age < -1.0:
-        return None
+        # fetch_stock_bars() normally uses a DatetimeIndex.
+        if latest_timestamp is None:
+            latest_timestamp = bars.index[-1]
 
-    return max(0.0, age)
+        fresh, freshness_reason = _data_timestamp_is_fresh(
+            latest_timestamp
+        )
 
+        if not fresh:
+            return {
+                "ok": False,
+                "reason": (
+                    f"UNDERLYING_DATA_{freshness_reason}"
+                ),
+            }
 
-def validate_bars(
-    symbol: str,
-    bars: Optional[pd.DataFrame],
-    min_rows: int = 50,
-    max_age_minutes: float = MAX_BAR_AGE_MINUTES,
-) -> tuple[bool, str]:
-    """Validate basic completeness, timestamps and freshness."""
-    if bars is None:
-        return False, f"{symbol}:BARS_NONE"
+        # 7. Generate features.
+        features = _call_compatible(
+            feature_function,
+            bars=bars,
+            df=bars,
+            data=bars,
+        )
 
-    if bars.empty:
-        return False, f"{symbol}:BARS_EMPTY"
+        if not isinstance(features, pd.DataFrame) or features.empty:
+            return {
+                "ok": False,
+                "reason": "FEATURE_FRAME_EMPTY",
+            }
 
-    missing = [
-        column for column in REQUIRED_BAR_COLUMNS
-        if column not in bars.columns
-    ]
-    if missing:
-        return False, f"{symbol}:MISSING_COLUMNS:{','.join(missing)}"
+        # 8. Train or obtain the model.
+        model_bundle = _call_compatible(
+            training_function,
+            data=features,
+            features=features,
+            df=features,
+        )
 
-    if len(bars) < min_rows:
-        return False, f"{symbol}:INSUFFICIENT_ROWS:{len(bars)}"
+        if isinstance(model_bundle, tuple):
+            model = model_bundle[0] if model_bundle else None
+            model_bundle = {
+                "model": model,
+                "enabled": model is not None,
+                "reasons": [],
+            }
 
-    if not isinstance(bars.index, pd.DatetimeIndex):
-        return False, f"{symbol}:INDEX_NOT_DATETIME"
+        elif not isinstance(model_bundle, dict):
+            model_bundle = {
+                "model": model_bundle,
+                "enabled": model_bundle is not None,
+                "reasons": [],
+            }
 
-    if bars.index.tz is None:
-        return False, f"{symbol}:INDEX_NOT_TIMEZONE_AWARE"
+        journal_model_run(model_bundle)
 
-    if not bars.index.is_monotonic_increasing:
-        return False, f"{symbol}:TIMESTAMPS_NOT_SORTED"
+        if not model_bundle.get("enabled", False):
+            return {
+                "ok": False,
+                "reason": "MODEL_GATE_DISABLED",
+                "model_bundle": model_bundle,
+            }
 
-    if bars.index.has_duplicates:
-        return False, f"{symbol}:DUPLICATE_TIMESTAMPS"
+        # 9. Predict using the latest feature row.
+        latest_features = features.tail(1)
 
-    if bars[REQUIRED_BAR_COLUMNS].isna().any().any():
-        return False, f"{symbol}:NAN_VALUES"
+        prediction = _call_compatible(
+            prediction_function,
+            model_bundle=model_bundle,
+            model=model_bundle,
+            features=latest_features,
+            latest=latest_features,
+            data=latest_features,
+        )
 
-    age = bar_age_minutes(bars)
-    if age is None:
-        return False, f"{symbol}:INVALID_LATEST_TIMESTAMP"
+        if not isinstance(prediction, dict):
+            return {
+                "ok": False,
+                "reason": "PREDICTION_RETURN_TYPE_UNSUPPORTED",
+            }
 
-    if age > max_age_minutes:
-        return False, f"{symbol}:STALE_BARS:{age:.1f}m"
+        # 10. Normalize direction and fail closed on WAIT.
+        direction = _normalise_direction(
+            prediction.get("signal")
+            or prediction.get("direction")
+        )
 
-    return True, "BARS_OK"
+        if direction == "WAIT":
+            return {
+                "ok": False,
+                "reason": prediction.get(
+                    "reason",
+                    "MODEL_DIRECTION_IS_WAIT",
+                ),
+                "prediction": prediction,
+                "model_bundle": model_bundle,
+            }
+
+        prediction["signal"] = direction
+
+        return {
+            "ok": True,
+            "prediction": prediction,
+            "model_bundle": model_bundle,
+            "bars": bars,
+            "features": features,
+            "latest_features": latest_features,
+        }
+
+    except Exception as exc:
+        log.exception("Current prediction failed.")
+        return {
+            "ok": False,
+            "reason": f"PREDICTION_PIPELINE_ERROR:{exc}",
+        }
+
 
 
 # ============================================================
