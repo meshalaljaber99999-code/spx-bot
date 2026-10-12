@@ -6180,6 +6180,7 @@ def main():
             "Telegram credentials are missing. "
             "The scanner can run, but alerts cannot be delivered."
         )
+calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
 
     while not _STOP_REQUESTED:
         started = time.monotonic()
