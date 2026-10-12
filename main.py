@@ -4001,6 +4001,7 @@ def find_option_recommendation_candidate(
     expected_direction: str,
     underlying: str = PRIMARY_UNDERLYING,
     current_time: Optional[datetime] = None,
+    **kwargs,
 ) -> dict[str, Any]:
     """
     Fetch contracts and quotes, apply filters, rank candidates,
@@ -4127,18 +4128,6 @@ def find_option_recommendation_candidate(
         "mode": "RECOMMENDATION_ONLY",
     }
 
-
-# ============================================================
-# END OF PART 4/6
-# ============================================================
-
-# ============================================================
-# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
-# PART 5/6
-# Signal Journal • Quote Observations • Paper Outcome Tracking
-#
-# Paste directly below PART 4/6.
-# NO ORDER EXECUTION.
 # ============================================================
 
 # ============================================================
