@@ -110,6 +110,9 @@ def _b(name: str, default: bool = False) -> bool:
 # 3. API CONFIGURATION
 # ============================================================
 
+def _s(name, default=""):
+    return os.getenv(name, default).strip()
+
 APCA_API_KEY_ID = _s("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = _s("APCA_API_SECRET_KEY")
 
