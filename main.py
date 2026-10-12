@@ -123,6 +123,13 @@ ALPACA_TRADING_URL = _s(
     "https://paper-api.alpaca.markets",
 ).rstrip("/")
 
+
+log.info(
+    "ALPACA ENV CHECK | "
+    f"KEY_ID_PRESENT={bool(APCA_API_KEY_ID)} | "
+    f"SECRET_PRESENT={bool(APCA_API_SECRET_KEY)}"
+)
+
 # Common Alpaca stock market-data feeds include iex and sip.
 # The account's permissions determine which feeds are accessible.
 ALPACA_DATA_FEED = _s("ALPACA_DATA_FEED", "iex").lower()
