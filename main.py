@@ -1998,18 +1998,12 @@ def validate_model_configuration() -> tuple[bool, str]:
 # 26. CHRONOLOGICAL DATA SPLIT
 # ============================================================
 
+
 def chronological_split(
     dataset: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Split observations in time order.
+    """Chronological split with a purge gap between each segment."""
 
-    Older observations are used for training, the next segment
-    for threshold selection, and the newest segment for final
-    holdout evaluation.
-
-    Never shuffle this split.
-    """
     if dataset is None or dataset.empty:
         raise ValueError("Cannot split an empty dataset.")
 
@@ -2030,27 +2024,47 @@ def chronological_split(
             "Dataset has duplicate timestamps; resolve before training."
         )
 
-    n_rows = len(ordered)
+    if not 0 < TRAIN_FRACTION < 1:
+        raise ValueError("TRAIN_FRACTION must be between 0 and 1.")
 
+    if not 0 < VALIDATION_FRACTION < 1:
+        raise ValueError(
+            "VALIDATION_FRACTION must be between 0 and 1."
+        )
+
+    if TRAIN_FRACTION + VALIDATION_FRACTION >= 1:
+        raise ValueError(
+            "TRAIN_FRACTION + VALIDATION_FRACTION must be below 1."
+        )
+
+    n_rows = len(ordered)
     train_end = int(n_rows * TRAIN_FRACTION)
     validation_end = train_end + int(
         n_rows * VALIDATION_FRACTION
     )
 
-    train = ordered.iloc[:train_end].copy()
-    validation = ordered.iloc[
-        train_end:validation_end
+    purge = max(1, int(HORIZON))
+
+    # Remove boundary rows whose future labels could cross
+    # into the next chronological segment.
+    train = ordered.iloc[
+        :max(0, train_end - purge)
     ].copy()
+
+    validation = ordered.iloc[
+        train_end:max(train_end, validation_end - purge)
+    ].copy()
+
     holdout = ordered.iloc[validation_end:].copy()
 
     if len(train) < MIN_TRAIN_ROWS:
         raise ValueError(
-            f"Training split too small: {len(train)} rows."
+            f"Training split too small after purge: {len(train)} rows."
         )
 
     if len(validation) < MIN_VALIDATION_ROWS:
         raise ValueError(
-            f"Validation split too small: {len(validation)} rows."
+            f"Validation split too small after purge: {len(validation)} rows."
         )
 
     if len(holdout) < MIN_HOLDOUT_ROWS:
