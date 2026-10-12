@@ -759,7 +759,7 @@ def fetch_stock_bars(
         if not page_token:
             break
 
-    if not collected:
+       if not collected:
         log.warning(
             "No bars returned for %s (feed=%s, timeframe=%s).",
             symbol,
@@ -769,19 +769,22 @@ def fetch_stock_bars(
         return pd.DataFrame(columns=REQUIRED_BAR_COLUMNS)
 
     log.warning(
-    "DEBUG FETCH | symbol=%s | collected=%d | pages=%d",
-    symbol, len(collected), pages
-)
-frame = normalize_bars(collected)
-log.warning(
-    "DEBUG NORMALIZE | symbol=%s | rows=%d | empty=%s",
-    symbol, len(frame), frame.empty
-)
+        "DEBUG FETCH | symbol=%s | collected=%d | pages=%d",
+        symbol, len(collected), pages
+    )
+
+    frame = normalize_bars(collected)
+
+    log.warning(
+        "DEBUG NORMALIZE | symbol=%s | rows=%d | empty=%s",
+        symbol, len(frame), frame.empty
+    )
 
     # DIAGNOSTIC: verify latest bar timestamp
     if not frame.empty:
         latest_bar_time = frame.index[-1]
         current_utc = pd.Timestamp.now(tz="UTC")
+current_utc = pd.Timestamp.now(tz="UTC")
 
         if latest_bar_time.tzinfo is None:
             log.warning(
