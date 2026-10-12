@@ -974,23 +974,23 @@ def get_current_prediction():
             }
 
 
-        # 9. Predict using the latest feature row.
-        latest_features = features.tail(1)
-
-        prediction = _call_compatible(
-            prediction_function,
-            model_bundle=model_bundle,
-            model=model_bundle,
-            features=latest_features,
-            latest=latest_features,
-            data=latest_features,
+        
+        # 9. Train using the existing feature-frame pipeline.
+        training_pipeline = _resolve_callable(
+            "train_from_feature_frame"
         )
 
-        if not isinstance(prediction, dict):
+        if training_pipeline is None:
             return {
                 "ok": False,
-                "reason": "PREDICTION_RETURN_TYPE_UNSUPPORTED",
+                "reason": "TRAINING_PIPELINE_NOT_FOUND",
             }
+
+        model_bundle = _call_compatible(
+            training_pipeline,
+            feature_frame=features,
+        )
+
 
         # 10. Normalize direction and fail closed on WAIT.
         direction = _normalise_direction(
