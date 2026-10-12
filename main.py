@@ -5990,6 +5990,13 @@ def run_scan():
     No orders are submitted.
     """
     log.info("Starting scan for %s.", PRIMARY_UNDERLYING)
+try:
+    # جلب الشموع المطلوبة للتحليل المستقل
+    bars = get_bars() # أو سحب الشموع بالطريقة المستخدمة في البوت
+except Exception:
+    bars = []
+
+calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
 
     prediction_result = get_current_prediction()
 
@@ -6180,8 +6187,6 @@ def main():
             "Telegram credentials are missing. "
             "The scanner can run, but alerts cannot be delivered."
         )
-calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
-
     while not _STOP_REQUESTED:
         started = time.monotonic()
 
