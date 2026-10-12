@@ -5990,14 +5990,8 @@ def run_scan():
     No orders are submitted.
     """
     log.info("Starting scan for %s.", PRIMARY_UNDERLYING)
-try:
-    # جلب الشموع المطلوبة للتحليل المستقل
-    bars = get_bars() # أو سحب الشموع بالطريقة المستخدمة في البوت
-except Exception:
-    bars = []
 
-calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
-
+    
     prediction_result = get_current_prediction()
 
     if not prediction_result.get("ok", False):
@@ -6041,6 +6035,10 @@ calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
         direction=direction,
         spot=spot,
     )
+try:
+    calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
+except Exception:
+    pass
 
     if not recommendation.get("ok", False):
         reason = recommendation.get(
