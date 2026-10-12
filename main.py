@@ -768,7 +768,15 @@ def fetch_stock_bars(
         )
         return pd.DataFrame(columns=REQUIRED_BAR_COLUMNS)
 
-    frame = normalize_bars(collected)
+    log.warning(
+    "DEBUG FETCH | symbol=%s | collected=%d | pages=%d",
+    symbol, len(collected), pages
+)
+frame = normalize_bars(collected)
+log.warning(
+    "DEBUG NORMALIZE | symbol=%s | rows=%d | empty=%s",
+    symbol, len(frame), frame.empty
+)
 
     # DIAGNOSTIC: verify latest bar timestamp
     if not frame.empty:
