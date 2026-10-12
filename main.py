@@ -891,6 +891,20 @@ def get_current_prediction():
         if latest_timestamp is None:
             latest_timestamp = bars.index[-1]
 
+        log.info(
+            "UNDERLYING FRESHNESS DEBUG | symbol=%s | "
+            "latest_timestamp=%s | max_age_seconds=%s | "
+            "now_utc=%s",
+            PRIMARY_UNDERLYING,
+            latest_timestamp,
+            MAX_DATA_AGE_SECONDS,
+            now_utc().isoformat(),
+        )
+
+        fresh, freshness_reason = _data_timestamp_is_fresh(
+            latest_timestamp
+        )
+
         fresh, freshness_reason = _data_timestamp_is_fresh(
             latest_timestamp
         )
