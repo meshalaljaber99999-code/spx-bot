@@ -479,47 +479,49 @@ def is_regular_session(value: Optional[datetime] = None) -> bool:
 def session_window_status(
     value: Optional[datetime] = None,
 ) -> tuple[bool, str]:
-  """Return whether new signals are allowed by the regular-session
+    """
+    Return whether new signals are allowed by the regular-session
+    time window, but permits pre-market warm-up and after-hours review.
+    """
+    current = to_ny(value or now_ny())
+    if current is None:
+        return False, "INVALID_TIME"
 
-  time window, but permits pre-market data preparation and analysis.
-  """
-  current = to_ny(value or now_ny())
-  if current is None:
-    return False, "INVALID_TIME"
+    if not is_weekday(current.date()):
+        return False, "WEEKEND"
 
-  if not is_weekday(current.date()):
-    return False, "WEEKEND"
+    if is_market_holiday(current.date()):
+        return False, "MARKET_HOLIDAY"
 
-  if is_market_holiday(current.date()):
-    return False, "MARKET_HOLIDAY"
+    start, end = regular_session_bounds(current.date())
 
-  start, end = regular_session_bounds(current.date())
+    # 1. فترة ما قبل الافتتاح (Pre-Market Warm-up): قبل الجرس بساعة
+    pre_market_start = start - timedelta(hours=1)
+    if pre_market_start <= current < start:
+        return True, "PRE_MARKET_WARMUP"
 
-  # --- تعديل الذكاء الاصطناعي لفترة ما قبل الافتتاح ---
-  # إذا كان الوقت قبل الافتتاح بساعة (مثلاً من 8:30 صباحاً بتوقيت نيويورك)،
-  # نسمح للبوت بالعمل والتحضير وجلب البيانات (Pre-Market Warm-up)
-  pre_market_start = start - timedelta(hours=1)
-  if pre_market_start <= current < start:
-    # نسمح بتشغيل التحليل وجلب البيانات، لكن نحدد حالة خاصة للجاهزية
-    return True, "PRE_MARKET_WARMUP"
-  # ----------------------------------------------------
+    if current < start:
+        return False, "PRE_MARKET"
 
-  if current < start:
-    return False, "PRE_MARKET"
+    # 2. فترة ما بعد الإغلاق (After-Hours Review): بعد الإغلاق بساعتين
+    after_market_end = end + timedelta(hours=2)
+    if end <= current < after_market_end:
+        return True, "AFTER_MARKET_REVIEW"
 
-  if current >= end:
-    return False, "AFTER_MARKET"
+    if current >= end:
+        return False, "AFTER_MARKET"
 
-  elapsed_minutes = (current - start).total_seconds() / 60.0
-  remaining_minutes = (end - current).total_seconds() / 60.0
+    elapsed_minutes = (current - start).total_seconds() / 60.0
+    remaining_minutes = (end - current).total_seconds() / 60.0
 
-  if elapsed_minutes < NO_TRADE_FIRST_MINUTES:
-    return False, "OPENING_BUFFER"
+    if elapsed_minutes < NO_TRADE_FIRST_MINUTES:
+        return False, "OPENING_BUFFER"
 
-  if remaining_minutes <= NO_TRADE_LAST_MINUTES:
-    return False, "CLOSING_BUFFER"
+    if remaining_minutes <= NO_TRADE_LAST_MINUTES:
+        return False, "CLOSING_BUFFER"
 
-  return True, "SESSION_OK"
+    return True, "SESSION_OK"
+
 
 # ============================================================
 # 9. HTTP SESSION AND ALPACA HEADERS
