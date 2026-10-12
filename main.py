@@ -517,13 +517,13 @@ def session_window_status(
 # 9. HTTP SESSION AND ALPACA HEADERS
 # ============================================================
 
+
 HTTP = requests.Session()
 
 HTTP.headers.update({
     "Accept": "application/json",
-    "User-Agent": f"{BOT_NAME}/{BOT_VERSION}",
+    "User-Agent": "SafaaAnalysis/21.0",
 })
-
 
 def alpaca_headers() -> dict[str, str]:
     """Create authenticated Alpaca market-data headers."""
