@@ -6040,8 +6040,8 @@ def run_scan():
         direction=direction,
         spot=spot,
     )
-try:
-    calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
+  try:
+calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
 except Exception:
     pass
 
