@@ -5675,12 +5675,13 @@ def get_current_prediction():
                 "reason": "FEATURE_FRAME_EMPTY",
             }
 
+        
         # 9. Train or obtain the model.
         model_bundle = _call_compatible(
             training_function,
-            data=features,
-            features=features,
-            df=features,
+            dataset=features,
+        )
+
         )
 
         if isinstance(model_bundle, tuple):
