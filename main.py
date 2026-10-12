@@ -5546,72 +5546,41 @@ def final_revalidation(
 # 67. MODEL PREDICTION ADAPTER
 # ============================================================
 
-
 def get_current_prediction():
     """
-    MODEL PREDICTION ADAPTER
-    صَفاء التحليل — SPY 0DTE AI ADVISOR
-
-    Recommendation-only.
-    No automatic order execution.
+    صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+    Fetch SPY + QQQ, align features, train and predict.
+    Recommendation-only. No Telegram. No order execution.
     """
 
-    # 1. Find the market-data function.
     bars_function = _resolve_callable(
+        "fetch_stock_bars",
         "get_live_bars",
         "get_market_bars",
         "get_underlying_bars",
-        "fetch_stock_bars",  # FIX: Part 11
     )
 
-    # 2. Find the feature-engineering function.
-    feature_function = _resolve_callable(
-        "make_features",
-        "build_features",
-        "create_features",
-    )
-
-    # 3. Find the model-training function.
-    training_function = _resolve_callable(
-        "train_model",
-        "train_direction_model",
-        "get_model",
-    )
-
-    # 4. Find the prediction function.
     prediction_function = _resolve_callable(
         "predict_direction",
         "calculate_prediction",
     )
 
-    # 5. Validate required functions.
+    training_pipeline = _resolve_callable(
+        "train_from_feature_frame"
+    )
+
     if bars_function is None:
-        return {
-            "ok": False,
-            "reason": "LIVE_BARS_FUNCTION_NOT_FOUND",
-        }
-
-    if feature_function is None:
-        return {
-            "ok": False,
-            "reason": "FEATURE_FUNCTION_NOT_FOUND",
-        }
-
-    if training_function is None:
-        return {
-            "ok": False,
-            "reason": "MODEL_TRAINING_FUNCTION_NOT_FOUND",
-        }
+        return {"ok": False, "reason": "LIVE_BARS_FUNCTION_NOT_FOUND"}
 
     if prediction_function is None:
-        return {
-            "ok": False,
-            "reason": "PREDICTION_FUNCTION_NOT_FOUND",
-        }
+        return {"ok": False, "reason": "PREDICTION_FUNCTION_NOT_FOUND"}
+
+    if training_pipeline is None:
+        return {"ok": False, "reason": "TRAINING_PIPELINE_NOT_FOUND"}
 
     try:
-        # 6. Fetch actual market bars.
-        bars = _call_compatible(
+        # 1. Fetch actual SPY and QQQ bars.
+        spy_bars = _call_compatible(
             bars_function,
             symbol=PRIMARY_UNDERLYING,
             timeframe=TIMEFRAME,
@@ -5619,91 +5588,125 @@ def get_current_prediction():
             days=HISTORY_DAYS,
         )
 
-        if not isinstance(bars, pd.DataFrame) or bars.empty:
-            return {
-                "ok": False,
-                "reason": "NO_LIVE_BARS",
-            }
+        qqq_bars = _call_compatible(
+            bars_function,
+            symbol="QQQ",
+            timeframe=TIMEFRAME,
+            history_days=HISTORY_DAYS,
+            days=HISTORY_DAYS,
+        )
 
-        # 7. Verify the newest bar timestamp.
-        latest_timestamp = None
+        if not isinstance(spy_bars, pd.DataFrame) or spy_bars.empty:
+            return {"ok": False, "reason": "SPY_BARS_EMPTY"}
 
-        for column in (
-            "timestamp",
-            "time",
-            "datetime",
-            "t",
+        if not isinstance(qqq_bars, pd.DataFrame) or qqq_bars.empty:
+            return {"ok": False, "reason": "QQQ_BARS_EMPTY"}
+
+        # 2. Validate freshness of both data sources.
+        for symbol, bars in (
+            (PRIMARY_UNDERLYING, spy_bars),
+            ("QQQ", qqq_bars),
         ):
-            if column in bars.columns:
-                latest_timestamp = bars[column].iloc[-1]
-                break
+            timestamp = None
 
-        # fetch_stock_bars normally uses a DatetimeIndex.
-        if latest_timestamp is None:
-            if bars.index.empty:
+            for column in ("timestamp", "time", "datetime", "t"):
+                if column in bars.columns:
+                    timestamp = bars[column].iloc[-1]
+                    break
+
+            if timestamp is None:
+                if bars.index.empty:
+                    return {
+                        "ok": False,
+                        "reason": f"{symbol}_TIMESTAMP_MISSING",
+                    }
+                timestamp = bars.index[-1]
+
+            fresh, freshness_reason = _data_timestamp_is_fresh(
+                timestamp
+            )
+
+            if not fresh:
                 return {
                     "ok": False,
-                    "reason": "BAR_TIMESTAMP_MISSING",
+                    "reason": (
+                        f"{symbol}_DATA_{freshness_reason}"
+                    ),
                 }
 
-            latest_timestamp = bars.index[-1]
+        # 3. Build SPY features and QQQ confirmation features.
+        spy_features = build_features(spy_bars)
 
-        fresh, freshness_reason = _data_timestamp_is_fresh(
-            latest_timestamp
+        qqq_features = build_confirmation_features(
+            qqq_bars,
+            prefix="qqq_",
         )
 
-        if not fresh:
-            return {
-                "ok": False,
-                "reason": (
-                    f"UNDERLYING_DATA_{freshness_reason}"
-                ),
-            }
-
-        # 8. Build features.
-        features = _call_compatible(
-            feature_function,
-            bars=bars,
-            df=bars,
-            data=bars,
-        )
-
-        if (
-            not isinstance(features, pd.DataFrame)
-            or features.empty
-        ):
+        if spy_features.empty or qqq_features.empty:
             return {
                 "ok": False,
                 "reason": "FEATURE_FRAME_EMPTY",
             }
 
-        
-        # 9. Train or obtain the model.
-        model_bundle = _call_compatible(
-            training_function,
-            dataset=features,
+        # 4. Align QQQ backward to SPY timestamps.
+        # This avoids using future QQQ bars.
+        aligned_features = align_confirmation_data(
+            spy_features,
+            qqq_features,
+            max_age_seconds=600,
         )
 
-
-
-        if isinstance(model_bundle, tuple):
-            model = (
-                model_bundle[0]
-                if model_bundle
-                else None
-            )
-
-            model_bundle = {
-                "model": model,
-                "enabled": model is not None,
-                "reasons": [],
+        if aligned_features.empty:
+            return {
+                "ok": False,
+                "reason": "ALIGNED_FEATURE_FRAME_EMPTY",
             }
 
-        elif not isinstance(model_bundle, dict):
-            model_bundle = {
-                "model": model_bundle,
-                "enabled": model_bundle is not None,
-                "reasons": [],
+        # 5. Verify required model columns exist.
+        missing_columns = [
+            column
+            for column in FEATURE_COLUMNS
+            if column not in aligned_features.columns
+        ]
+
+        if missing_columns:
+            return {
+                "ok": False,
+                "reason": (
+                    "MISSING_FEATURE_COLUMNS:"
+                    + ",".join(missing_columns)
+                ),
+            }
+
+        # 6. Do not predict if the newest SPY row has
+        # incomplete or stale QQQ confirmation features.
+        latest_features = aligned_features[
+            FEATURE_COLUMNS
+        ].tail(1)
+
+        if (
+            latest_features.empty
+            or latest_features.isna().any(axis=1).iloc[0]
+            or not np.isfinite(
+                latest_features.to_numpy(dtype=float)
+            ).all()
+        ):
+            return {
+                "ok": False,
+                "reason": "LATEST_FEATURES_INCOMPLETE",
+            }
+
+        # 7. Train through the existing labeling and
+        # dataset-preparation pipeline.
+        model_bundle = _call_compatible(
+            training_pipeline,
+            feature_frame=aligned_features,
+        )
+
+        if not isinstance(model_bundle, dict):
+            return {
+                "ok": False,
+                "reason": "TRAINING_RESULT_NOT_A_DICTIONARY",
             }
 
         journal_model_run(model_bundle)
@@ -5725,27 +5728,20 @@ def get_current_prediction():
                 "model_bundle": model_bundle,
             }
 
-        # 10. Predict using the newest feature row.
-        latest_features = features.tail(1)
-
+        # 8. Predict using the actual predict_direction signature:
+        # predict_direction(trained, latest_features)
         prediction = _call_compatible(
             prediction_function,
-            model_bundle=model_bundle,
-            model=model_bundle,
-            features=latest_features,
-            latest=latest_features,
-            data=latest_features,
+            trained=model_bundle,
+            latest_features=latest_features,
         )
 
         if not isinstance(prediction, dict):
             return {
                 "ok": False,
-                "reason": (
-                    "PREDICTION_RETURN_TYPE_UNSUPPORTED"
-                ),
+                "reason": "PREDICTION_RETURN_TYPE_UNSUPPORTED",
             }
 
-        # 11. Normalize the direction.
         direction = _normalise_direction(
             prediction.get("signal")
             or prediction.get("direction")
@@ -5768,8 +5764,9 @@ def get_current_prediction():
             "ok": True,
             "prediction": prediction,
             "model_bundle": model_bundle,
-            "bars": bars,
-            "features": features,
+            "bars": spy_bars,
+            "qqq_bars": qqq_bars,
+            "features": aligned_features,
             "latest_features": latest_features,
         }
 
@@ -5778,10 +5775,9 @@ def get_current_prediction():
 
         return {
             "ok": False,
-            "reason": (
-                f"PREDICTION_PIPELINE_ERROR:{exc}"
-            ),
+            "reason": f"PREDICTION_PIPELINE_ERROR:{exc}",
         }
+
 
 
 # ============================================================
