@@ -5991,6 +5991,11 @@ def run_scan():
     """
     log.info("Starting scan for %s.", PRIMARY_UNDERLYING)
 
+    try:
+        calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
+    except Exception:
+        pass
+
     
     prediction_result = get_current_prediction()
 
