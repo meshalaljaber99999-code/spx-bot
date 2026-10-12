@@ -6251,6 +6251,80 @@ fetch_option_quotes = fetch_latest_option_quotes
 if __name__ == "__main__":
     main()
 
+import math
+import requests
+
+def send_market_outlook_telegram(current_price, direction, target_price, points_move, bot_token, chat_id):
+    """
+    إرسال تقرير تحليل حركة المؤشر المستقل عبر تليجرام بتصميم أبو سحاب
+    """
+    if not bot_token or not chat_id:
+        return
+    
+    # تحديد الإيموجي والاتجاه بناءً على الحسابات
+    dir_text = "صعود بنقاط مستهدفة 🟢" if direction == "up" else "هبوط بنقاط مستهدفة 🔴"
+    
+    message = (
+        "✨ **تحليل حركة المؤشر المتوقعة**\n"
+        "🤖\n\n"
+        f"▫️ **المؤشر:** `S&P 500`\n"
+        f"▫️ **السعر الحالي:** `{current_price:.2f}`\n"
+        f"▫️ **الوجهة المتوقعة:** {dir_text}\n"
+        f"▫️ **الهدف السعري:** `{target_price:.2f}`\n"
+        f"▫️ **مدى الحركة:** `{points_move}`\n\n"
+        "⚡ *جاهز للجلسة بناءً على تحليل الـ ATR*\n\n"
+        "<i>✨ تصميم أبو سحاب</i>"
+    )
+    
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("تم إرسال تحليل المؤشر اليومي بنجاح.")
+        else:
+            print(f"فشل إرسال تحليل المؤشر: {response.text}")
+    except Exception as e:
+        print(f"خطأ في الاتصال بتليجرام: {e}")
+
+def calculate_and_send_outlook(bars, bot_token, chat_id):
+    """
+    حساب الهدف السعري بناءً على آخر الشموع والـ ATR
+    """
+    if not bars or len(bars) < 2:
+        return
+    
+    current_price = float(bars[-1]['close'])
+    
+    # حساب تقريبي للـ ATR والمدى بناءً على آخر الشموع (أو استخدام دالة الـ ATR الموجودة عندك في البوت)
+    highs = [float(b['high']) for b in bars[-14:]]
+    lows = [float(b['low']) for b in bars[-14:]]
+    closes = [float(b['close']) for b in bars[-14:]]
+    
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+    
+    atr = sum(tr_list) / len(tr_list) if tr_list else 5.0
+    
+    # تحديد الاتجاه المتوقع والهدف بناءً على الزخم الأخير
+    if closes[-1] >= closes[-2]:
+        direction = "up"
+        target_price = current_price + (atr * 0.5)
+        points_move = f"+{round(atr * 0.5, 2)} نقاط"
+    else:
+        direction = "down"
+        target_price = current_price - (atr * 0.5)
+        points_move = f"-{round(atr * 0.5, 2)} نقاط"
+        
+    # إرسال الرسالة عبر التليجرام
+    send_market_outlook_telegram(current_price, direction, target_price, points_move, bot_token, chat_id)
 
 # ============================================================
 # END OF PART 6/6
