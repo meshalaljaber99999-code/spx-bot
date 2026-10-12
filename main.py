@@ -685,6 +685,7 @@ def normalize_bars(
 # 11. FETCH HISTORICAL STOCK BARS
 # ============================================================
 
+
 def fetch_stock_bars(
     symbol: str,
     timeframe: str = TIMEFRAME,
@@ -694,11 +695,11 @@ def fetch_stock_bars(
     """
     Fetch historical stock bars from Alpaca's market-data API.
 
-    Pagination uses next_page_token where provided. The function
-    returns actual stock bars; it does not multiply SPY by ten to
-    manufacture an SPX price.
+    Pagination uses next_page_token where provided.
+    Returns actual stock bars, not SPY multiplied by ten.
     """
     symbol = symbol.strip().upper()
+
     if not symbol:
         raise ValueError("Symbol cannot be empty.")
 
@@ -732,8 +733,8 @@ def fetch_stock_bars(
             params.pop("page_token", None)
 
         payload = alpaca_get(url, params=params)
-        
         bars = payload.get("bars") or []
+
         log.warning(
             "ALPACA CHECK | symbol=%s | count=%s | "
             "last_bar=%s | next_page=%s | feed=%s | end=%s",
@@ -744,7 +745,6 @@ def fetch_stock_bars(
             ALPACA_DATA_FEED,
             params.get("end"),
         )
-
 
         if bars:
             if not isinstance(bars, list):
@@ -759,7 +759,7 @@ def fetch_stock_bars(
         if not page_token:
             break
 
-       if not collected:
+    if not collected:
         log.warning(
             "No bars returned for %s (feed=%s, timeframe=%s).",
             symbol,
@@ -770,21 +770,24 @@ def fetch_stock_bars(
 
     log.warning(
         "DEBUG FETCH | symbol=%s | collected=%d | pages=%d",
-        symbol, len(collected), pages
+        symbol,
+        len(collected),
+        pages,
     )
 
     frame = normalize_bars(collected)
 
     log.warning(
         "DEBUG NORMALIZE | symbol=%s | rows=%d | empty=%s",
-        symbol, len(frame), frame.empty
+        symbol,
+        len(frame),
+        frame.empty,
     )
 
     # DIAGNOSTIC: verify latest bar timestamp
     if not frame.empty:
         latest_bar_time = frame.index[-1]
         current_utc = pd.Timestamp.now(tz="UTC")
-current_utc = pd.Timestamp.now(tz="UTC")
 
         if latest_bar_time.tzinfo is None:
             log.warning(
@@ -798,7 +801,8 @@ current_utc = pd.Timestamp.now(tz="UTC")
             ).total_seconds()
 
             log.info(
-                "DATA AGE CHECK | %s | last=%s | now_utc=%s | age_seconds=%.1f",
+                "DATA AGE CHECK | %s | last=%s | "
+                "now_utc=%s | age_seconds=%.1f",
                 symbol,
                 latest_bar_time.isoformat(),
                 current_utc.isoformat(),
@@ -806,7 +810,10 @@ current_utc = pd.Timestamp.now(tz="UTC")
             )
 
     if frame.empty:
-        log.warning("All returned bars were invalid for %s.", symbol)
+        log.warning(
+            "All returned bars were invalid for %s.",
+            symbol,
+        )
         return frame
 
     log.info(
@@ -818,6 +825,7 @@ current_utc = pd.Timestamp.now(tz="UTC")
     )
 
     return frame
+
 
 
 # ============================================================
