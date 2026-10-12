@@ -5464,41 +5464,45 @@ def final_revalidation(
 # 67. MODEL PREDICTION ADAPTER
 # ============================================================
 
+
 def get_current_prediction():
     """
-    Adapter for the earlier parts.
+    MODEL PREDICTION ADAPTER
+    صَفاء التحليل — SPY 0DTE AI ADVISOR
 
-    Expected model function:
-        predict_direction(model_bundle, feature_frame)
-
-    Expected market-data function:
-        get_live_bars(symbol=PRIMARY_UNDERLYING, ...)
-
-    Missing or incompatible functions cause a safe WAIT.
+    Recommendation-only.
+    No automatic order execution.
     """
+
+    # 1. Find the market-data function.
     bars_function = _resolve_callable(
         "get_live_bars",
         "get_market_bars",
         "get_underlying_bars",
+        "fetch_stock_bars",  # FIX: Part 11
     )
 
+    # 2. Find the feature-engineering function.
     feature_function = _resolve_callable(
         "make_features",
         "build_features",
         "create_features",
     )
 
+    # 3. Find the model-training function.
     training_function = _resolve_callable(
         "train_model",
         "train_direction_model",
         "get_model",
     )
 
+    # 4. Find the prediction function.
     prediction_function = _resolve_callable(
         "predict_direction",
         "calculate_prediction",
     )
 
+    # 5. Validate required functions.
     if bars_function is None:
         return {
             "ok": False,
@@ -5524,6 +5528,7 @@ def get_current_prediction():
         }
 
     try:
+        # 6. Fetch actual market bars.
         bars = _call_compatible(
             bars_function,
             symbol=PRIMARY_UNDERLYING,
@@ -5532,29 +5537,34 @@ def get_current_prediction():
             days=HISTORY_DAYS,
         )
 
-        if bars is None or len(bars) == 0:
+        if not isinstance(bars, pd.DataFrame) or bars.empty:
             return {
                 "ok": False,
                 "reason": "NO_LIVE_BARS",
             }
 
-        # Require a timestamp column or datetime index. A frame
-        # without a verifiable latest timestamp is rejected.
+        # 7. Verify the newest bar timestamp.
         latest_timestamp = None
 
-        if isinstance(bars, pd.DataFrame):
-            for column in (
-                "timestamp",
-                "time",
-                "datetime",
-                "t",
-            ):
-                if column in bars.columns:
-                    latest_timestamp = bars[column].iloc[-1]
-                    break
+        for column in (
+            "timestamp",
+            "time",
+            "datetime",
+            "t",
+        ):
+            if column in bars.columns:
+                latest_timestamp = bars[column].iloc[-1]
+                break
 
-            if latest_timestamp is None:
-                latest_timestamp = bars.index[-1]
+        # fetch_stock_bars normally uses a DatetimeIndex.
+        if latest_timestamp is None:
+            if bars.index.empty:
+                return {
+                    "ok": False,
+                    "reason": "BAR_TIMESTAMP_MISSING",
+                }
+
+            latest_timestamp = bars.index[-1]
 
         fresh, freshness_reason = _data_timestamp_is_fresh(
             latest_timestamp
@@ -5563,9 +5573,12 @@ def get_current_prediction():
         if not fresh:
             return {
                 "ok": False,
-                "reason": f"UNDERLYING_DATA_{freshness_reason}",
+                "reason": (
+                    f"UNDERLYING_DATA_{freshness_reason}"
+                ),
             }
 
+        # 8. Build features.
         features = _call_compatible(
             feature_function,
             bars=bars,
@@ -5573,12 +5586,16 @@ def get_current_prediction():
             data=bars,
         )
 
-        if features is None or len(features) == 0:
+        if (
+            not isinstance(features, pd.DataFrame)
+            or features.empty
+        ):
             return {
                 "ok": False,
                 "reason": "FEATURE_FRAME_EMPTY",
             }
 
+        # 9. Train or obtain the model.
         model_bundle = _call_compatible(
             training_function,
             data=features,
@@ -5587,9 +5604,11 @@ def get_current_prediction():
         )
 
         if isinstance(model_bundle, tuple):
-            # Accommodate common train_model returns:
-            # (model, feature_names, auc, accuracy).
-            model = model_bundle[0] if model_bundle else None
+            model = (
+                model_bundle[0]
+                if model_bundle
+                else None
+            )
 
             model_bundle = {
                 "model": model,
@@ -5597,7 +5616,7 @@ def get_current_prediction():
                 "reasons": [],
             }
 
-        if not isinstance(model_bundle, dict):
+        elif not isinstance(model_bundle, dict):
             model_bundle = {
                 "model": model_bundle,
                 "enabled": model_bundle is not None,
@@ -5613,6 +5632,7 @@ def get_current_prediction():
                 "model_bundle": model_bundle,
             }
 
+        # 10. Predict using the newest feature row.
         latest_features = features.tail(1)
 
         prediction = _call_compatible(
@@ -5627,9 +5647,12 @@ def get_current_prediction():
         if not isinstance(prediction, dict):
             return {
                 "ok": False,
-                "reason": "PREDICTION_RETURN_TYPE_UNSUPPORTED",
+                "reason": (
+                    "PREDICTION_RETURN_TYPE_UNSUPPORTED"
+                ),
             }
 
+        # 11. Normalize the direction.
         direction = _normalise_direction(
             prediction.get("signal")
             or prediction.get("direction")
@@ -5659,9 +5682,12 @@ def get_current_prediction():
 
     except Exception as exc:
         log.exception("Current prediction failed.")
+
         return {
             "ok": False,
-            "reason": f"PREDICTION_PIPELINE_ERROR:{exc}",
+            "reason": (
+                f"PREDICTION_PIPELINE_ERROR:{exc}"
+            ),
         }
 
 
