@@ -965,12 +965,14 @@ def get_current_prediction():
 
         journal_model_run(model_bundle)
 
+        
         if not model_bundle.get("enabled", False):
             return {
                 "ok": False,
                 "reason": "MODEL_GATE_DISABLED",
                 "model_bundle": model_bundle,
             }
+
 
         # 9. Predict using the latest feature row.
         latest_features = features.tail(1)
