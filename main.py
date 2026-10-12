@@ -758,6 +758,30 @@ def fetch_stock_bars(
 
     frame = normalize_bars(collected)
 
+    # DIAGNOSTIC: verify latest bar timestamp
+    if not frame.empty:
+        latest_bar_time = frame.index[-1]
+        current_utc = pd.Timestamp.now(tz="UTC")
+
+        if latest_bar_time.tzinfo is None:
+            log.warning(
+                "DATA TIMEZONE NAIVE | %s | timestamp=%s",
+                symbol,
+                latest_bar_time,
+            )
+        else:
+            age_seconds = (
+                current_utc - latest_bar_time.tz_convert("UTC")
+            ).total_seconds()
+
+            log.info(
+                "DATA AGE CHECK | %s | last=%s | now_utc=%s | age_seconds=%.1f",
+                symbol,
+                latest_bar_time.isoformat(),
+                current_utc.isoformat(),
+                age_seconds,
+            )
+
     if frame.empty:
         log.warning("All returned bars were invalid for %s.", symbol)
         return frame
