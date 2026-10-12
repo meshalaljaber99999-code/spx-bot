@@ -901,10 +901,7 @@ def get_current_prediction():
             now_utc().isoformat(),
         )
 
-        fresh, freshness_reason = _data_timestamp_is_fresh(
-            latest_timestamp
-        )
-
+      
         fresh, freshness_reason = _data_timestamp_is_fresh(
             latest_timestamp
         )
