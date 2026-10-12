@@ -3997,10 +3997,11 @@ def daily_risk_guard(
 # ============================================================
 
 def find_option_recommendation_candidate(
-    underlying_price: float,
-    expected_direction: str,
+    underlying_price: float = 0.0,
+    expected_direction: str = "CALL",
     underlying: str = PRIMARY_UNDERLYING,
     current_time: Optional[datetime] = None,
+    *args,
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -4010,7 +4011,17 @@ def find_option_recommendation_candidate(
     This function returns a recommendation candidate only.
     It never submits an order.
     """
-    direction = expected_direction.strip().upper()
+    # التعامل مع أي وسيط إضافي قد يمرر عبر args أو kwargs
+    if args:
+        if len(args) > 0 and not underlying_price:
+            underlying_price = args[0]
+        if len(args) > 1 and not expected_direction:
+            expected_direction = args[1]
+
+    if kwargs.get("direction") and not expected_direction:
+        expected_direction = kwargs.get("direction")
+
+    direction = str(expected_direction).strip().upper()
 
     if direction not in {"CALL", "PUT"}:
         return {
@@ -4037,7 +4048,7 @@ def find_option_recommendation_candidate(
 
     underlying_value = safe_positive_float(underlying_price)
 
-    if underlying_value is None:
+    if underlying_value is None or underlying_value <= 0:
         return {
             "ok": False,
             "reason": "INVALID_UNDERLYING_PRICE",
