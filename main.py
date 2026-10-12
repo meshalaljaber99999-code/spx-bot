@@ -506,13 +506,27 @@ HTTP.headers.update({
 })
 
 
+
 def alpaca_headers() -> dict[str, str]:
     """Create authenticated Alpaca market-data headers."""
-    if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
+
+    key_id = str(APCA_API_KEY_ID or "").strip()
+    secret_key = str(APCA_API_SECRET_KEY or "").strip()
+
+    if not key_id or not secret_key:
         raise RuntimeError(
-            "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY "
-            "environment variables."
+            "Alpaca credentials are empty. "
+            f"KEY_ID_PRESENT={bool(key_id)}, "
+            f"SECRET_PRESENT={bool(secret_key)}. "
+            "Check environment variables and _s()."
         )
+
+    return {
+        "APCA-API-KEY-ID": key_id,
+        "APCA-API-SECRET-KEY": secret_key,
+        "Accept": "application/json",
+    }
+
 
     return {
         "APCA-API-KEY-ID": APCA_API_KEY_ID,
