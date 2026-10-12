@@ -732,7 +732,19 @@ def fetch_stock_bars(
             params.pop("page_token", None)
 
         payload = alpaca_get(url, params=params)
-        bars = payload.get("bars", [])
+        
+        bars = payload.get("bars") or []
+        log.warning(
+            "ALPACA CHECK | symbol=%s | count=%s | "
+            "last_bar=%s | next_page=%s | feed=%s | end=%s",
+            symbol,
+            len(bars),
+            bars[-1].get("t") if bars else None,
+            bool(payload.get("next_page_token")),
+            ALPACA_DATA_FEED,
+            params.get("end"),
+        )
+
 
         if bars:
             if not isinstance(bars, list):
