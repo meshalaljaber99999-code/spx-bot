@@ -5682,7 +5682,7 @@ def get_current_prediction():
             dataset=features,
         )
 
-        )
+
 
         if isinstance(model_bundle, tuple):
             model = (
