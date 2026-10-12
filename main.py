@@ -1,630 +1,1363 @@
+
 # ============================================================
-# SPX 0DTE AI ADVISOR v19.9 — صَفاء التحليل
-# STRICT BAR COMPLETENESS + PRE-SEND RE-VALIDATION FIX
-# 15M NY SESSION ALIGNMENT + ANTI-LOOKAHEAD ENFORCEMENT
-# OBSERVED QUOTES JOURNAL — NOT ACTUAL EXECUTION P&L
-# SPXW SAME-DAY OPTIONS — RECOMMENDATIONS ONLY
-# NO AUTOMATIC ORDER EXECUTION
+# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+# PART 1/6
+# Imports • Configuration • NY Session • Calendar • Market Data
+#
+# MODE: RECOMMENDATIONS ONLY — NO ORDER EXECUTION
+# IMPORTANT: SPY is not SPX. SPY data must never be presented
+# as the actual SPX index price or as an SPXW option quote.
 # ============================================================
 
+from __future__ import annotations
+
 import os
+import sys
+import json
 import time
+import math
 import logging
 import warnings
-from datetime import datetime, timedelta, timezone, date
+from datetime import (
+    datetime,
+    date,
+    time as dt_time,
+    timedelta,
+    timezone,
+)
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import make_pipeline
-from sklearn.metrics import accuracy_score, roc_auc_score
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-warnings.filterwarnings("ignore")
+# ============================================================
+# 1. VERSION AND LOGGING
+# ============================================================
 
-# ======================== CONFIG =============================
-
-VERSION = "19.9"
 BOT_NAME = "صَفاء التحليل"
+BOT_VERSION = "21.4"
+JOURNAL_VERSION = "21.4"
 
-NY = ZoneInfo("America/New_York")
-UTC = timezone.utc
-
-API_KEY = (
-    os.getenv("ALPACA_API_KEY")
-    or os.getenv("APCA_API_KEY_ID")
-    or ""
-).strip()
-
-API_SECRET = (
-    os.getenv("ALPACA_SECRET_KEY")
-    or os.getenv("APCA_API_SECRET_KEY")
-    or ""
-).strip()
-
-TRADE_URL = os.getenv(
-    "ALPACA_TRADE_URL",
-    "https://paper-api.alpaca.markets"
-).rstrip("/")
-
-DATA_URL = os.getenv(
-    "ALPACA_DATA_URL",
-    "https://data.alpaca.markets"
-).rstrip("/")
-
-DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
-OPTIONS_FEED = os.getenv(
-    "ALPACA_OPTIONS_FEED", "indicative"
-).lower()
-
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-MIN_AUC = float(os.getenv("MIN_MODEL_AUC", "0.55"))
-MIN_CONFIDENCE = float(
-    os.getenv("MIN_MODEL_CONFIDENCE", "0.62")
-)
-
-BASE_MAX_SPREAD_PCT = float(
-    os.getenv("MAX_OPTION_SPREAD_PCT", "0.12")
-)
-
-MIN_OPTION_PREMIUM = float(
-    os.getenv("MIN_OPTION_PREMIUM", "0.50")
-)
-
-MAX_OPTION_PREMIUM = float(
-    os.getenv("MAX_OPTION_PREMIUM", "50.00")
-)
-
-MIN_TARGET_DISTANCE = float(
-    os.getenv("MIN_TARGET_DISTANCE_POINTS", "1.00")
-)
-
-MAX_TARGET_DISTANCE = float(
-    os.getenv("MAX_TARGET_DISTANCE_POINTS", "15.00")
-)
-
-MIN_DIRECTION_VOTES = int(
-    os.getenv("MIN_DIRECTION_VOTES", "2")
-)
-
-MAX_SPX_BAR_AGE_MINUTES = float(
-    os.getenv("MAX_SPX_BAR_AGE_MINUTES", "12")
-)
-
-MAX_STOCK_BAR_AGE_MINUTES = float(
-    os.getenv("MAX_STOCK_BAR_AGE_MINUTES", "12")
-)
-
-MAX_COMMON_BAR_AGE_MINUTES = float(
-    os.getenv("MAX_COMMON_BAR_AGE_MINUTES", "12")
-)
-
-MAX_SOURCE_SYNC_GAP_MINUTES = float(
-    os.getenv("MAX_SOURCE_SYNC_GAP_MINUTES", "8")
-)
-
-MAX_SPOT_AGE_SECONDS = float(
-    os.getenv("MAX_SPOT_AGE_SECONDS", "180")
-)
-
-MAX_OPTION_QUOTE_AGE_SECONDS = float(
-    os.getenv("MAX_OPTION_QUOTE_AGE_SECONDS", "180")
-)
-
-MIN_ABS_DELTA = float(os.getenv("MIN_ABS_DELTA", "0.25"))
-MAX_ABS_DELTA = float(os.getenv("MAX_ABS_DELTA", "0.65"))
-TARGET_ABS_DELTA = float(os.getenv("TARGET_ABS_DELTA", "0.45"))
-
-MAX_DELTA_QUOTE_AGE_SECONDS = float(
-    os.getenv("MAX_DELTA_QUOTE_AGE_SECONDS", "90")
-)
-
-MAX_SPOT_OPTION_GAP_SECONDS = float(
-    os.getenv("MAX_SPOT_OPTION_GAP_SECONDS", "180")
-)
-
-MAX_SIGNAL_AGE_BEFORE_SEND_SECONDS = float(
-    os.getenv("MAX_SIGNAL_AGE_BEFORE_SEND_SECONDS", "120")
-)
-
-SCAN_SECONDS = max(20, int(os.getenv("SCAN_SECONDS", "60")))
-ALERT_COOLDOWN_MINUTES = max(
-    1, int(os.getenv("ALERT_COOLDOWN_MINUTES", "20"))
-)
-
-LABEL_HORIZON = 3
-MAX_BARS = 5000
-MAX_CONTRACTS_TO_CHECK = 100
-
-SIGNAL_LOG_PATH = os.getenv(
-    "SIGNAL_LOG_PATH", "spxw_signal_journal.csv"
-)
-
-OUTCOME_MINUTES = (1, 3, 5, 10)
-
-REQUIRE_INDEPENDENT_GREEKS_TIMESTAMP = (
-    os.getenv("REQUIRE_INDEPENDENT_GREEKS_TIMESTAMP", "false").lower()
-    in ("1", "true", "yes")
-)
-
-FEATURES = [
-    "ret_1", "ret_3", "ret_6",
-    "rsi", "ema_spread", "ema_long_spread",
-    "atr_pct", "range_pct", "body_ratio",
-    "volatility", "momentum_accel", "momentum_velocity",
-    "resistance_dist", "support_dist",
-    "macd_line_pct", "macd_signal_pct", "macd_hist_pct",
-    "adx", "plus_di", "minus_di",
-    "volume_ratio", "session_vwap_dist",
-    "bullish_engulfing", "bearish_engulfing",
-    "lower_wick_ratio", "upper_wick_ratio",
-    "bullish_rejection", "bearish_rejection",
-    "breakout_up", "breakout_down",
-    "fakeout_up", "fakeout_down",
-    "retest_up", "retest_down",
-    "opening_range_position",
-    "opening_range_break_up", "opening_range_break_down",
-    "spy_ret_1", "spy_ret_3", "spy_ema_spread",
-    "spy_rsi", "spy_vwap_dist",
-    "spy_macd_hist_pct", "spy_adx", "spy_volume_ratio",
-    "qqq_ret_1", "qqq_ret_3", "qqq_ema_spread",
-    "qqq_rsi", "qqq_vwap_dist",
-    "qqq_macd_hist_pct", "qqq_adx", "qqq_volume_ratio",
-    "m15_ret_1", "m15_ema_spread", "m15_rsi",
-    "m15_macd_hist_pct", "m15_adx",
-]
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": f"SafaaAnalysis/{VERSION}"})
+log = logging.getLogger("safa_analysis")
 
-LAST_ALERTS = {}
+# ============================================================
+# 2. ENVIRONMENT CONFIGURATION HELPERS
+# ============================================================
 
-
-# ======================== LOGGING / TIME =====================
-
-def log(message, level="info"):
-    getattr(logging, level, logging.info)(message)
-
-
-def utc_now():
-    return datetime.now(UTC)
+def _s(name: str, default: str = "") -> str:
+    """Read a string environment variable."""
+    value = os.getenv(name)
+    return default if value is None else value.strip()
 
 
-def ny_now():
-    return datetime.now(NY)
+def _i(name: str, default: int) -> int:
+    """Read an integer environment variable safely."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value.strip())
+    except (TypeError, ValueError):
+        log.warning("%s is invalid; using default %s", name, default)
+        return default
 
 
-def alpaca_headers():
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError("مفاتيح Alpaca غير موجودة في متغيرات البيئة.")
-    return {
-        "APCA-API-KEY-ID": API_KEY,
-        "APCA-API-SECRET-KEY": API_SECRET,
+def _f(name: str, default: float) -> float:
+    """Read a finite floating-point environment variable safely."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        result = float(value.strip())
+        if not math.isfinite(result):
+            raise ValueError("non-finite value")
+        return result
+    except (TypeError, ValueError):
+        log.warning("%s is invalid; using default %s", name, default)
+        return default
+
+
+def _b(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable safely."""
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in {
+        "1", "true", "yes", "y", "on"
     }
 
 
-def parse_timestamp(value):
+# ============================================================
+# 3. API CONFIGURATION
+# ============================================================
+
+APCA_API_KEY_ID = _s("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = _s("APCA_API_SECRET_KEY")
+
+ALPACA_DATA_URL = _s(
+    "ALPACA_DATA_URL",
+    "https://data.alpaca.markets",
+).rstrip("/")
+
+ALPACA_TRADING_URL = _s(
+    "ALPACA_TRADING_URL",
+    "https://paper-api.alpaca.markets",
+).rstrip("/")
+
+# Common Alpaca stock market-data feeds include iex and sip.
+# The account's permissions determine which feeds are accessible.
+ALPACA_DATA_FEED = _s("ALPACA_DATA_FEED", "iex").lower()
+
+REQUEST_TIMEOUT_SECONDS = _i("REQUEST_TIMEOUT_SECONDS", 15)
+HTTP_RETRIES = _i("HTTP_RETRIES", 3)
+HTTP_RETRY_SLEEP_SECONDS = _f("HTTP_RETRY_SLEEP_SECONDS", 1.5)
+
+# This bot must not submit orders.
+NO_ORDER_EXECUTION = True
+RECOMMENDATION_ONLY = True
+
+# ============================================================
+# 4. MARKET AND MODEL SETTINGS
+# ============================================================
+
+TIMEZONE_NY = ZoneInfo("America/New_York")
+TIMEZONE_UTC = timezone.utc
+
+TIMEFRAME = _s("TIMEFRAME", "5Min")
+HISTORY_DAYS = _i("HISTORY_DAYS", 60)
+MIN_TRAIN_ROWS = _i("MIN_TRAIN_ROWS", 300)
+HORIZON = _i("HORIZON", 6)
+
+# These thresholds are filters, not guarantees of profitability.
+MIN_PROBABILITY = _f("MIN_PROBABILITY", 0.64)
+MIN_AUC = _f("MIN_AUC", 0.55)
+MIN_SPY_SCORE = _f("MIN_SPY_SCORE", 78.0)
+MIN_CONFIRMATIONS = _i("MIN_CONFIRMATIONS", 2)
+
+# Conservative model-evaluation gate.
+MIN_HOLDOUT_SIGNAL_N = _i("MIN_HOLDOUT_SIGNAL_N", 30)
+MIN_HOLDOUT_SIGNAL_ACC = _f("MIN_HOLDOUT_SIGNAL_ACC", 0.55)
+MAX_HOLDOUT_BRIER = _f("MAX_HOLDOUT_BRIER", 0.25)
+
+# Volatility / movement settings.
+ATR_TARGET = _f("ATR_TARGET", 0.50)
+
+# Option quote filters.
+MAX_SPREAD_PERCENT = _f("MAX_SPREAD_PERCENT", 0.12)
+MIN_OPTION_PREMIUM = _f("MIN_OPTION_PREMIUM", 0.50)
+MAX_OPTION_PREMIUM = _f("MAX_OPTION_PREMIUM", 50.00)
+MAX_STRIKE_DISTANCE = _f("MAX_STRIKE_DISTANCE", 35.0)
+MIN_DELTA = _f("MIN_DELTA", 0.20)
+MAX_DELTA = _f("MAX_DELTA", 0.80)
+
+# Freshness requirements.
+MAX_BAR_AGE_MINUTES = _i("MAX_BAR_AGE_MINUTES", 10)
+MAX_QUOTE_AGE_SECONDS = _i("MAX_QUOTE_AGE_SECONDS", 60)
+MAX_SPOT_AGE_SECONDS = _i("MAX_SPOT_AGE_SECONDS", 60)
+MAX_SPOT_OPTION_SKEW_SECONDS = _i(
+    "MAX_SPOT_OPTION_SKEW_SECONDS", 30
+)
+
+# Signal cadence.
+POLL_SECONDS = _i("POLL_SECONDS", 30)
+SIGNAL_COOLDOWN_MINUTES = _i("SIGNAL_COOLDOWN_MINUTES", 20)
+
+# Avoid the first and last minutes of the regular session.
+NO_TRADE_FIRST_MINUTES = _i("NO_TRADE_FIRST_MINUTES", 10)
+NO_TRADE_LAST_MINUTES = _i("NO_TRADE_LAST_MINUTES", 30)
+
+# Confirmation instruments: market context only.
+MARKET_SYMBOLS = ["SPY", "QQQ"]
+
+CONFIRMATION_SYMBOLS = [
+    "NVDA",
+    "AAPL",
+    "MSFT",
+    "TSLA",
+    "AMZN",
+    "META",
+    "GOOGL",
+    "AMD",
+    "AVGO",
+    "NFLX",
+]
+
+# Stock options are not automatically equivalent to SPXW options.
+# The actual SPX index and SPXW option chain require suitable data access.
+PRIMARY_UNDERLYING = _s("PRIMARY_UNDERLYING", "SPY").upper()
+
+# ============================================================
+# 5. RISK AND ACCOUNT SETTINGS
+# ============================================================
+
+# Zero equity means no risk-based contract sizing can be approved.
+# Set this to your actual account equity through environment settings.
+ACCOUNT_EQUITY = _f("ACCOUNT_EQUITY", 0.0)
+
+# Percent units: 0.5 means 0.5%, not 50%.
+RISK_PCT = _f("RISK_PCT", 0.50)
+
+MAX_DAILY_LOSS = _f("MAX_DAILY_LOSS", 200.0)
+MAX_TRADES_PER_DAY = _i("MAX_TRADES_PER_DAY", 5)
+MAX_OPEN_POSITIONS = _i("MAX_OPEN_POSITIONS", 2)
+MAX_CONTRACTS = _i("MAX_CONTRACTS", 5)
+
+ESTIMATED_SLIPPAGE_PER_CONTRACT = _f(
+    "ESTIMATED_SLIPPAGE_PER_CONTRACT", 0.05
+)
+ESTIMATED_FEES_PER_CONTRACT = _f(
+    "ESTIMATED_FEES_PER_CONTRACT", 1.00
+)
+
+# ============================================================
+# 6. TELEGRAM CONFIGURATION
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = _s("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _s("TELEGRAM_CHAT_ID")
+
+TELEGRAM_ENABLED = bool(
+    TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+)
+
+# ============================================================
+# 7. JOURNAL FILES
+# ============================================================
+
+DATA_DIR = _s("DATA_DIR", ".")
+
+SIGNAL_JOURNAL_PATH = os.path.join(
+    DATA_DIR, "safa_signals_v214.csv"
+)
+QUOTE_JOURNAL_PATH = os.path.join(
+    DATA_DIR, "safa_quote_observations_v214.csv"
+)
+MODEL_JOURNAL_PATH = os.path.join(
+    DATA_DIR, "safa_model_diagnostics_v214.csv"
+)
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ============================================================
+# 8. SESSION TIME HELPERS
+# ============================================================
+
+def now_utc() -> datetime:
+    """Current timezone-aware UTC time."""
+    return datetime.now(TIMEZONE_UTC)
+
+
+def now_ny() -> datetime:
+    """Current timezone-aware New York time."""
+    return datetime.now(TIMEZONE_NY)
+
+
+def to_utc(value: Any) -> Optional[datetime]:
+    """
+    Convert a datetime or parseable timestamp to UTC.
+    Return None for invalid or missing values.
+    """
     if value is None:
         return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
 
     try:
         ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return None
+
         if ts.tzinfo is None:
+            # Naive timestamps from market-data APIs are treated as UTC
+            # only where the calling API explicitly documents that behavior.
             ts = ts.tz_localize("UTC")
         else:
             ts = ts.tz_convert("UTC")
+
         return ts.to_pydatetime()
     except Exception:
         return None
 
 
-def age_seconds(ts):
+def to_ny(value: Any) -> Optional[datetime]:
+    """Convert a datetime or timestamp to New York time."""
+    ts = to_utc(value)
     if ts is None:
         return None
-    return (utc_now() - ts.astimezone(UTC)).total_seconds()
+    return ts.astimezone(TIMEZONE_NY)
 
 
-def timestamp_gap_seconds(ts1, ts2):
-    if ts1 is None or ts2 is None:
-        return None
-    return abs((ts1.astimezone(UTC) - ts2.astimezone(UTC)).total_seconds())
+def minutes_between(a: datetime, b: datetime) -> float:
+    """Absolute time difference in minutes."""
+    return abs((a - b).total_seconds()) / 60.0
 
 
-def valid_timestamp_age(ts, max_age):
-    age = age_seconds(ts)
-    return age is not None and -30 <= age <= max_age
+def seconds_between(a: datetime, b: datetime) -> float:
+    """Absolute time difference in seconds."""
+    return abs((a - b).total_seconds())
 
 
-# ======================== BAR NORMALIZATION ==================
+def is_weekday(day: date) -> bool:
+    return day.weekday() < 5
 
-def normalize_bars(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.copy()
 
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+def nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the nth weekday of a month; Monday=0."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def last_weekday(year: int, month: int, weekday: int) -> date:
+    """Return the last weekday of a month; Monday=0."""
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
     else:
-        df.index = pd.DatetimeIndex(pd.to_datetime(df.index, utc=True))
-        df.index.name = "timestamp"
+        next_month = date(year, month + 1, 1)
 
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    required = [c for c in ["open", "high", "low", "close"] if c in df.columns]
-    if required:
-        df = df.dropna(subset=required)
-    return df
+    current = next_month - timedelta(days=1)
+    offset = (current.weekday() - weekday) % 7
+    return current - timedelta(days=offset)
 
 
-def remove_incomplete_5m_bars(df, source):
+def observed_fixed_holiday(day: date) -> date:
+    """Apply common US federal holiday observation rules."""
+    if day.weekday() == 5:
+        return day - timedelta(days=1)
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
+def us_market_holidays(year: int) -> set[date]:
     """
-    يضمن عدم قبول أي شمعة لم ينقضِ وقت إغلاقها الفعلي تماماً (منع Lookahead).
+    Approximate US equity-market holiday calendar.
+
+    This is a conservative manual calendar for common holidays.
+    It does not model every exceptional exchange closure or every
+    special early-close session. For production trading, verify the
+    official exchange calendar.
     """
-    df = normalize_bars(df)
-    if df.empty:
-        return df
+    holidays: set[date] = set()
 
-    now = pd.Timestamp(utc_now())
-    end_times = df.index + pd.Timedelta(minutes=5)
-    completed = end_times <= now
-    removed = int((~completed).sum())
+    # New Year's Day, including a Saturday-observed closure
+    jan1 = date(year, 1, 1)
+    holidays.add(observed_fixed_holiday(jan1))
 
-    if removed:
-        log(f"[الشموع غير المكتملة] {source}: استبعاد {removed} شمعة لم يحن وقت اكتمالها")
+    # If January 1 of the next year is Saturday, December 31 may close.
+    next_jan1 = date(year + 1, 1, 1)
+    if next_jan1.weekday() == 5:
+        holidays.add(date(year, 12, 31))
 
-    return df.loc[completed].copy()
+    # Martin Luther King Jr. Day: third Monday in January
+    holidays.add(nth_weekday(year, 1, 0, 3))
+
+    # Presidents' Day: third Monday in February
+    holidays.add(nth_weekday(year, 2, 0, 3))
+
+    # Good Friday: two days before Easter Sunday
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    easter_month = (h + l - 7 * m + 114) // 31
+    easter_day = ((h + l - 7 * m + 114) % 31) + 1
+    easter_sunday = date(year, easter_month, easter_day)
+    holidays.add(easter_sunday - timedelta(days=2))
+
+    # Memorial Day: last Monday in May
+    holidays.add(last_weekday(year, 5, 0))
+
+    # Juneteenth, observed from 2022 onward
+    if year >= 2022:
+        holidays.add(observed_fixed_holiday(date(year, 6, 19)))
+
+    # Independence Day
+    holidays.add(observed_fixed_holiday(date(year, 7, 4)))
+
+    # Labor Day: first Monday in September
+    holidays.add(nth_weekday(year, 9, 0, 1))
+
+    # Thanksgiving: fourth Thursday in November
+    holidays.add(nth_weekday(year, 11, 3, 4))
+
+    # Christmas
+    holidays.add(observed_fixed_holiday(date(year, 12, 25)))
+
+    return holidays
 
 
-def validate_bar_freshness(df, source, max_age_minutes):
-    if df is None or df.empty:
-        raise RuntimeError(f"{source}: لا توجد شموع مكتملة")
-
-    last_ts = df.index[-1].to_pydatetime()
-    age_min = (utc_now() - last_ts).total_seconds() / 60
-
-    log(f"[حداثة البيانات] {source}: آخر بداية شمعة={last_ts.isoformat()} | العمر={age_min:.1f} دقيقة")
-
-    if age_min < -2:
-        raise RuntimeError(f"{source}: توقيت آخر شمعة في المستقبل")
-    if age_min > max_age_minutes:
-        raise RuntimeError(f"{source}: بيانات قديمة ({age_min:.1f} دقيقة)")
-
-    return age_min
+def is_market_holiday(day: date) -> bool:
+    """Check common holidays for this date and adjacent calendar years."""
+    holidays = set()
+    for year in (day.year - 1, day.year, day.year + 1):
+        holidays.update(us_market_holidays(year))
+    return day in holidays
 
 
-# ======================== MARKET DATA ========================
+def regular_session_bounds(day: date) -> tuple[datetime, datetime]:
+    """Regular session bounds in New York time: 09:30–16:00."""
+    start = datetime.combine(
+        day, dt_time(hour=9, minute=30), tzinfo=TIMEZONE_NY
+    )
+    end = datetime.combine(
+        day, dt_time(hour=16, minute=0), tzinfo=TIMEZONE_NY
+    )
+    return start, end
 
-def get_alpaca_stock_bars(symbol):
+
+def is_regular_session(value: Optional[datetime] = None) -> bool:
+    """
+    Check weekday, common holiday calendar and regular session hours.
+    Early closes are not fully represented by this manual calendar.
+    """
+    current = to_ny(value or now_ny())
+    if current is None:
+        return False
+
+    if not is_weekday(current.date()):
+        return False
+
+    if is_market_holiday(current.date()):
+        return False
+
+    start, end = regular_session_bounds(current.date())
+    return start <= current < end
+
+
+def session_window_status(
+    value: Optional[datetime] = None,
+) -> tuple[bool, str]:
+    """
+    Return whether new signals are allowed by the regular-session
+    time window and explain any rejection.
+    """
+    current = to_ny(value or now_ny())
+    if current is None:
+        return False, "INVALID_TIME"
+
+    if not is_weekday(current.date()):
+        return False, "WEEKEND"
+
+    if is_market_holiday(current.date()):
+        return False, "MARKET_HOLIDAY"
+
+    start, end = regular_session_bounds(current.date())
+
+    if current < start:
+        return False, "PRE_MARKET"
+
+    if current >= end:
+        return False, "AFTER_MARKET"
+
+    elapsed_minutes = (current - start).total_seconds() / 60.0
+    remaining_minutes = (end - current).total_seconds() / 60.0
+
+    if elapsed_minutes < NO_TRADE_FIRST_MINUTES:
+        return False, "OPENING_BUFFER"
+
+    if remaining_minutes <= NO_TRADE_LAST_MINUTES:
+        return False, "CLOSING_BUFFER"
+
+    return True, "SESSION_OK"
+
+
+# ============================================================
+# 9. HTTP SESSION AND ALPACA HEADERS
+# ============================================================
+
+HTTP = requests.Session()
+
+HTTP.headers.update({
+    "Accept": "application/json",
+    "User-Agent": f"{BOT_NAME}/{BOT_VERSION}",
+})
+
+
+def alpaca_headers() -> dict[str, str]:
+    """Create authenticated Alpaca market-data headers."""
+    if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
+        raise RuntimeError(
+            "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY "
+            "environment variables."
+        )
+
+    return {
+        "APCA-API-KEY-ID": APCA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+        "Accept": "application/json",
+    }
+
+
+def alpaca_get(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Perform a retry-limited Alpaca GET request.
+    Raises on authentication, HTTP or malformed-response errors.
+    """
+    headers = alpaca_headers()
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            response = HTTP.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if response.status_code in (401, 403):
+                raise RuntimeError(
+                    f"Alpaca authentication/permission error "
+                    f"{response.status_code}: {response.text[:300]}"
+                )
+
+            response.raise_for_status()
+
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError("Unexpected Alpaca JSON response.")
+
+            return payload
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < HTTP_RETRIES:
+                sleep_for = HTTP_RETRY_SLEEP_SECONDS * attempt
+                log.warning(
+                    "Alpaca request failed (%s/%s): %s; retrying in %.1fs",
+                    attempt,
+                    HTTP_RETRIES,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+
+    raise RuntimeError(
+        f"Alpaca GET failed after {HTTP_RETRIES} attempts: {last_error}"
+    )
+
+
+# ============================================================
+# 10. MARKET DATA NORMALIZATION
+# ============================================================
+
+REQUIRED_BAR_COLUMNS = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+]
+
+
+def normalize_bars(
+    raw_bars: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Normalize Alpaca stock bars to a UTC-indexed DataFrame.
+    Invalid rows are removed; duplicate timestamps keep the last row.
+    """
+    if not raw_bars:
+        return pd.DataFrame(columns=REQUIRED_BAR_COLUMNS)
+
+    frame = pd.DataFrame(raw_bars)
+
+    if "t" not in frame.columns:
+        raise ValueError("Bar response has no timestamp field 't'.")
+
+    rename_map = {
+        "t": "timestamp",
+        "o": "open",
+        "h": "high",
+        "l": "low",
+        "c": "close",
+        "v": "volume",
+        "n": "trade_count",
+        "vw": "vwap",
+    }
+    frame = frame.rename(columns=rename_map)
+
+    if "timestamp" not in frame.columns:
+        raise ValueError("Unable to identify bar timestamps.")
+
+    frame["timestamp"] = pd.to_datetime(
+        frame["timestamp"], utc=True, errors="coerce"
+    )
+    frame = frame.dropna(subset=["timestamp"])
+
+    for column in REQUIRED_BAR_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = np.nan
+
+        frame[column] = pd.to_numeric(
+            frame[column], errors="coerce"
+        )
+
+    frame = frame.dropna(subset=REQUIRED_BAR_COLUMNS)
+
+    frame = frame[
+        (frame["open"] > 0)
+        & (frame["high"] > 0)
+        & (frame["low"] > 0)
+        & (frame["close"] > 0)
+        & (frame["volume"] >= 0)
+    ]
+
+    frame = frame.sort_values("timestamp")
+    frame = frame.drop_duplicates(
+        subset=["timestamp"], keep="last"
+    )
+    frame = frame.set_index("timestamp")
+    frame.index.name = "timestamp"
+
+    for optional_column in ("trade_count", "vwap"):
+        if optional_column in frame.columns:
+            frame[optional_column] = pd.to_numeric(
+                frame[optional_column], errors="coerce"
+            )
+
+    return frame
+
+
+# ============================================================
+# 11. FETCH HISTORICAL STOCK BARS
+# ============================================================
+
+def fetch_stock_bars(
+    symbol: str,
+    timeframe: str = TIMEFRAME,
+    history_days: int = HISTORY_DAYS,
+    limit: int = 10000,
+) -> pd.DataFrame:
+    """
+    Fetch historical stock bars from Alpaca's market-data API.
+
+    Pagination uses next_page_token where provided. The function
+    returns actual stock bars; it does not multiply SPY by ten to
+    manufacture an SPX price.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol:
+        raise ValueError("Symbol cannot be empty.")
+
+    if history_days < 1:
+        raise ValueError("history_days must be >= 1.")
+
+    end_time = now_utc()
+    start_time = end_time - timedelta(days=history_days)
+
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+
+    params: dict[str, Any] = {
+        "timeframe": timeframe,
+        "start": start_time.isoformat().replace("+00:00", "Z"),
+        "end": end_time.isoformat().replace("+00:00", "Z"),
+        "limit": min(max(int(limit), 1), 10000),
+        "adjustment": "raw",
+        "feed": ALPACA_DATA_FEED,
+        "sort": "asc",
+    }
+
+    collected: list[dict[str, Any]] = []
+    page_token: Optional[str] = None
+    pages = 0
+    max_pages = 50
+
+    while pages < max_pages:
+        if page_token:
+            params["page_token"] = page_token
+        else:
+            params.pop("page_token", None)
+
+        payload = alpaca_get(url, params=params)
+        bars = payload.get("bars", [])
+
+        if bars:
+            if not isinstance(bars, list):
+                raise RuntimeError(
+                    f"Unexpected bars payload for {symbol}."
+                )
+            collected.extend(bars)
+
+        page_token = payload.get("next_page_token")
+        pages += 1
+
+        if not page_token:
+            break
+
+    if not collected:
+        log.warning(
+            "No bars returned for %s (feed=%s, timeframe=%s).",
+            symbol,
+            ALPACA_DATA_FEED,
+            timeframe,
+        )
+        return pd.DataFrame(columns=REQUIRED_BAR_COLUMNS)
+
+    frame = normalize_bars(collected)
+
+    if frame.empty:
+        log.warning("All returned bars were invalid for %s.", symbol)
+        return frame
+
+    log.info(
+        "DATA %s: %s bars | last=%s | feed=%s",
+        symbol,
+        len(frame),
+        frame.index[-1].isoformat(),
+        ALPACA_DATA_FEED,
+    )
+
+    return frame
+
+
+# ============================================================
+# 12. DATA FRESHNESS AND QUALITY CHECKS
+# ============================================================
+
+def latest_bar_timestamp(
+    bars: Optional[pd.DataFrame],
+) -> Optional[datetime]:
+    if bars is None or bars.empty:
+        return None
+
     try:
-        end = utc_now()
-        start = end - timedelta(days=10)
-        params = {
-            "timeframe": "5Min",
-            "start": start.isoformat().replace("+00:00", "Z"),
-            "end": end.isoformat().replace("+00:00", "Z"),
-            "limit": 10000,
-            "adjustment": "raw",
-            "feed": DATA_FEED,
-            "sort": "asc",
-        }
-        response = HTTP.get(f"{DATA_URL}/v2/stocks/{symbol}/bars", headers=alpaca_headers(), params=params, timeout=25)
-        if response.status_code >= 400:
-            raise RuntimeError(f"Alpaca HTTP {response.status_code}: {response.text[:200]}")
-
-        rows = response.json().get("bars", [])
-        if not rows:
-            raise RuntimeError(f"لا توجد بيانات {symbol} من Alpaca")
-
-        df = pd.DataFrame(rows).rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-        df = remove_incomplete_5m_bars(df, f"{symbol} Alpaca")
-        df = df.tail(MAX_BARS)
-
-        if len(df) < 100:
-            raise RuntimeError(f"شموع {symbol} غير كافية: {len(df)}")
-
-        validate_bar_freshness(df, f"{symbol} 5m Alpaca", MAX_SPX_BAR_AGE_MINUTES)
-        return df
-    except Exception as exc:
-        log(f"[تحذير Alpaca {symbol}] {exc} — محاولة التحويل إلى Yahoo Finance", "warning")
-        return pd.DataFrame()
-
-
-def get_spx_bars():
-    df = get_alpaca_stock_bars("SPX")
-    if not df.empty:
-        log("[مصدر SPX] تم الجلب بنجاح من Alpaca Direct Feed.")
-        return df
-
-    try:
-        raw = yf.download("^GSPC", period="60d", interval="5m", auto_adjust=False, progress=False, threads=False)
-        if raw is None or raw.empty:
-            raise RuntimeError("لم تصل بيانات SPX من Yahoo Finance")
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-
-        raw = raw.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        raw = remove_incomplete_5m_bars(raw, "SPX Yahoo 5m")
-        raw = raw.tail(MAX_BARS)
-
-        if len(raw) < 300:
-            raise RuntimeError(f"شموع SPX غير كافية: {len(raw)}")
-
-        validate_bar_freshness(raw, "SPX 5m Yahoo", MAX_SPX_BAR_AGE_MINUTES)
-        log("[مصدر SPX] تم الاعتماد على Yahoo Finance (Fallback).")
-        return raw
-    except Exception as exc:
-        log(f"[خطأ بيانات SPX النهائي] {exc}", "error")
-        return pd.DataFrame()
-
-
-def get_spx_spot():
-    try:
-        response = HTTP.get(f"{DATA_URL}/v2/stocks/SPX/trades/latest", headers=alpaca_headers(), timeout=10)
-        if response.status_code < 400:
-            trade = response.json().get("trade", {})
-            price = number_from(trade, "p", "price")
-            ts = parse_timestamp(trade.get("t"))
-            if price and ts and valid_timestamp_age(ts, MAX_SPOT_AGE_SECONDS):
-                return float(price), ts
+        return to_utc(bars.index[-1])
     except Exception:
-        pass
+        return None
 
+
+def bar_age_minutes(
+    bars: Optional[pd.DataFrame],
+    current_time: Optional[datetime] = None,
+) -> Optional[float]:
+    timestamp = latest_bar_timestamp(bars)
+    current = to_utc(current_time or now_utc())
+
+    if timestamp is None or current is None:
+        return None
+
+    # A future-dated bar is treated as invalid rather than fresh.
+    age = (current - timestamp).total_seconds() / 60.0
+    if age < -1.0:
+        return None
+
+    return max(0.0, age)
+
+
+def validate_bars(
+    symbol: str,
+    bars: Optional[pd.DataFrame],
+    min_rows: int = 50,
+    max_age_minutes: float = MAX_BAR_AGE_MINUTES,
+) -> tuple[bool, str]:
+    """Validate basic completeness, timestamps and freshness."""
+    if bars is None:
+        return False, f"{symbol}:BARS_NONE"
+
+    if bars.empty:
+        return False, f"{symbol}:BARS_EMPTY"
+
+    missing = [
+        column for column in REQUIRED_BAR_COLUMNS
+        if column not in bars.columns
+    ]
+    if missing:
+        return False, f"{symbol}:MISSING_COLUMNS:{','.join(missing)}"
+
+    if len(bars) < min_rows:
+        return False, f"{symbol}:INSUFFICIENT_ROWS:{len(bars)}"
+
+    if not isinstance(bars.index, pd.DatetimeIndex):
+        return False, f"{symbol}:INDEX_NOT_DATETIME"
+
+    if bars.index.tz is None:
+        return False, f"{symbol}:INDEX_NOT_TIMEZONE_AWARE"
+
+    if not bars.index.is_monotonic_increasing:
+        return False, f"{symbol}:TIMESTAMPS_NOT_SORTED"
+
+    if bars.index.has_duplicates:
+        return False, f"{symbol}:DUPLICATE_TIMESTAMPS"
+
+    if bars[REQUIRED_BAR_COLUMNS].isna().any().any():
+        return False, f"{symbol}:NAN_VALUES"
+
+    age = bar_age_minutes(bars)
+    if age is None:
+        return False, f"{symbol}:INVALID_LATEST_TIMESTAMP"
+
+    if age > max_age_minutes:
+        return False, f"{symbol}:STALE_BARS:{age:.1f}m"
+
+    return True, "BARS_OK"
+
+
+# ============================================================
+# 13. SAFE PRICE / NUMERIC HELPERS
+# ============================================================
+
+def safe_float(
+    value: Any,
+    default: Optional[float] = None,
+) -> Optional[float]:
     try:
-        raw = yf.download("^GSPC", period="1d", interval="1m", auto_adjust=False, progress=False, threads=False)
-        if raw is None or raw.empty:
-            raise RuntimeError("لم تصل بيانات SPX الدقيقة")
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-
-        raw = raw.rename(columns={"Close": "close"})
-        raw = normalize_bars(raw)
-        if raw.empty or "close" not in raw.columns:
-            raise RuntimeError("بيانات SPX الدقيقة غير صالحة")
-
-        ts = raw.index[-1].to_pydatetime()
-        spot = float(raw["close"].iloc[-1])
-        if not valid_timestamp_age(ts, MAX_SPOT_AGE_SECONDS):
-            raise RuntimeError("سعر SPX المرجعي قديم")
-        return spot, ts
-    except Exception as exc:
-        log(f"[خطأ سعر SPX المرجعي] {exc}", "error")
-        return None, None
-
-
-def get_stock_bars(symbol):
-    df = get_alpaca_stock_bars(symbol)
-    if not df.empty:
-        return df
-    try:
-        raw = yf.download(symbol, period="10d", interval="5m", auto_adjust=False, progress=False, threads=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        raw = raw.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        return remove_incomplete_5m_bars(raw, f"{symbol} Yahoo")
-    except Exception as exc:
-        log(f"[خطأ {symbol}] {exc}", "error")
-        return pd.DataFrame()
-
-
-# ======================== TECHNICAL INDICATORS ===============
-
-def calc_rsi(close, period=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_macd(close):
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    line = ema12 - ema26
-    signal = line.ewm(span=9, adjust=False).mean()
-    hist = line - signal
-    scale = close.replace(0, np.nan)
-    return line / scale, signal / scale, hist / scale
-
-
-def calculate_adx(high, low, close, period=14):
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=close.index)
-    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=close.index)
-    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    plus_smoothed = plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    minus_smoothed = minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    plus_di = 100 * plus_smoothed / atr.replace(0, np.nan)
-    minus_di = 100 * minus_smoothed / atr.replace(0, np.nan)
-    denom = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / denom
-    adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    return adx, plus_di, minus_di
-
-
-def add_session_vwap(df):
-    result = pd.Series(np.nan, index=df.index, dtype=float)
-    if "volume" not in df.columns:
+        result = float(value)
+        if not math.isfinite(result):
+            return default
         return result
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0).clip(lower=0)
-    if volume.sum() <= 0:
-        return result
-    local_index = df.index.tz_convert(NY)
-    dates = pd.Series(local_index.date, index=df.index)
-    minutes = pd.Series(local_index.hour * 60 + local_index.minute, index=df.index)
-    typical = (df["high"] + df["low"] + df["close"]) / 3
+    except (TypeError, ValueError):
+        return default
 
-    for session_date in dates.unique():
-        mask = ((dates == session_date) & (minutes >= 570) & (minutes < 960))
-        if not mask.any():
-            continue
-        vol = volume.loc[mask]
-        price = typical.loc[mask]
-        cumulative_volume = vol.cumsum()
-        cumulative_value = (price * vol).cumsum()
-        result.loc[mask] = cumulative_value / cumulative_volume.replace(0, np.nan)
+
+def safe_positive_float(
+    value: Any,
+) -> Optional[float]:
+    result = safe_float(value)
+    if result is None or result <= 0:
+        return None
     return result
 
 
-def add_opening_range(df):
-    high_result = pd.Series(np.nan, index=df.index, dtype=float)
-    low_result = pd.Series(np.nan, index=df.index, dtype=float)
-    local_index = df.index.tz_convert(NY)
-    dates = pd.Series(local_index.date, index=df.index)
-    minutes = pd.Series(local_index.hour * 60 + local_index.minute, index=df.index)
-
-    for session_date in dates.unique():
-        session_mask = ((dates == session_date) & (minutes >= 570) & (minutes < 960))
-        session = df.loc[session_mask]
-        if session.empty:
-            continue
-        session_minutes = minutes.loc[session.index]
-        opening = session[(session_minutes >= 570) & (session_minutes < 585)]
-        if len(opening) < 3:
-            continue
-        opening_high = float(opening["high"].max())
-        opening_low = float(opening["low"].min())
-        after_opening = session_minutes >= 585
-        valid_idx = session.index[after_opening]
-        high_result.loc[valid_idx] = opening_high
-        low_result.loc[valid_idx] = opening_low
-
-    return high_result, low_result
+def pct_change(
+    current: Optional[float],
+    previous: Optional[float],
+) -> Optional[float]:
+    if current is None or previous is None or previous == 0:
+        return None
+    return ((current / previous) - 1.0) * 100.0
 
 
-# ======================== FEATURE ENGINEERING ===============
+def calculate_spread_percent(
+    bid: Any,
+    ask: Any,
+) -> Optional[float]:
+    """
+    Calculate bid/ask spread as a fraction of midpoint.
+    Example: 0.05 means 5%. Returns None for invalid quotes.
+    """
+    bid_value = safe_positive_float(bid)
+    ask_value = safe_positive_float(ask)
 
-def build_features(bars, prefix=""):
-    df = normalize_bars(bars)
-    if df.empty:
-        return pd.DataFrame()
+    if bid_value is None or ask_value is None:
+        return None
 
-    o, h, lo, c = df["open"], df["high"], df["low"], df["close"]
-    result = pd.DataFrame(index=df.index)
+    if ask_value < bid_value:
+        return None
 
-    result[f"{prefix}ret_1"] = c.pct_change(1)
-    result[f"{prefix}ret_3"] = c.pct_change(3)
-    result[f"{prefix}ret_6"] = c.pct_change(6)
-    result[f"{prefix}rsi"] = calc_rsi(c)
+    midpoint = (bid_value + ask_value) / 2.0
+    if midpoint <= 0:
+        return None
 
-    ema9 = c.ewm(span=9, adjust=False).mean()
-    ema21 = c.ewm(span=21, adjust=False).mean()
-    ema50 = c.ewm(span=50, adjust=False).mean()
+    return (ask_value - bid_value) / midpoint
 
-    result[f"{prefix}ema_spread"] = (ema9 - ema21) / c.replace(0, np.nan)
-    result[f"{prefix}ema_long_spread"] = (ema21 - ema50) / c.replace(0, np.nan)
 
-    prev = c.shift(1)
-    tr = pd.concat([h - lo, (h - prev).abs(), (lo - prev).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
+# ============================================================
+# END OF PART 1/6
+# ============================================================
 
-    result[f"{prefix}atr_pct"] = atr / c.replace(0, np.nan)
-    candle_range = (h - lo).replace(0, np.nan)
-    result[f"{prefix}range_pct"] = (h - lo) / c.replace(0, np.nan)
-    result[f"{prefix}body_ratio"] = (c - o) / candle_range
-    result[f"{prefix}volatility"] = c.pct_change().rolling(20).std()
-    result[f"{prefix}momentum_accel"] = c.pct_change().diff(3)
-    result[f"{prefix}momentum_velocity"] = (c - c.shift(3)) / (candle_range.rolling(3).mean().replace(0, np.nan))
+# ============================================================
+# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+# PART 2/6
+# Technical Indicators • Price Action • Feature Engineering
+# • Multi-Timeframe Confirmation • Training Labels
+#
+# Paste directly below PART 1/6.
+# NO ORDER EXECUTION.
+# ============================================================
 
-    macd_line, macd_signal, macd_hist = calculate_macd(c)
-    result[f"{prefix}macd_line_pct"] = macd_line
-    result[f"{prefix}macd_signal_pct"] = macd_signal
-    result[f"{prefix}macd_hist_pct"] = macd_hist
+# ============================================================
+# 14. FEATURE DEFINITIONS
+# ============================================================
 
-    adx, plus_di, minus_di = calculate_adx(h, lo, c)
-    result[f"{prefix}adx"] = adx
-    result[f"{prefix}plus_di"] = plus_di
-    result[f"{prefix}minus_di"] = minus_di
+FEATURE_COLUMNS = [
+    "ret_1",
+    "ret_3",
+    "ret_6",
+    "ret_12",
+    "ema_spread",
+    "ema_trend",
+    "rsi_14",
+    "atr_pct",
+    "range_pct",
+    "body_pct",
+    "upper_wick_pct",
+    "lower_wick_pct",
+    "close_location",
+    "volume_ratio",
+    "volume_change",
+    "momentum_3",
+    "momentum_6",
+    "realized_volatility",
+    "qqq_ret_3",
+    "qqq_ema_spread",
+]
 
-    if "volume" in df.columns and df["volume"].fillna(0).sum() > 0:
-        volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0).clip(lower=0)
-        average = volume.shift(1).rolling(20).mean()
-        result[f"{prefix}volume_ratio"] = volume / average.replace(0, np.nan)
-    else:
-        result[f"{prefix}volume_ratio"] = np.nan
+MODEL_FEATURE_COUNT = len(FEATURE_COLUMNS)
 
-    session_vwap = add_session_vwap(df)
-    result[f"{prefix}session_vwap_dist"] = (c - session_vwap) / c.replace(0, np.nan)
 
-    if prefix in ("spy_", "qqq_"):
-        result[f"{prefix}vwap_dist"] = result[f"{prefix}session_vwap_dist"]
+# ============================================================
+# 15. CORE INDICATOR HELPERS
+# ============================================================
 
-    upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
-    lower_wick = pd.concat([o, c], axis=1).min(axis=1) - lo
-    result[f"{prefix}upper_wick_ratio"] = upper_wick / candle_range
-    result[f"{prefix}lower_wick_ratio"] = lower_wick / candle_range
-
-    prev_open = o.shift(1)
-    prev_close = c.shift(1)
-
-    result[f"{prefix}bullish_engulfing"] = ((prev_close < prev_open) & (c > o) & (o <= prev_close) & (c >= prev_open)).astype(float)
-    result[f"{prefix}bearish_engulfing"] = ((prev_close > prev_open) & (c < o) & (o >= prev_close) & (c <= prev_open)).astype(float)
-    result[f"{prefix}bullish_rejection"] = ((lower_wick > 2 * (c - o).abs()) & (lower_wick > upper_wick) & (c > lo + candle_range.fillna(0) * 0.60)).astype(float)
-    result[f"{prefix}bearish_rejection"] = ((upper_wick > 2 * (c - o).abs()) & (upper_wick > lower_wick) & (c < h - candle_range.fillna(0) * 0.60)).astype(float)
-
-    prior_high = h.shift(1).rolling(20).max()
-    prior_low = lo.shift(1).rolling(20).min()
-
-    if prefix == "":
-        result["resistance_dist"] = (prior_high - c) / c.replace(0, np.nan)
-        result["support_dist"] = (c - prior_low) / c.replace(0, np.nan)
-        result["breakout_up"] = (c > prior_high).astype(float)
-        result["breakout_down"] = (c < prior_low).astype(float)
-
-        prior_prior_high = h.shift(2).rolling(20).max()
-        prior_prior_low = lo.shift(2).rolling(20).min()
-
-        result["fakeout_up"] = ((c.shift(1) > prior_prior_high) & (c <= prior_high)).astype(float)
-        result["fakeout_down"] = ((c.shift(1) < prior_prior_low) & (c >= prior_low)).astype(float)
-        result["retest_up"] = ((c.shift(1) > prior_high.shift(1)) & (lo <= prior_high * 1.001) & (c > prior_high)).astype(float)
-        result["retest_down"] = ((c.shift(1) < prior_low.shift(1)) & (h >= prior_low * 0.999) & (c < prior_low)).astype(float)
-
-        or_high, or_low = add_opening_range(df)
-        result["opening_range_position"] = (c - or_low) / (or_high - or_low).replace(0, np.nan)
-        result["opening_range_break_up"] = ((c > or_high) & or_high.notna()).astype(float)
-        result["opening_range_break_down"] = ((c < or_low) & or_low.notna()).astype(float)
-
+def _safe_divide(
+    numerator: pd.Series,
+    denominator: pd.Series,
+) -> pd.Series:
+    """Vectorized division with invalid or zero denominators masked."""
+    denominator = denominator.replace(0, np.nan)
+    result = numerator / denominator
     return result.replace([np.inf, -np.inf], np.nan)
 
 
-# ======================== 15-MINUTE ALIGNMENT FIX ===========
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(
+        span=span,
+        adjust=False,
+        min_periods=span,
+    ).mean()
 
-def build_15m_features(spx):
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder-style RSI using exponentially smoothed gains/losses."""
+    delta = series.diff()
+
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+
+    avg_gain = gains.ewm(
+        alpha=1.0 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    avg_loss = losses.ewm(
+        alpha=1.0 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    relative_strength = _safe_divide(avg_gain, avg_loss)
+    result = 100.0 - (100.0 / (1.0 + relative_strength))
+
+    # If there were gains but no losses, RSI approaches 100.
+    result = result.where(avg_loss != 0, 100.0)
+    # If neither gains nor losses exist, RSI is neutral.
+    result = result.where(
+        ~((avg_gain == 0) & (avg_loss == 0)),
+        50.0,
+    )
+
+    return result.clip(0.0, 100.0)
+
+
+def _true_range(frame: pd.DataFrame) -> pd.Series:
+    previous_close = frame["close"].shift(1)
+
+    components = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - previous_close).abs(),
+            (frame["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    )
+
+    return components.max(axis=1)
+
+
+def _atr(
+    frame: pd.DataFrame,
+    period: int = 14,
+) -> pd.Series:
+    true_range = _true_range(frame)
+
+    return true_range.ewm(
+        alpha=1.0 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+
+# ============================================================
+# 16. DATAFRAME INPUT VALIDATION
+# ============================================================
+
+def validate_feature_input(
+    bars: Optional[pd.DataFrame],
+    symbol: str = "UNKNOWN",
+    min_rows: int = 60,
+) -> tuple[bool, str]:
+    if bars is None:
+        return False, f"{symbol}:NO_DATA"
+
+    if not isinstance(bars, pd.DataFrame):
+        return False, f"{symbol}:NOT_DATAFRAME"
+
+    if bars.empty:
+        return False, f"{symbol}:EMPTY_DATA"
+
+    missing = [
+        column for column in REQUIRED_BAR_COLUMNS
+        if column not in bars.columns
+    ]
+
+    if missing:
+        return False, (
+            f"{symbol}:MISSING_COLUMNS:"
+            + ",".join(missing)
+        )
+
+    if len(bars) < min_rows:
+        return False, f"{symbol}:TOO_FEW_ROWS:{len(bars)}"
+
+    if not isinstance(bars.index, pd.DatetimeIndex):
+        return False, f"{symbol}:INVALID_INDEX"
+
+    if bars.index.tz is None:
+        return False, f"{symbol}:TIMEZONE_REQUIRED"
+
+    if not bars.index.is_monotonic_increasing:
+        return False, f"{symbol}:INDEX_NOT_SORTED"
+
+    if bars.index.has_duplicates:
+        return False, f"{symbol}:DUPLICATE_INDEX"
+
+    return True, "INPUT_OK"
+
+
+# ============================================================
+# 17. PRICE-ACTION FEATURE ENGINEERING
+# ============================================================
+
+def build_features(
+    bars: pd.DataFrame,
+    prefix: str = "",
+) -> pd.DataFrame:
     """
-    تجميع شموع 15 دقيقة المكتملة بدقة تامة وفق توقيت نيويورك الرسمي،
-    مع التأكد من اكتمال الشموع الثلاث الفرعية (5 دقائق لكل منها) ومنع أي تسريب مستقبلي.
+    Build features from historical OHLCV bars.
+
+    All features at timestamp t use only information available
+    at or before t. No future close is used in the feature values.
+
+    The optional prefix allows the same feature calculation to be
+    applied to confirmation instruments without column collisions.
     """
-    df = normalize_bars(spx)
-    if df.empty:
-        return pd.DataFrame()
+    valid, reason = validate_feature_input(
+        bars,
+        symbol=prefix or "PRIMARY",
+        min_rows=30,
+    )
 
-    local = df.copy()
-    local.index = local.index.tz_convert(NY)
+    if not valid:
+        raise ValueError(f"Cannot build features: {reason}")
 
-    bars15 = local.resample("15min", closed="left", label="right").agg({
+    frame = bars.copy().sort_index()
+
+    for column in REQUIRED_BAR_COLUMNS:
+        frame[column] = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        )
+
+    open_price = frame["open"]
+    high = frame["high"]
+    low = frame["low"]
+    close = frame["close"]
+    volume = frame["volume"]
+
+    safe_close = close.replace(0, np.nan)
+
+    # --------------------------------------------------------
+    # Returns / momentum
+    # --------------------------------------------------------
+
+    frame["ret_1"] = close.pct_change(1)
+    frame["ret_3"] = close.pct_change(3)
+    frame["ret_6"] = close.pct_change(6)
+    frame["ret_12"] = close.pct_change(12)
+
+    frame["momentum_3"] = close - close.shift(3)
+    frame["momentum_6"] = close - close.shift(6)
+
+    # --------------------------------------------------------
+    # Moving averages / trend
+    # --------------------------------------------------------
+
+    ema9 = _ema(close, 9)
+    ema20 = _ema(close, 20)
+    ema50 = _ema(close, 50)
+
+    frame["ema_spread"] = _safe_divide(
+        ema9 - ema20,
+        safe_close,
+    )
+
+    frame["ema_trend"] = _safe_divide(
+        ema20 - ema50,
+        safe_close,
+    )
+
+    # --------------------------------------------------------
+    # RSI / ATR / volatility
+    # --------------------------------------------------------
+
+    frame["rsi_14"] = _rsi(close, 14) / 100.0
+
+    atr14 = _atr(frame, 14)
+    frame["atr_pct"] = _safe_divide(
+        atr14,
+        safe_close,
+    )
+
+    returns = close.pct_change()
+
+    frame["realized_volatility"] = returns.rolling(
+        20,
+        min_periods=20,
+    ).std()
+
+    # --------------------------------------------------------
+    # Candle structure / price action
+    # --------------------------------------------------------
+
+    candle_range = (high - low).clip(lower=0)
+    body = close - open_price
+
+    frame["range_pct"] = _safe_divide(
+        candle_range,
+        safe_close,
+    )
+
+    frame["body_pct"] = _safe_divide(
+        body,
+        safe_close,
+    )
+
+    upper_wick = high - pd.concat(
+        [open_price, close], axis=1
+    ).max(axis=1)
+
+    lower_wick = pd.concat(
+        [open_price, close], axis=1
+    ).min(axis=1) - low
+
+    frame["upper_wick_pct"] = _safe_divide(
+        upper_wick.clip(lower=0),
+        safe_close,
+    )
+
+    frame["lower_wick_pct"] = _safe_divide(
+        lower_wick.clip(lower=0),
+        safe_close,
+    )
+
+    frame["close_location"] = _safe_divide(
+        close - low,
+        candle_range,
+    )
+
+    # Flat candles have no directional close location.
+    frame["close_location"] = frame[
+        "close_location"
+    ].where(candle_range > 0, 0.5)
+
+    # --------------------------------------------------------
+    # Volume
+    # --------------------------------------------------------
+
+    volume_mean20 = volume.rolling(
+        20,
+        min_periods=20,
+    ).mean()
+
+    frame["volume_ratio"] = _safe_divide(
+        volume,
+        volume_mean20,
+    )
+
+    frame["volume_change"] = volume.pct_change()
+
+    # Replace infinities, but preserve NaN until final filtering.
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+
+    if prefix:
+        frame = frame.rename(
+            columns={
+                column: f"{prefix}{column}"
+                for column in FEATURE_COLUMNS
+                if column in frame.columns
+            }
+        )
+
+    return frame
+
+
+# ============================================================
+# 18. MARKET CONFIRMATION FEATURES
+# ============================================================
+
+def build_confirmation_features(
+    bars: pd.DataFrame,
+    prefix: str,
+) -> pd.DataFrame:
+    """
+    Build a compact confirmation feature set for QQQ or another
+    market instrument. It does not create an SPX price.
+    """
+    if not prefix:
+        raise ValueError("A non-empty prefix is required.")
+
+    frame = build_features(bars, prefix=prefix)
+
+    expected = [
+        f"{prefix}ret_3",
+        f"{prefix}ema_spread",
+    ]
+
+    missing = [
+        column for column in expected
+        if column not in frame.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Confirmation features missing: "
+            + ", ".join(missing)
+        )
+
+    return frame[expected].copy()
+
+
+def align_confirmation_data(
+    primary: pd.DataFrame,
+    confirmation: pd.DataFrame,
+    max_age_seconds: int = 600,
+) -> pd.DataFrame:
+    """
+    Align confirmation data backward to primary timestamps.
+
+    merge_asof(direction='backward') prevents a primary bar from
+    receiving a confirmation bar that occurs in the future.
+
+    Both indexes must be timezone-aware.
+    """
+    if primary.empty:
+        return primary.copy()
+
+    if confirmation.empty:
+        result = primary.copy()
+        for column in confirmation.columns:
+            result[column] = np.nan
+        return result
+
+    left = primary.sort_index().copy()
+    right = confirmation.sort_index().copy()
+
+    if left.index.tz is None or right.index.tz is None:
+        raise ValueError(
+            "Both primary and confirmation indexes must be timezone-aware."
+        )
+
+    left = left.reset_index()
+    right = right.reset_index()
+
+    left_time = left.columns[0]
+    right_time = right.columns[0]
+
+    if left_time != "timestamp":
+        left = left.rename(columns={left_time: "timestamp"})
+
+    if right_time != "timestamp":
+        right = right.rename(columns={right_time: "timestamp"})
+
+    right = right.rename(
+        columns={"timestamp": "confirmation_timestamp"}
+    )
+
+    merged = pd.merge_asof(
+        left.sort_values("timestamp"),
+        right.sort_values("confirmation_timestamp"),
+        left_on="timestamp",
+        right_on="confirmation_timestamp",
+        direction="backward",
+        tolerance=pd.Timedelta(seconds=max_age_seconds),
+    )
+
+    # Retain the matched confirmation timestamp for diagnostics.
+    # The caller can decide whether to keep or drop this column.
+    merged = merged.set_index("timestamp")
+    merged.index.name = "timestamp"
+
+    return merged
+
+
+# ============================================================
+# 19. 15-MINUTE FEATURES FROM 5-MINUTE BARS
+# ============================================================
+
+def build_15m_features(
+    bars_5m: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Aggregate 5-minute bars into 15-minute bars and calculate
+    higher-timeframe trend features.
+
+    Bars are labeled at their ending timestamp. With closed='left'
+    and label='right', a 09:30–09:45 bar is labeled 09:45.
+
+    Incomplete groups with fewer than three 5-minute bars are removed.
+    """
+    valid, reason = validate_feature_input(
+        bars_5m,
+        symbol="15M_SOURCE",
+        min_rows=30,
+    )
+
+    if not valid:
+        raise ValueError(
+            f"Cannot build 15-minute features: {reason}"
+        )
+
+    frame = bars_5m.copy().sort_index()
+
+    if frame.index.tz is None:
+        raise ValueError(
+            "5-minute bars must have timezone-aware timestamps."
+        )
+
+    frame = frame.tz_convert(TIMEZONE_NY)
+
+    aggregated = frame.resample(
+        "15min",
+        closed="left",
+        label="right",
+        origin="start_day",
+        offset="9h30min",
+    ).agg({
         "open": "first",
         "high": "max",
         "low": "min",
@@ -632,663 +1365,4559 @@ def build_15m_features(spx):
         "volume": "sum",
     })
 
-    counts = local["close"].resample("15min", closed="left", label="right").count()
-    bars15 = bars15.loc[counts == 3].dropna(subset=["open", "high", "low", "close"])
-    if bars15.empty:
-        return pd.DataFrame()
+    counts = frame["close"].resample(
+        "15min",
+        closed="left",
+        label="right",
+        origin="start_day",
+        offset="9h30min",
+    ).count()
 
-    now_ny = pd.Timestamp(ny_now())
-    bars15 = bars15.loc[bars15.index <= now_ny]
-    if bars15.empty:
-        return pd.DataFrame()
-
-    local_index = bars15.index
-    minutes = local_index.hour * 60 + local_index.minute
-    bars15 = bars15.loc[(minutes >= 585) & (minutes <= 960)]
-    if bars15.empty:
-        return pd.DataFrame()
-
-    bars15.index = bars15.index.tz_convert(UTC)
-    f15 = build_features(bars15)
-
-    return f15[[
-        "ret_1", "ema_spread", "rsi", "macd_hist_pct", "adx",
-    ]].rename(columns={
-        "ret_1": "m15_ret_1",
-        "ema_spread": "m15_ema_spread",
-        "rsi": "m15_rsi",
-        "macd_hist_pct": "m15_macd_hist_pct",
-        "adx": "m15_adx",
-    })
-
-
-# ======================== FEATURE MERGE ======================
-
-def make_features(spx, spy, qqq):
-    spx = normalize_bars(spx)
-    spy = normalize_bars(spy)
-    qqq = normalize_bars(qqq)
-
-    if spx.empty or spy.empty or qqq.empty:
-        raise RuntimeError("بيانات SPX أو SPY أو QQQ غير متوفرة")
-
-    newest = [spx.index[-1], spy.index[-1], qqq.index[-1]]
-    sync_gap = (max(newest) - min(newest)).total_seconds() / 60
-    if sync_gap > MAX_SOURCE_SYNC_GAP_MINUTES:
-        raise RuntimeError(f"مصادر البيانات غير متزامنة؛ الفرق {sync_gap:.1f} دقيقة")
-
-    spxf = build_features(spx)
-    spy_all = build_features(spy, "spy_")
-    qqq_all = build_features(qqq, "qqq_")
-
-    spy_cols = ["spy_ret_1", "spy_ret_3", "spy_ema_spread", "spy_rsi", "spy_vwap_dist", "spy_macd_hist_pct", "spy_adx", "spy_volume_ratio"]
-    qqq_cols = ["qqq_ret_1", "qqq_ret_3", "qqq_ema_spread", "qqq_rsi", "qqq_vwap_dist", "qqq_macd_hist_pct", "qqq_adx", "qqq_volume_ratio"]
-
-    m15 = build_15m_features(spx)
-
-    merged = (
-        spxf.join(spy_all[spy_cols], how="inner")
-        .join(qqq_all[qqq_cols], how="inner")
-        .join(m15, how="left")
-        .join(spx[["close"]], how="inner")
+    aggregated = aggregated[counts >= 3].dropna(
+        subset=REQUIRED_BAR_COLUMNS
     )
 
-    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=["close"]).sort_index()
-    required_history = ["ret_1", "rsi", "ema_spread", "atr_pct", "macd_hist_pct"]
-    merged = merged.dropna(subset=required_history)
+    if len(aggregated) < 30:
+        raise ValueError(
+            "Not enough complete 15-minute bars for trend features."
+        )
 
-    if len(merged) < 400:
-        raise RuntimeError(f"صفوف البيانات المتطابقة غير كافية: {len(merged)}")
+    features = build_features(aggregated)
+
+    result = features[
+        [
+            "ema_spread",
+            "ema_trend",
+            "rsi_14",
+            "atr_pct",
+            "ret_3",
+        ]
+    ].copy()
+
+    result = result.rename(
+        columns={
+            "ema_spread": "m15_ema_spread",
+            "ema_trend": "m15_ema_trend",
+            "rsi_14": "m15_rsi_14",
+            "atr_pct": "m15_atr_pct",
+            "ret_3": "m15_ret_3",
+        }
+    )
+
+    return result
+
+
+def align_15m_features(
+    primary_5m_features: pd.DataFrame,
+    features_15m: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Backward-align completed 15-minute features to 5-minute bars.
+    No future 15-minute feature is allowed to leak backward.
+    """
+    if primary_5m_features.empty:
+        return primary_5m_features.copy()
+
+    if features_15m.empty:
+        result = primary_5m_features.copy()
+        for column in features_15m.columns:
+            result[column] = np.nan
+        return result
+
+    left = primary_5m_features.sort_index().copy()
+    right = features_15m.sort_index().copy()
+
+    if left.index.tz is None or right.index.tz is None:
+        raise ValueError(
+            "Both feature indexes must be timezone-aware."
+        )
+
+    left = left.reset_index()
+    right = right.reset_index()
+
+    left = left.rename(columns={left.columns[0]: "timestamp"})
+    right = right.rename(
+        columns={right.columns[0]: "feature_timestamp"}
+    )
+
+    merged = pd.merge_asof(
+        left.sort_values("timestamp"),
+        right.sort_values("feature_timestamp"),
+        left_on="timestamp",
+        right_on="feature_timestamp",
+        direction="backward",
+        tolerance=pd.Timedelta(minutes=30),
+    )
+
+    merged = merged.set_index("timestamp")
+    merged.index.name = "timestamp"
 
     return merged
 
 
-# ======================== MACHINE LEARNING ===================
+# ============================================================
+# 20. BUILD THE COMPLETE PRIMARY FEATURE FRAME
+# ============================================================
 
-def new_model():
-    return make_pipeline(
-        SimpleImputer(strategy="median"),
-        HistGradientBoostingClassifier(
-            max_iter=100,
-            learning_rate=0.05,
-            max_leaf_nodes=12,
-            l2_regularization=2.0,
-            random_state=42,
+def build_model_feature_frame(
+    primary_bars: pd.DataFrame,
+    qqq_bars: Optional[pd.DataFrame] = None,
+    include_15m: bool = True,
+) -> pd.DataFrame:
+    """
+    Create the primary model feature frame.
+
+    The configured base model uses FEATURE_COLUMNS. Optional 15-minute
+    features are appended for diagnostics or for a future model version;
+    they are not silently added to the current model's feature list.
+    """
+    primary = build_features(primary_bars)
+
+    # QQQ is context/confirmation data, not a substitute for SPX.
+    if qqq_bars is not None and not qqq_bars.empty:
+        qqq_features = build_confirmation_features(
+            qqq_bars,
+            prefix="qqq_",
+        )
+
+        primary = align_confirmation_data(
+            primary,
+            qqq_features,
+            max_age_seconds=600,
+        )
+
+    else:
+        primary["qqq_ret_3"] = np.nan
+        primary["qqq_ema_spread"] = np.nan
+
+    # A separate multi-timeframe feature set is available for analysis.
+    if include_15m:
+        try:
+            higher_timeframe = build_15m_features(primary_bars)
+            primary = align_15m_features(
+                primary,
+                higher_timeframe,
+            )
+        except ValueError as exc:
+            log.warning(
+                "15-minute features unavailable: %s",
+                exc,
+            )
+
+            for column in (
+                "m15_ema_spread",
+                "m15_ema_trend",
+                "m15_rsi_14",
+                "m15_atr_pct",
+                "m15_ret_3",
+            ):
+                if column not in primary.columns:
+                    primary[column] = np.nan
+
+    # Confirm the model's required columns are present.
+    missing = [
+        column for column in FEATURE_COLUMNS
+        if column not in primary.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Required model features missing: "
+            + ", ".join(missing)
+        )
+
+    return primary.sort_index()
+
+
+# ============================================================
+# 21. TRAINING LABELS — FUTURE DATA ONLY IN THE TARGET
+# ============================================================
+
+def add_training_target(
+    feature_frame: pd.DataFrame,
+    horizon: int = HORIZON,
+) -> pd.DataFrame:
+    """
+    Add a binary training target.
+
+    Target = 1 if the close after `horizon` bars is higher than the
+    current close; otherwise 0.
+
+    IMPORTANT:
+    - This future close is used ONLY to form the historical label.
+    - It must NEVER be included as a model input feature.
+    - The latest rows have unknown targets and are removed from
+      the labeled training set.
+    """
+    if feature_frame is None or feature_frame.empty:
+        raise ValueError("Cannot label an empty feature frame.")
+
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1.")
+
+    if "close" not in feature_frame.columns:
+        raise ValueError("Feature frame must contain close.")
+
+    result = feature_frame.copy().sort_index()
+
+    future_close = result["close"].shift(-horizon)
+
+    result["target"] = np.where(
+        future_close.notna(),
+        (future_close > result["close"]).astype(float),
+        np.nan,
+    )
+
+    return result
+
+
+def prepare_labeled_dataset(
+    feature_frame: pd.DataFrame,
+    min_rows: int = MIN_TRAIN_ROWS,
+) -> pd.DataFrame:
+    """
+    Return only rows with complete features and known targets.
+    The caller must split chronologically before fitting a model.
+    """
+    if feature_frame is None or feature_frame.empty:
+        raise ValueError("Feature frame is empty.")
+
+    missing = [
+        column for column in FEATURE_COLUMNS
+        if column not in feature_frame.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Cannot prepare dataset; missing features: "
+            + ", ".join(missing)
+        )
+
+    if "target" not in feature_frame.columns:
+        raise ValueError(
+            "Training target is missing; call add_training_target first."
+        )
+
+    dataset = feature_frame[
+        FEATURE_COLUMNS + ["target"]
+    ].copy()
+
+    dataset = dataset.replace([np.inf, -np.inf], np.nan)
+    dataset = dataset.dropna(subset=FEATURE_COLUMNS + ["target"])
+
+    dataset["target"] = dataset["target"].astype(int)
+
+    if not dataset["target"].isin([0, 1]).all():
+        raise ValueError("Training target must contain only 0 and 1.")
+
+    if len(dataset) < min_rows:
+        raise ValueError(
+            f"Insufficient labeled rows: {len(dataset)} < {min_rows}"
+        )
+
+    if dataset["target"].nunique() < 2:
+        raise ValueError(
+            "Training target contains only one class."
+        )
+
+    return dataset
+
+
+# ============================================================
+# 22. FEATURE DIAGNOSTICS
+# ============================================================
+
+def feature_diagnostics(
+    feature_frame: pd.DataFrame,
+) -> dict[str, Any]:
+    """
+    Return basic feature-quality diagnostics without fitting a model.
+    """
+    if feature_frame is None or feature_frame.empty:
+        return {
+            "ok": False,
+            "reason": "EMPTY_FEATURE_FRAME",
+            "rows": 0,
+            "missing_percent": {},
+        }
+
+    available = [
+        column for column in FEATURE_COLUMNS
+        if column in feature_frame.columns
+    ]
+
+    missing_columns = [
+        column for column in FEATURE_COLUMNS
+        if column not in feature_frame.columns
+    ]
+
+    missing_percent = {}
+
+    for column in available:
+        missing_percent[column] = round(
+            float(feature_frame[column].isna().mean() * 100.0),
+            2,
+        )
+
+    complete_rows = (
+        feature_frame[available].notna().all(axis=1).sum()
+        if available
+        else 0
+    )
+
+    return {
+        "ok": (
+            not missing_columns
+            and complete_rows >= MIN_TRAIN_ROWS
         ),
+        "rows": int(len(feature_frame)),
+        "complete_rows": int(complete_rows),
+        "required_feature_count": int(MODEL_FEATURE_COUNT),
+        "available_feature_count": int(len(available)),
+        "missing_columns": missing_columns,
+        "missing_percent": missing_percent,
+    }
+
+
+# ============================================================
+# END OF PART 2/6
+# ============================================================
+
+# ============================================================
+# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+# PART 3/6
+# Chronological Training • ML Ensemble • Holdout Validation
+# AUC • Brier Score • Signal Threshold • Honest Model Gate
+#
+# Paste directly below PART 2/6.
+# NO ORDER EXECUTION.
+# ============================================================
+
+# ============================================================
+# 23. MACHINE-LEARNING IMPORTS
+# ============================================================
+
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.pipeline import Pipeline
+
+
+# ============================================================
+# 24. MODEL CONFIGURATION
+# ============================================================
+
+MODEL_RANDOM_STATE = _i("MODEL_RANDOM_STATE", 42)
+
+TRAIN_FRACTION = _f("TRAIN_FRACTION", 0.65)
+VALIDATION_FRACTION = _f("VALIDATION_FRACTION", 0.20)
+HOLDOUT_FRACTION = _f("HOLDOUT_FRACTION", 0.15)
+
+MIN_VALIDATION_ROWS = _i("MIN_VALIDATION_ROWS", 50)
+MIN_HOLDOUT_ROWS = _i("MIN_HOLDOUT_ROWS", 50)
+
+MIN_THRESHOLD = _f("MIN_THRESHOLD", 0.50)
+MAX_THRESHOLD = _f("MAX_THRESHOLD", 0.90)
+THRESHOLD_STEP = _f("THRESHOLD_STEP", 0.01)
+
+MIN_VALIDATION_SIGNAL_N = _i(
+    "MIN_VALIDATION_SIGNAL_N", 20
+)
+MIN_VALIDATION_SIGNAL_ACC = _f(
+    "MIN_VALIDATION_SIGNAL_ACC", 0.55
+)
+
+# A model must pass all required quality gates before it is enabled.
+REQUIRE_HOLDOUT_GATE = _b("REQUIRE_HOLDOUT_GATE", True)
+
+
+# ============================================================
+# 25. VALIDATE MODEL CONFIGURATION
+# ============================================================
+
+def validate_model_configuration() -> tuple[bool, str]:
+    if not 0.0 < TRAIN_FRACTION < 1.0:
+        return False, "TRAIN_FRACTION_OUT_OF_RANGE"
+
+    if not 0.0 < VALIDATION_FRACTION < 1.0:
+        return False, "VALIDATION_FRACTION_OUT_OF_RANGE"
+
+    if not 0.0 < HOLDOUT_FRACTION < 1.0:
+        return False, "HOLDOUT_FRACTION_OUT_OF_RANGE"
+
+    fraction_total = (
+        TRAIN_FRACTION
+        + VALIDATION_FRACTION
+        + HOLDOUT_FRACTION
+    )
+
+    if not math.isclose(
+        fraction_total,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        return False, "SPLIT_FRACTIONS_MUST_SUM_TO_ONE"
+
+    if MIN_THRESHOLD < 0.5 or MAX_THRESHOLD > 1.0:
+        return False, "THRESHOLD_RANGE_INVALID"
+
+    if MIN_THRESHOLD >= MAX_THRESHOLD:
+        return False, "THRESHOLD_MIN_MUST_BE_BELOW_MAX"
+
+    if THRESHOLD_STEP <= 0:
+        return False, "THRESHOLD_STEP_MUST_BE_POSITIVE"
+
+    if MIN_HOLDOUT_SIGNAL_N < 1:
+        return False, "MIN_HOLDOUT_SIGNAL_N_MUST_BE_POSITIVE"
+
+    return True, "CONFIGURATION_OK"
+
+
+# ============================================================
+# 26. CHRONOLOGICAL DATA SPLIT
+# ============================================================
+
+def chronological_split(
+    dataset: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split observations in time order.
+
+    Older observations are used for training, the next segment
+    for threshold selection, and the newest segment for final
+    holdout evaluation.
+
+    Never shuffle this split.
+    """
+    if dataset is None or dataset.empty:
+        raise ValueError("Cannot split an empty dataset.")
+
+    if not isinstance(dataset.index, pd.DatetimeIndex):
+        raise ValueError(
+            "Dataset must have a DatetimeIndex for chronological splitting."
+        )
+
+    if dataset.index.tz is None:
+        raise ValueError(
+            "Dataset index must be timezone-aware."
+        )
+
+    ordered = dataset.sort_index().copy()
+
+    if ordered.index.has_duplicates:
+        raise ValueError(
+            "Dataset has duplicate timestamps; resolve before training."
+        )
+
+    n_rows = len(ordered)
+
+    train_end = int(n_rows * TRAIN_FRACTION)
+    validation_end = train_end + int(
+        n_rows * VALIDATION_FRACTION
+    )
+
+    train = ordered.iloc[:train_end].copy()
+    validation = ordered.iloc[
+        train_end:validation_end
+    ].copy()
+    holdout = ordered.iloc[validation_end:].copy()
+
+    if len(train) < MIN_TRAIN_ROWS:
+        raise ValueError(
+            f"Training split too small: {len(train)} rows."
+        )
+
+    if len(validation) < MIN_VALIDATION_ROWS:
+        raise ValueError(
+            f"Validation split too small: {len(validation)} rows."
+        )
+
+    if len(holdout) < MIN_HOLDOUT_ROWS:
+        raise ValueError(
+            f"Holdout split too small: {len(holdout)} rows."
+        )
+
+    for name, split in (
+        ("train", train),
+        ("validation", validation),
+        ("holdout", holdout),
+    ):
+        if split["target"].nunique() < 2:
+            raise ValueError(
+                f"{name} split contains only one target class."
+            )
+
+    if not (
+        train.index.max() < validation.index.min()
+        and validation.index.max() < holdout.index.min()
+    ):
+        raise ValueError(
+            "Chronological split ordering failed."
+        )
+
+    return train, validation, holdout
+
+
+# ============================================================
+# 27. CREATE THE BASE MODELS
+# ============================================================
+
+def create_base_models() -> dict[str, Pipeline]:
+    """
+    Build two tree-based classifiers.
+
+    Median imputation is fitted inside each training pipeline,
+    so missing-value statistics are learned from training data only.
+    """
+    random_forest = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="median"),
+            ),
+            (
+                "model",
+                RandomForestClassifier(
+                    n_estimators=350,
+                    max_depth=8,
+                    min_samples_leaf=8,
+                    min_samples_split=16,
+                    max_features="sqrt",
+                    class_weight="balanced_subsample",
+                    random_state=MODEL_RANDOM_STATE,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    extra_trees = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="median"),
+            ),
+            (
+                "model",
+                ExtraTreesClassifier(
+                    n_estimators=350,
+                    max_depth=8,
+                    min_samples_leaf=8,
+                    min_samples_split=16,
+                    max_features="sqrt",
+                    class_weight="balanced",
+                    random_state=MODEL_RANDOM_STATE + 1,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    return {
+        "random_forest": random_forest,
+        "extra_trees": extra_trees,
+    }
+
+
+# ============================================================
+# 28. SAFE PROBABILITY EXTRACTION
+# ============================================================
+
+def positive_class_probability(
+    model: Any,
+    features: pd.DataFrame,
+) -> np.ndarray:
+    """
+    Extract probability for target class 1.
+
+    This explicitly checks class ordering instead of assuming
+    probability column 1 always represents the positive class.
+    """
+    probabilities = np.asarray(
+        model.predict_proba(features),
+        dtype=float,
+    )
+
+    classes = np.asarray(model.classes_)
+    positive_indices = np.flatnonzero(classes == 1)
+
+    if len(positive_indices) != 1:
+        raise ValueError(
+            "Model does not contain exactly one positive class."
+        )
+
+    result = probabilities[:, int(positive_indices[0])]
+
+    if not np.isfinite(result).all():
+        raise ValueError(
+            "Model produced invalid probabilities."
+        )
+
+    return np.clip(result, 0.0, 1.0)
+
+
+# ============================================================
+# 29. ENSEMBLE MODEL WRAPPER
+# ============================================================
+
+class ProbabilityEnsemble:
+    """
+    Equal-weight probability ensemble.
+
+    The output is a model probability estimate, not a guarantee
+    that a trade will win and not a calibrated expected return.
+    """
+
+    def __init__(
+        self,
+        models: dict[str, Pipeline],
+        weights: Optional[dict[str, float]] = None,
+    ) -> None:
+        if not models:
+            raise ValueError("At least one model is required.")
+
+        self.models = models
+        self.weights = weights or {
+            name: 1.0 for name in models
+        }
+
+        total_weight = sum(
+            max(0.0, float(self.weights.get(name, 0.0)))
+            for name in models
+        )
+
+        if total_weight <= 0:
+            raise ValueError(
+                "Ensemble weights must sum to a positive value."
+            )
+
+        self.weights = {
+            name: max(
+                0.0,
+                float(self.weights.get(name, 0.0)),
+            ) / total_weight
+            for name in models
+        }
+
+        self.classes_ = np.array([0, 1])
+
+    def fit(
+        self,
+        features: pd.DataFrame,
+        target: pd.Series,
+    ) -> "ProbabilityEnsemble":
+        for name, model in self.models.items():
+            log.info(
+                "Training model %s using %s rows.",
+                name,
+                len(features),
+            )
+            model.fit(features, target)
+
+        return self
+
+    def predict_proba(
+        self,
+        features: pd.DataFrame,
+    ) -> np.ndarray:
+        weighted_probability = np.zeros(
+            len(features),
+            dtype=float,
+        )
+
+        for name, model in self.models.items():
+            probability = positive_class_probability(
+                model,
+                features,
+            )
+
+            weighted_probability += (
+                self.weights[name] * probability
+            )
+
+        weighted_probability = np.clip(
+            weighted_probability,
+            0.0,
+            1.0,
+        )
+
+        return np.column_stack(
+            [
+                1.0 - weighted_probability,
+                weighted_probability,
+            ]
+        )
+
+
+# ============================================================
+# 30. MODEL METRICS
+# ============================================================
+
+def calculate_model_metrics(
+    target: pd.Series,
+    probabilities: np.ndarray,
+    threshold: float = 0.50,
+) -> dict[str, Any]:
+    """
+    Calculate classification and probability-quality metrics.
+
+    AUC evaluates ranking ability. Brier evaluates probability
+    error. Neither metric alone proves profitability.
+    """
+    y_true = np.asarray(target, dtype=int)
+    probs = np.asarray(probabilities, dtype=float)
+
+    if len(y_true) != len(probs):
+        raise ValueError(
+            "Target and probability arrays have different lengths."
+        )
+
+    if len(y_true) == 0:
+        raise ValueError("Cannot calculate metrics on empty data.")
+
+    if not np.isfinite(probs).all():
+        raise ValueError("Probabilities contain invalid values.")
+
+    probs = np.clip(probs, 0.0, 1.0)
+    predicted = (probs >= threshold).astype(int)
+
+    if len(np.unique(y_true)) >= 2:
+        try:
+            auc_value = float(
+                roc_auc_score(y_true, probs)
+            )
+        except Exception:
+            auc_value = None
+    else:
+        auc_value = None
+
+    try:
+        brier_value = float(
+            brier_score_loss(y_true, probs)
+        )
+    except Exception:
+        brier_value = None
+
+    try:
+        accuracy = float(
+            accuracy_score(y_true, predicted)
+        )
+        balanced_accuracy = float(
+            balanced_accuracy_score(y_true, predicted)
+        )
+        precision = float(
+            precision_score(
+                y_true,
+                predicted,
+                zero_division=0,
+            )
+        )
+        recall = float(
+            recall_score(
+                y_true,
+                predicted,
+                zero_division=0,
+            )
+        )
+    except Exception:
+        accuracy = None
+        balanced_accuracy = None
+        precision = None
+        recall = None
+
+    return {
+        "n": int(len(y_true)),
+        "positive_rate": float(np.mean(y_true)),
+        "auc": auc_value,
+        "brier": brier_value,
+        "accuracy_at_050": accuracy,
+        "balanced_accuracy_at_050": balanced_accuracy,
+        "precision_at_050": precision,
+        "recall_at_050": recall,
+    }
+
+
+# ============================================================
+# 31. SELECT THRESHOLD USING VALIDATION ONLY
+# ============================================================
+
+def choose_signal_threshold(
+    target: pd.Series,
+    probabilities: np.ndarray,
+) -> tuple[Optional[float], dict[str, Any]]:
+    """
+    Choose a directional confidence threshold using validation data.
+
+    The holdout set must NOT be used to choose this threshold.
+    Both upward and downward confidence are considered.
+    """
+    y_true = np.asarray(target, dtype=int)
+    probs = np.asarray(probabilities, dtype=float)
+
+    if len(y_true) != len(probs) or len(y_true) == 0:
+        return None, {
+            "reason": "INVALID_VALIDATION_DATA",
+        }
+
+    if not np.isfinite(probs).all():
+        return None, {
+            "reason": "INVALID_VALIDATION_PROBABILITIES",
+        }
+
+    confidence = np.maximum(probs, 1.0 - probs)
+    predicted_direction = (probs >= 0.5).astype(int)
+
+    candidates = np.arange(
+        MIN_THRESHOLD,
+        MAX_THRESHOLD + THRESHOLD_STEP / 2.0,
+        THRESHOLD_STEP,
+    )
+
+    best_threshold: Optional[float] = None
+    best_stats: Optional[dict[str, Any]] = None
+    best_key: Optional[tuple[float, float, int]] = None
+
+    for candidate in candidates:
+        selected = confidence >= candidate
+        selected_count = int(selected.sum())
+
+        if selected_count < MIN_VALIDATION_SIGNAL_N:
+            continue
+
+        selected_accuracy = float(
+            np.mean(
+                predicted_direction[selected]
+                == y_true[selected]
+            )
+        )
+
+        if selected_accuracy < MIN_VALIDATION_SIGNAL_ACC:
+            continue
+
+        # Prefer higher accuracy, then more qualifying observations.
+        # This threshold selection uses validation data only.
+        key = (
+            selected_accuracy,
+            math.log1p(selected_count),
+            selected_count,
+        )
+
+        if best_key is None or key > best_key:
+            best_key = key
+            best_threshold = float(candidate)
+            best_stats = {
+                "threshold": float(candidate),
+                "signal_count": selected_count,
+                "signal_accuracy": selected_accuracy,
+                "validation_rows": int(len(y_true)),
+            }
+
+    if best_threshold is None:
+        return None, {
+            "reason": "NO_VALIDATION_THRESHOLD_PASSED",
+            "validation_rows": int(len(y_true)),
+            "minimum_signal_count": MIN_VALIDATION_SIGNAL_N,
+            "minimum_signal_accuracy": MIN_VALIDATION_SIGNAL_ACC,
+        }
+
+    return best_threshold, best_stats or {}
+
+
+# ============================================================
+# 32. EVALUATE THE SELECTED THRESHOLD ON HOLDOUT
+# ============================================================
+
+def evaluate_holdout_signals(
+    target: pd.Series,
+    probabilities: np.ndarray,
+    threshold: float,
+) -> dict[str, Any]:
+    """
+    Evaluate the already-selected validation threshold on untouched
+    holdout data. This function must not alter the threshold.
+    """
+    y_true = np.asarray(target, dtype=int)
+    probs = np.asarray(probabilities, dtype=float)
+
+    if len(y_true) != len(probs) or len(y_true) == 0:
+        return {
+            "passed": False,
+            "reason": "INVALID_HOLDOUT_DATA",
+            "signal_count": 0,
+            "signal_accuracy": None,
+        }
+
+    if not np.isfinite(probs).all():
+        return {
+            "passed": False,
+            "reason": "INVALID_HOLDOUT_PROBABILITIES",
+            "signal_count": 0,
+            "signal_accuracy": None,
+        }
+
+    confidence = np.maximum(probs, 1.0 - probs)
+    predicted_direction = (probs >= 0.5).astype(int)
+    selected = confidence >= threshold
+
+    signal_count = int(selected.sum())
+
+    if signal_count == 0:
+        return {
+            "passed": False,
+            "reason": "NO_HOLDOUT_SIGNALS",
+            "signal_count": 0,
+            "signal_accuracy": None,
+            "threshold": float(threshold),
+        }
+
+    signal_accuracy = float(
+        np.mean(
+            predicted_direction[selected]
+            == y_true[selected]
+        )
+    )
+
+    enough_signals = (
+        signal_count >= MIN_HOLDOUT_SIGNAL_N
+    )
+
+    accuracy_passed = (
+        signal_accuracy >= MIN_HOLDOUT_SIGNAL_ACC
+    )
+
+    return {
+        "passed": bool(
+            enough_signals and accuracy_passed
+        ),
+        "reason": (
+            "HOLDOUT_GATE_PASSED"
+            if enough_signals and accuracy_passed
+            else "HOLDOUT_GATE_FAILED"
+        ),
+        "signal_count": signal_count,
+        "signal_accuracy": signal_accuracy,
+        "minimum_signal_count": MIN_HOLDOUT_SIGNAL_N,
+        "minimum_signal_accuracy": MIN_HOLDOUT_SIGNAL_ACC,
+        "enough_signals": bool(enough_signals),
+        "accuracy_passed": bool(accuracy_passed),
+        "threshold": float(threshold),
+    }
+
+
+# ============================================================
+# 33. TRAIN AND EVALUATE THE ENSEMBLE
+# ============================================================
+
+def train_model(
+    dataset: pd.DataFrame,
+) -> dict[str, Any]:
+    """
+    Train the ensemble and run chronological validation.
+
+    Required input:
+        A prepared dataset containing FEATURE_COLUMNS + target,
+        indexed by timezone-aware timestamps.
+
+    Return dictionary:
+        model, enabled, threshold, metrics, reasons, split sizes.
+
+    A model that fails any mandatory quality gate remains disabled.
+    """
+    result: dict[str, Any] = {
+        "model": None,
+        "enabled": False,
+        "threshold": None,
+        "metrics": {},
+        "reasons": [],
+        "trained_at_utc": now_utc().isoformat(),
+        "version": BOT_VERSION,
+    }
+
+    config_ok, config_reason = validate_model_configuration()
+
+    if not config_ok:
+        result["reasons"].append(config_reason)
+        log.error("MODEL DISABLED: %s", config_reason)
+        return result
+
+    if dataset is None or dataset.empty:
+        result["reasons"].append("EMPTY_DATASET")
+        return result
+
+    missing = [
+        column for column in FEATURE_COLUMNS + ["target"]
+        if column not in dataset.columns
+    ]
+
+    if missing:
+        result["reasons"].append(
+            "MISSING_COLUMNS:" + ",".join(missing)
+        )
+        return result
+
+    clean = dataset.copy().sort_index()
+    clean = clean.replace([np.inf, -np.inf], np.nan)
+    clean = clean.dropna(
+        subset=FEATURE_COLUMNS + ["target"]
+    )
+
+    if len(clean) < MIN_TRAIN_ROWS:
+        result["reasons"].append(
+            f"INSUFFICIENT_ROWS:{len(clean)}"
+        )
+        return result
+
+    clean["target"] = clean["target"].astype(int)
+
+    if not clean["target"].isin([0, 1]).all():
+        result["reasons"].append("INVALID_TARGET_VALUES")
+        return result
+
+    if clean["target"].nunique() != 2:
+        result["reasons"].append("ONLY_ONE_TARGET_CLASS")
+        return result
+
+    try:
+        train, validation, holdout = chronological_split(clean)
+    except Exception as exc:
+        result["reasons"].append(
+            f"CHRONOLOGICAL_SPLIT_FAILED:{exc}"
+        )
+        log.error("MODEL DISABLED: %s", result["reasons"][-1])
+        return result
+
+    result["split_rows"] = {
+        "train": int(len(train)),
+        "validation": int(len(validation)),
+        "holdout": int(len(holdout)),
+    }
+
+    x_train = train[FEATURE_COLUMNS]
+    y_train = train["target"]
+
+    x_validation = validation[FEATURE_COLUMNS]
+    y_validation = validation["target"]
+
+    x_holdout = holdout[FEATURE_COLUMNS]
+    y_holdout = holdout["target"]
+
+    # Fit only on the oldest training segment.
+    models = create_base_models()
+    ensemble = ProbabilityEnsemble(models)
+
+    try:
+        ensemble.fit(x_train, y_train)
+
+        validation_probability = positive_class_probability(
+            ensemble,
+            x_validation,
+        )
+
+        validation_metrics = calculate_model_metrics(
+            y_validation,
+            validation_probability,
+        )
+
+    except Exception as exc:
+        result["reasons"].append(
+            f"TRAIN_OR_VALIDATION_FAILED:{exc}"
+        )
+        log.exception("Model training failed.")
+        return result
+
+    result["metrics"]["validation"] = validation_metrics
+
+    validation_auc = validation_metrics.get("auc")
+    validation_brier = validation_metrics.get("brier")
+
+    if validation_auc is None or validation_auc < MIN_AUC:
+        result["reasons"].append(
+            f"VALIDATION_AUC_BELOW_MIN:{validation_auc}"
+        )
+
+    if (
+        validation_brier is None
+        or validation_brier > MAX_HOLDOUT_BRIER
+    ):
+        result["reasons"].append(
+            f"VALIDATION_BRIER_FAILED:{validation_brier}"
+        )
+
+    threshold, threshold_stats = choose_signal_threshold(
+        y_validation,
+        validation_probability,
+    )
+
+    result["threshold_selection"] = threshold_stats
+
+    if threshold is None:
+        result["reasons"].append(
+            "NO_ACCEPTABLE_VALIDATION_THRESHOLD"
+        )
+
+        log.warning(
+            "MODEL DISABLED: no threshold passed validation."
+        )
+
+        return result
+
+    # --------------------------------------------------------
+    # Untouched holdout evaluation
+    # --------------------------------------------------------
+
+    try:
+        holdout_probability = positive_class_probability(
+            ensemble,
+            x_holdout,
+        )
+
+        holdout_metrics = calculate_model_metrics(
+            y_holdout,
+            holdout_probability,
+            threshold=0.50,
+        )
+
+        holdout_signal_metrics = evaluate_holdout_signals(
+            y_holdout,
+            holdout_probability,
+            threshold,
+        )
+
+    except Exception as exc:
+        result["reasons"].append(
+            f"HOLDOUT_EVALUATION_FAILED:{exc}"
+        )
+        log.exception("Holdout evaluation failed.")
+        return result
+
+    result["metrics"]["holdout"] = holdout_metrics
+    result["metrics"]["holdout_signals"] = (
+        holdout_signal_metrics
+    )
+
+    holdout_auc = holdout_metrics.get("auc")
+    holdout_brier = holdout_metrics.get("brier")
+
+    if holdout_auc is None or holdout_auc < MIN_AUC:
+        result["reasons"].append(
+            f"HOLDOUT_AUC_BELOW_MIN:{holdout_auc}"
+        )
+
+    if (
+        holdout_brier is None
+        or holdout_brier > MAX_HOLDOUT_BRIER
+    ):
+        result["reasons"].append(
+            f"HOLDOUT_BRIER_FAILED:{holdout_brier}"
+        )
+
+    if REQUIRE_HOLDOUT_GATE and not holdout_signal_metrics.get(
+        "passed", False
+    ):
+        result["reasons"].append(
+            "HOLDOUT_SIGNAL_GATE_FAILED"
+        )
+
+    result["model"] = ensemble
+    result["threshold"] = float(threshold)
+
+    # Do not silently retrain on the holdout after evaluating it:
+    # doing so would invalidate the reported holdout assessment.
+    result["enabled"] = len(result["reasons"]) == 0
+
+    if result["enabled"]:
+        log.info(
+            "MODEL ENABLED | threshold=%.2f | "
+            "validation AUC=%s | holdout AUC=%s | "
+            "holdout signal accuracy=%s | holdout signals=%s",
+            threshold,
+            validation_auc,
+            holdout_auc,
+            holdout_signal_metrics.get("signal_accuracy"),
+            holdout_signal_metrics.get("signal_count"),
+        )
+    else:
+        log.warning(
+            "MODEL DISABLED | reasons=%s",
+            " ; ".join(result["reasons"]),
+        )
+
+    return result
+
+
+# ============================================================
+# 34. PREDICT WITH AN ENABLED MODEL
+# ============================================================
+
+def predict_direction(
+    trained: dict[str, Any],
+    latest_features: pd.DataFrame,
+) -> dict[str, Any]:
+    """
+    Return direction, probability and confidence for the newest row.
+
+    The caller must still apply market-session, data freshness,
+    contract-liquidity, risk and final revalidation checks.
+    """
+    if not isinstance(trained, dict):
+        return {
+            "ok": False,
+            "reason": "INVALID_MODEL_BUNDLE",
+        }
+
+    if not trained.get("enabled", False):
+        return {
+            "ok": False,
+            "reason": "MODEL_NOT_ENABLED",
+            "details": trained.get("reasons", []),
+        }
+
+    model = trained.get("model")
+    threshold = trained.get("threshold")
+
+    if model is None or threshold is None:
+        return {
+            "ok": False,
+            "reason": "MODEL_OR_THRESHOLD_MISSING",
+        }
+
+    if latest_features is None or latest_features.empty:
+        return {
+            "ok": False,
+            "reason": "NO_LATEST_FEATURES",
+        }
+
+    missing = [
+        column for column in FEATURE_COLUMNS
+        if column not in latest_features.columns
+    ]
+
+    if missing:
+        return {
+            "ok": False,
+            "reason": "MISSING_FEATURES",
+            "details": missing,
+        }
+
+    latest = latest_features.iloc[[-1]][FEATURE_COLUMNS]
+    latest = latest.replace([np.inf, -np.inf], np.nan)
+
+    if latest.isna().any().any():
+        return {
+            "ok": False,
+            "reason": "LATEST_FEATURES_INCOMPLETE",
+        }
+
+    try:
+        probability_up = float(
+            positive_class_probability(model, latest)[0]
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": f"PREDICTION_FAILED:{exc}",
+        }
+
+    probability_down = 1.0 - probability_up
+    confidence = max(probability_up, probability_down)
+
+    if confidence < float(threshold):
+        return {
+            "ok": True,
+            "signal": "WAIT",
+            "probability_up": probability_up,
+            "probability_down": probability_down,
+            "confidence": confidence,
+            "threshold": float(threshold),
+            "reason": "CONFIDENCE_BELOW_THRESHOLD",
+        }
+
+    signal = "CALL" if probability_up > probability_down else "PUT"
+
+    return {
+        "ok": True,
+        "signal": signal,
+        "probability_up": probability_up,
+        "probability_down": probability_down,
+        "confidence": confidence,
+        "threshold": float(threshold),
+        "reason": "MODEL_THRESHOLD_PASSED",
+    }
+
+
+# ============================================================
+# 35. TRAINING PIPELINE ENTRY POINT
+# ============================================================
+
+def train_from_feature_frame(
+    feature_frame: pd.DataFrame,
+) -> dict[str, Any]:
+    """
+    Build labels and prepare the training dataset from an existing
+    feature frame, then run the chronological model pipeline.
+    """
+    try:
+        labeled = add_training_target(
+            feature_frame,
+            horizon=HORIZON,
+        )
+
+        dataset = prepare_labeled_dataset(
+            labeled,
+            min_rows=MIN_TRAIN_ROWS,
+        )
+
+        return train_model(dataset)
+
+    except Exception as exc:
+        log.exception("Training pipeline failed.")
+
+        return {
+            "model": None,
+            "enabled": False,
+            "threshold": None,
+            "metrics": {},
+            "reasons": [f"TRAINING_PIPELINE_FAILED:{exc}"],
+            "trained_at_utc": now_utc().isoformat(),
+            "version": BOT_VERSION,
+        }
+
+
+# ============================================================
+# END OF PART 3/6
+# ============================================================
+
+# ============================================================
+# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+# PART 4/6
+# Option Contracts • Live Quotes • Liquidity • Risk Controls
+#
+# Paste directly below PART 3/6.
+# RECOMMENDATIONS ONLY — NO ORDER EXECUTION.
+# ============================================================
+
+# ============================================================
+# 36. OPTIONS CONFIGURATION
+# ============================================================
+
+OPTIONS_DATA_URL = _s(
+    "OPTIONS_DATA_URL",
+    "https://data.alpaca.markets",
+).rstrip("/")
+
+OPTIONS_CONTRACTS_URL = _s(
+    "OPTIONS_CONTRACTS_URL",
+    f"{ALPACA_TRADING_URL}/v2/options/contracts",
+).rstrip("/")
+
+OPTIONS_FEED = _s("OPTIONS_FEED", "indicative").lower()
+
+OPTION_EXPIRY_MODE = _s(
+    "OPTION_EXPIRY_MODE", "same_day"
+).lower()
+
+OPTION_TYPE = _s("OPTION_TYPE", "both").lower()
+
+OPTION_CHAIN_LIMIT = _i("OPTION_CHAIN_LIMIT", 1000)
+MAX_OPTION_PAGES = _i("MAX_OPTION_PAGES", 10)
+
+MIN_TIME_TO_EXPIRY_MINUTES = _i(
+    "MIN_TIME_TO_EXPIRY_MINUTES", 5
+)
+
+MAX_TIME_TO_EXPIRY_MINUTES = _i(
+    "MAX_TIME_TO_EXPIRY_MINUTES", 390
+)
+
+# Optional delta data can be unavailable depending on feed/endpoint.
+# If delta is required but unavailable, the contract is rejected.
+REQUIRE_DELTA = _b("REQUIRE_DELTA", False)
+
+# When delta is available, require it to fall inside the configured band.
+MIN_ABS_DELTA = _f("MIN_ABS_DELTA", MIN_DELTA)
+MAX_ABS_DELTA = _f("MAX_ABS_DELTA", MAX_DELTA)
+
+# Additional option-specific filters.
+MIN_OPTION_BID = _f("MIN_OPTION_BID", 0.01)
+MIN_OPTION_ASK = _f("MIN_OPTION_ASK", MIN_OPTION_PREMIUM)
+MAX_OPTION_ASK = _f("MAX_OPTION_ASK", MAX_OPTION_PREMIUM)
+
+# A conservative estimate of entry cost.
+# One standard equity-option contract represents 100 shares.
+OPTION_MULTIPLIER = _i("OPTION_MULTIPLIER", 100)
+
+# A signal may be generated only if the account equity is configured.
+REQUIRE_ACCOUNT_EQUITY = _b("REQUIRE_ACCOUNT_EQUITY", True)
+
+
+# ============================================================
+# 37. OPTION API HEADERS
+# ============================================================
+
+def options_headers() -> dict[str, str]:
+    """Return authenticated headers for Alpaca option data."""
+    headers = alpaca_headers()
+    headers["Accept"] = "application/json"
+    return headers
+
+
+def options_get(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    GET an options endpoint with bounded retries.
+    No order-submission endpoint is called by this module.
+    """
+    headers = options_headers()
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            response = HTTP.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if response.status_code in (401, 403):
+                raise RuntimeError(
+                    "Alpaca options permission/authentication error "
+                    f"{response.status_code}: {response.text[:300]}"
+                )
+
+            response.raise_for_status()
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    "Unexpected options API response format."
+                )
+
+            return payload
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < HTTP_RETRIES:
+                time.sleep(
+                    HTTP_RETRY_SLEEP_SECONDS * attempt
+                )
+
+    raise RuntimeError(
+        f"Options GET failed after {HTTP_RETRIES} attempts: "
+        f"{last_error}"
     )
 
 
-def train_model(df):
-    data = df.sort_index().copy()
-    future_close = data["close"].shift(-LABEL_HORIZON)
-    valid = future_close.notna()
+# ============================================================
+# 38. CONTRACT FIELD NORMALIZATION
+# ============================================================
 
-    X = data.loc[valid, FEATURES].replace([np.inf, -np.inf], np.nan)
-    y = (future_close.loc[valid] > data.loc[valid, "close"]).astype(int)
+def normalize_option_type(value: Any) -> Optional[str]:
+    """Normalize option type to CALL or PUT."""
+    if value is None:
+        return None
 
-    if len(X) < 500:
-        raise RuntimeError(f"بيانات التدريب غير كافية: {len(X)}")
+    text_value = str(value).strip().lower()
 
-    split = int(len(X) * 0.80)
-    train_end = split - LABEL_HORIZON
-    if train_end < 200 or len(X) - split < 100:
-        raise RuntimeError("بيانات التدريب أو الاختبار غير كافية")
+    if text_value in {"call", "c"}:
+        return "CALL"
 
-    X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
-    X_test, y_test = X.iloc[split:], y.iloc[split:]
+    if text_value in {"put", "p"}:
+        return "PUT"
 
-    if y_train.nunique() < 2 or y_test.nunique() < 2:
-        raise RuntimeError("بيانات التدريب أو الاختبار تحتوي على فئة واحدة")
-
-    evaluator = new_model()
-    evaluator.fit(X_train, y_train)
-
-    probabilities = evaluator.predict_proba(X_test)[:, 1]
-    predictions = (probabilities >= 0.5).astype(int)
-
-    accuracy = float(accuracy_score(y_test, predictions))
-    auc = float(roc_auc_score(y_test, probabilities))
-    baseline_accuracy = float((y_test == int(y_train.mean() >= 0.5)).mean())
-
-    log(f"[اختبار اتجاه SPX] صفوف={len(X)} | اختبار={len(X_test)} | دقة={accuracy:.3f} | AUC={auc:.3f}")
-
-    live_model = new_model()
-    live_model.fit(X, y)
-    return live_model, FEATURES.copy(), auc, accuracy, baseline_accuracy
+    return None
 
 
-# ======================== DIRECTIONAL CONFIRMATION ===========
+def parse_expiration_date(value: Any) -> Optional[date]:
+    """Parse an option expiration date."""
+    if value is None:
+        return None
 
-def _num(row, key, default=np.nan):
     try:
-        value = float(row.get(key, default))
-        return value if np.isfinite(value) else default
+        return pd.Timestamp(value).date()
+    except Exception:
+        return None
+
+
+def normalize_contract(
+    raw: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """
+    Normalize an Alpaca option-contract object.
+
+    Returns None if required contract information is missing.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    symbol = str(raw.get("symbol", "")).strip().upper()
+    underlying = str(
+        raw.get("underlying_symbol", "")
+    ).strip().upper()
+
+    option_type = normalize_option_type(
+        raw.get("type", raw.get("right"))
+    )
+
+    strike = safe_positive_float(
+        raw.get("strike_price", raw.get("strike"))
+    )
+
+    expiration = parse_expiration_date(
+        raw.get("expiration_date", raw.get("expiration"))
+    )
+
+    if not symbol or not option_type:
+        return None
+
+    if strike is None or expiration is None:
+        return None
+
+    return {
+        "symbol": symbol,
+        "underlying_symbol": underlying,
+        "type": option_type,
+        "strike": float(strike),
+        "expiration_date": expiration,
+        "tradable": raw.get("tradable"),
+        "raw": raw,
+    }
+
+
+# ============================================================
+# 39. FETCH OPTION CONTRACTS
+# ============================================================
+
+def fetch_option_contracts(
+    underlying: str = PRIMARY_UNDERLYING,
+    expiration: Optional[date] = None,
+    option_type: str = "both",
+    limit: int = OPTION_CHAIN_LIMIT,
+) -> list[dict[str, Any]]:
+    """
+    Fetch option contracts from Alpaca's contracts endpoint.
+
+    This retrieves contract definitions, not executable orders.
+    A contract's presence in the chain does not prove that it has
+    a current, liquid or tradable quote.
+    """
+    underlying = underlying.strip().upper()
+
+    if not underlying:
+        raise ValueError("Underlying symbol cannot be empty.")
+
+    if option_type.lower() not in {"both", "call", "put"}:
+        raise ValueError(
+            "option_type must be 'both', 'call' or 'put'."
+        )
+
+    params: dict[str, Any] = {
+        "underlying_symbols": underlying,
+        "status": "active",
+        "limit": min(max(int(limit), 1), 1000),
+    }
+
+    if expiration is not None:
+        params["expiration_date"] = expiration.isoformat()
+
+    if option_type.lower() in {"call", "put"}:
+        params["type"] = option_type.lower()
+
+    collected: list[dict[str, Any]] = []
+    page_token: Optional[str] = None
+
+    for _ in range(MAX_OPTION_PAGES):
+        if page_token:
+            params["page_token"] = page_token
+        else:
+            params.pop("page_token", None)
+
+        payload = options_get(
+            OPTIONS_CONTRACTS_URL,
+            params=params,
+        )
+
+        contracts = payload.get(
+            "option_contracts",
+            payload.get("contracts", []),
+        )
+
+        if not isinstance(contracts, list):
+            raise RuntimeError(
+                "Unexpected option-contract list format."
+            )
+
+        collected.extend(contracts)
+
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+
+    normalized: list[dict[str, Any]] = []
+
+    for raw in collected:
+        contract = normalize_contract(raw)
+
+        if contract is None:
+            continue
+
+        if (
+            contract["underlying_symbol"]
+            and contract["underlying_symbol"] != underlying
+        ):
+            continue
+
+        if option_type.lower() == "call":
+            if contract["type"] != "CALL":
+                continue
+
+        elif option_type.lower() == "put":
+            if contract["type"] != "PUT":
+                continue
+
+        normalized.append(contract)
+
+    log.info(
+        "OPTION CHAIN %s: %s normalized contracts",
+        underlying,
+        len(normalized),
+    )
+
+    return normalized
+
+
+# ============================================================
+# 40. LATEST OPTION QUOTES
+# ============================================================
+
+def fetch_latest_option_quotes(
+    option_symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """
+    Fetch latest option quotes from Alpaca.
+
+    The quote endpoint and available feed depend on the account's
+    options-data permissions. API failure is treated as unavailable
+    data, never as permission to fabricate a price.
+    """
+    symbols = sorted({
+        str(symbol).strip().upper()
+        for symbol in option_symbols
+        if str(symbol).strip()
+    })
+
+    if not symbols:
+        return {}
+
+    quotes: dict[str, dict[str, Any]] = {}
+
+    # Batch requests to avoid excessively long URLs.
+    batch_size = 50
+
+    for start in range(0, len(symbols), batch_size):
+        batch = symbols[start:start + batch_size]
+
+        url = f"{OPTIONS_DATA_URL}/v1beta1/options/quotes/latest"
+
+        params = {
+            "symbols": ",".join(batch),
+            "feed": OPTIONS_FEED,
+        }
+
+        payload = options_get(url, params=params)
+
+        quote_map = payload.get("quotes", {})
+
+        if not isinstance(quote_map, dict):
+            log.warning(
+                "Unexpected quote-map format for option batch."
+            )
+            continue
+
+        for symbol, quote in quote_map.items():
+            if isinstance(quote, dict):
+                quotes[str(symbol).upper()] = quote
+
+    return quotes
+
+
+# ============================================================
+# 41. QUOTE TIMESTAMP / QUALITY
+# ============================================================
+
+def quote_timestamp(
+    quote: dict[str, Any],
+) -> Optional[datetime]:
+    """Extract a quote timestamp and normalize it to UTC."""
+    if not isinstance(quote, dict):
+        return None
+
+    for key in ("t", "timestamp", "time"):
+        if quote.get(key) is not None:
+            timestamp = to_utc(quote[key])
+            if timestamp is not None:
+                return timestamp
+
+    return None
+
+
+def quote_age_seconds(
+    quote: dict[str, Any],
+    current_time: Optional[datetime] = None,
+) -> Optional[float]:
+    timestamp = quote_timestamp(quote)
+    current = to_utc(current_time or now_utc())
+
+    if timestamp is None or current is None:
+        return None
+
+    age = (current - timestamp).total_seconds()
+
+    # A materially future-dated quote is invalid.
+    if age < -2.0:
+        return None
+
+    return max(0.0, age)
+
+
+def extract_quote_prices(
+    quote: dict[str, Any],
+) -> tuple[Optional[float], Optional[float]]:
+    """Extract bid and ask prices from an Alpaca quote."""
+    if not isinstance(quote, dict):
+        return None, None
+
+    bid = safe_positive_float(
+        quote.get("bp", quote.get("bid_price"))
+    )
+
+    ask = safe_positive_float(
+        quote.get("ap", quote.get("ask_price"))
+    )
+
+    return bid, ask
+
+
+def validate_option_quote(
+    quote: dict[str, Any],
+    current_time: Optional[datetime] = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Validate quote freshness, bid/ask ordering and spread.
+
+    The returned metrics are diagnostics only; a valid quote does
+    not guarantee that the displayed price can be filled.
+    """
+    if not isinstance(quote, dict):
+        return False, "QUOTE_MISSING", {}
+
+    bid, ask = extract_quote_prices(quote)
+
+    if bid is None or ask is None:
+        return False, "BID_OR_ASK_MISSING", {}
+
+    if bid < MIN_OPTION_BID:
+        return False, "BID_BELOW_MINIMUM", {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    if ask < MIN_OPTION_ASK:
+        return False, "ASK_BELOW_MINIMUM", {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    if ask > MAX_OPTION_ASK:
+        return False, "ASK_ABOVE_MAXIMUM", {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    if ask < bid:
+        return False, "CROSSED_MARKET", {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    age = quote_age_seconds(
+        quote,
+        current_time=current_time,
+    )
+
+    if age is None:
+        return False, "QUOTE_TIMESTAMP_INVALID", {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    if age > MAX_QUOTE_AGE_SECONDS:
+        return False, "QUOTE_STALE", {
+            "bid": bid,
+            "ask": ask,
+            "age_seconds": age,
+        }
+
+    spread = calculate_spread_percent(bid, ask)
+
+    if spread is None:
+        return False, "SPREAD_INVALID", {
+            "bid": bid,
+            "ask": ask,
+        }
+
+    if spread > MAX_SPREAD_PERCENT:
+        return False, "SPREAD_TOO_WIDE", {
+            "bid": bid,
+            "ask": ask,
+            "spread_percent": spread,
+            "age_seconds": age,
+        }
+
+    midpoint = (bid + ask) / 2.0
+
+    return True, "QUOTE_OK", {
+        "bid": bid,
+        "ask": ask,
+        "midpoint": midpoint,
+        "spread_percent": spread,
+        "age_seconds": age,
+        "quote_timestamp": quote_timestamp(quote),
+    }
+
+
+# ============================================================
+# 42. OPTION EXPIRY FILTERS
+# ============================================================
+
+def minutes_until_expiry(
+    expiration: date,
+    current_time: Optional[datetime] = None,
+) -> Optional[float]:
+    """
+    Approximate minutes remaining until the regular-session close
+    on the expiration date.
+
+    This is a conservative session-time estimate, not a full model
+    of every product's settlement and exercise rules.
+    """
+    current = to_ny(current_time or now_ny())
+
+    if current is None:
+        return None
+
+    if expiration < current.date():
+        return -1.0
+
+    _, session_end = regular_session_bounds(expiration)
+
+    if expiration > current.date():
+        return (
+            (session_end - current).total_seconds() / 60.0
+        )
+
+    return (
+        (session_end - current).total_seconds() / 60.0
+    )
+
+
+def contract_expiry_is_acceptable(
+    contract: dict[str, Any],
+    current_time: Optional[datetime] = None,
+) -> tuple[bool, str, Optional[float]]:
+    expiration = contract.get("expiration_date")
+
+    if not isinstance(expiration, date):
+        return False, "INVALID_EXPIRATION", None
+
+    current = to_ny(current_time or now_ny())
+    if current is None:
+        return False, "INVALID_CURRENT_TIME", None
+
+    if OPTION_EXPIRY_MODE == "same_day":
+        if expiration != current.date():
+            return False, "NOT_SAME_DAY_EXPIRY", None
+
+    elif OPTION_EXPIRY_MODE == "any_active":
+        if expiration < current.date():
+            return False, "EXPIRED_CONTRACT", None
+
+    else:
+        return False, "INVALID_EXPIRY_MODE", None
+
+    remaining = minutes_until_expiry(
+        expiration,
+        current_time=current,
+    )
+
+    if remaining is None:
+        return False, "EXPIRY_TIME_UNAVAILABLE", None
+
+    if remaining <= MIN_TIME_TO_EXPIRY_MINUTES:
+        return False, "TOO_CLOSE_TO_EXPIRY", remaining
+
+    if remaining > MAX_TIME_TO_EXPIRY_MINUTES:
+        return False, "OUTSIDE_EXPIRY_WINDOW", remaining
+
+    return True, "EXPIRY_OK", remaining
+
+
+# ============================================================
+# 43. OPTIONAL DELTA EXTRACTION
+# ============================================================
+
+def extract_delta(
+    contract: dict[str, Any],
+    quote: Optional[dict[str, Any]] = None,
+) -> Optional[float]:
+    """
+    Extract delta only if the API response actually supplies it.
+
+    Most ordinary quote objects do not contain Greeks. This function
+    does not invent a delta from strike distance or underlying price.
+    """
+    sources = [
+        contract.get("raw", {}),
+        quote or {},
+    ]
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+
+        if source.get("delta") is not None:
+            delta = safe_float(source.get("delta"))
+            if delta is not None and -1.0 <= delta <= 1.0:
+                return delta
+
+        greeks = source.get("greeks")
+        if isinstance(greeks, dict) and greeks.get("delta") is not None:
+            delta = safe_float(greeks.get("delta"))
+            if delta is not None and -1.0 <= delta <= 1.0:
+                return delta
+
+    return None
+
+
+def delta_is_acceptable(
+    contract: dict[str, Any],
+    quote: Optional[dict[str, Any]] = None,
+) -> tuple[bool, str, Optional[float]]:
+    delta = extract_delta(contract, quote)
+
+    if delta is None:
+        if REQUIRE_DELTA:
+            return False, "DELTA_REQUIRED_BUT_UNAVAILABLE", None
+        return True, "DELTA_UNAVAILABLE_NOT_FILTERED", None
+
+    abs_delta = abs(delta)
+
+    if abs_delta < MIN_ABS_DELTA:
+        return False, "DELTA_BELOW_MINIMUM", delta
+
+    if abs_delta > MAX_ABS_DELTA:
+        return False, "DELTA_ABOVE_MAXIMUM", delta
+
+    return True, "DELTA_OK", delta
+
+
+# ============================================================
+# 44. CONTRACT CANDIDATE FILTER
+# ============================================================
+
+def evaluate_contract_candidate(
+    contract: dict[str, Any],
+    quote: Optional[dict[str, Any]],
+    underlying_price: float,
+    expected_direction: str,
+    current_time: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """
+    Evaluate one contract against the direction, strike distance,
+    expiry, quote and optional delta filters.
+    """
+    result: dict[str, Any] = {
+        "accepted": False,
+        "reason": "NOT_EVALUATED",
+        "contract": contract,
+    }
+
+    if not isinstance(contract, dict):
+        result["reason"] = "INVALID_CONTRACT"
+        return result
+
+    direction = expected_direction.strip().upper()
+
+    if direction not in {"CALL", "PUT"}:
+        result["reason"] = "INVALID_DIRECTION"
+        return result
+
+    if contract.get("type") != direction:
+        result["reason"] = "DIRECTION_MISMATCH"
+        return result
+
+    underlying = safe_positive_float(underlying_price)
+
+    if underlying is None:
+        result["reason"] = "INVALID_UNDERLYING_PRICE"
+        return result
+
+    strike = safe_positive_float(contract.get("strike"))
+
+    if strike is None:
+        result["reason"] = "INVALID_STRIKE"
+        return result
+
+    strike_distance = abs(strike - underlying)
+
+    if strike_distance > MAX_STRIKE_DISTANCE:
+        result["reason"] = "STRIKE_TOO_FAR"
+        result["strike_distance"] = strike_distance
+        return result
+
+    expiry_ok, expiry_reason, remaining = (
+        contract_expiry_is_acceptable(
+            contract,
+            current_time=current_time,
+        )
+    )
+
+    if not expiry_ok:
+        result["reason"] = expiry_reason
+        result["minutes_to_expiry"] = remaining
+        return result
+
+    quote_ok, quote_reason, quote_metrics = validate_option_quote(
+        quote or {},
+        current_time=current_time,
+    )
+
+    if not quote_ok:
+        result["reason"] = quote_reason
+        result.update(quote_metrics)
+        return result
+
+    delta_ok, delta_reason, delta = delta_is_acceptable(
+        contract,
+        quote,
+    )
+
+    if not delta_ok:
+        result["reason"] = delta_reason
+        result["delta"] = delta
+        return result
+
+    result.update({
+        "accepted": True,
+        "reason": "CONTRACT_OK",
+        "symbol": contract["symbol"],
+        "type": contract["type"],
+        "strike": strike,
+        "expiration_date": contract["expiration_date"].isoformat(),
+        "strike_distance": strike_distance,
+        "minutes_to_expiry": remaining,
+        "delta": delta,
+        **quote_metrics,
+    })
+
+    return result
+
+
+# ============================================================
+# 45. CONTRACT SCORING
+# ============================================================
+
+def score_contract_candidate(
+    candidate: dict[str, Any],
+) -> float:
+    """
+    Rank already-valid contracts.
+
+    This is a deterministic ranking heuristic, not an estimate
+    of option profitability or probability of filling.
+    """
+    if not candidate.get("accepted", False):
+        return -1.0
+
+    spread = safe_float(candidate.get("spread_percent"))
+    distance = safe_float(candidate.get("strike_distance"))
+    midpoint = safe_positive_float(candidate.get("midpoint"))
+
+    if spread is None or distance is None or midpoint is None:
+        return -1.0
+
+    # Prefer tighter spreads and strikes nearer the underlying.
+    # Premium is not rewarded without limit.
+    spread_score = max(0.0, 1.0 - spread / MAX_SPREAD_PERCENT)
+    distance_score = max(
+        0.0,
+        1.0 - distance / max(MAX_STRIKE_DISTANCE, 0.01),
+    )
+
+    # Avoid favoring expensive contracts merely because they cost more.
+    premium_score = 1.0 / (1.0 + midpoint)
+
+    delta = candidate.get("delta")
+    if delta is None:
+        delta_score = 0.5
+    else:
+        abs_delta = abs(float(delta))
+        midpoint_delta = (
+            MIN_ABS_DELTA + MAX_ABS_DELTA
+        ) / 2.0
+        delta_score = max(
+            0.0,
+            1.0 - abs(abs_delta - midpoint_delta),
+        )
+
+    return (
+        0.40 * spread_score
+        + 0.25 * distance_score
+        + 0.15 * premium_score
+        + 0.20 * delta_score
+    )
+
+
+def select_best_contract(
+    contracts: list[dict[str, Any]],
+    quotes: dict[str, dict[str, Any]],
+    underlying_price: float,
+    expected_direction: str,
+    current_time: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """
+    Evaluate the chain and return the highest-ranked valid contract.
+    Returns a structured rejection if no contract passes.
+    """
+    candidates: list[dict[str, Any]] = []
+    rejection_counts: dict[str, int] = {}
+
+    for contract in contracts:
+        symbol = contract.get("symbol", "")
+        quote = quotes.get(symbol)
+
+        candidate = evaluate_contract_candidate(
+            contract=contract,
+            quote=quote,
+            underlying_price=underlying_price,
+            expected_direction=expected_direction,
+            current_time=current_time,
+        )
+
+        if not candidate.get("accepted", False):
+            reason = str(candidate.get("reason", "UNKNOWN"))
+            rejection_counts[reason] = (
+                rejection_counts.get(reason, 0) + 1
+            )
+            continue
+
+        candidate["rank_score"] = score_contract_candidate(
+            candidate
+        )
+        candidates.append(candidate)
+
+    if not candidates:
+        return {
+            "ok": False,
+            "reason": "NO_CONTRACT_PASSED_FILTERS",
+            "rejection_counts": rejection_counts,
+        }
+
+    candidates.sort(
+        key=lambda item: item.get("rank_score", -1.0),
+        reverse=True,
+    )
+
+    best = candidates[0]
+
+    return {
+        "ok": True,
+        "reason": "BEST_CONTRACT_SELECTED",
+        "contract": best,
+        "candidate_count": len(candidates),
+        "rejection_counts": rejection_counts,
+    }
+
+
+# ============================================================
+# 46. RISK BUDGET AND CONTRACT SIZING
+# ============================================================
+
+def calculate_risk_budget(
+    account_equity: float = ACCOUNT_EQUITY,
+    risk_pct: float = RISK_PCT,
+) -> tuple[bool, str, float]:
+    """
+    Convert a percentage risk setting into a monetary risk budget.
+
+    This is a budget cap, not a forecast of maximum loss.
+    """
+    equity = safe_positive_float(account_equity)
+
+    if equity is None:
+        return False, "ACCOUNT_EQUITY_NOT_CONFIGURED", 0.0
+
+    pct = safe_float(risk_pct)
+
+    if pct is None or pct <= 0 or pct > 100:
+        return False, "INVALID_RISK_PERCENT", 0.0
+
+    risk_budget = equity * (pct / 100.0)
+
+    if risk_budget <= 0:
+        return False, "RISK_BUDGET_ZERO", 0.0
+
+    return True, "RISK_BUDGET_OK", risk_budget
+
+
+def calculate_contract_quantity(
+    ask_price: float,
+    account_equity: float = ACCOUNT_EQUITY,
+    risk_pct: float = RISK_PCT,
+    max_contracts: int = MAX_CONTRACTS,
+    slippage_per_contract: float = ESTIMATED_SLIPPAGE_PER_CONTRACT,
+    fees_per_contract: float = ESTIMATED_FEES_PER_CONTRACT,
+) -> dict[str, Any]:
+    """
+    Estimate a contract quantity using the full premium cost plus
+    estimated slippage and fees.
+
+    For long options, the premium paid can be lost in full.
+    This function deliberately budgets against estimated total entry
+    cost rather than pretending a stop loss is guaranteed to fill.
+
+    It does not place an order.
+    """
+    ask = safe_positive_float(ask_price)
+
+    if ask is None:
+        return {
+            "ok": False,
+            "reason": "INVALID_ASK_PRICE",
+            "contracts": 0,
+        }
+
+    if REQUIRE_ACCOUNT_EQUITY and account_equity <= 0:
+        return {
+            "ok": False,
+            "reason": "ACCOUNT_EQUITY_NOT_CONFIGURED",
+            "contracts": 0,
+        }
+
+    budget_ok, budget_reason, risk_budget = calculate_risk_budget(
+        account_equity=account_equity,
+        risk_pct=risk_pct,
+    )
+
+    if not budget_ok:
+        return {
+            "ok": False,
+            "reason": budget_reason,
+            "contracts": 0,
+        }
+
+    slippage = safe_float(slippage_per_contract)
+    fees = safe_float(fees_per_contract)
+
+    if slippage is None or slippage < 0:
+        return {
+            "ok": False,
+            "reason": "INVALID_SLIPPAGE_ESTIMATE",
+            "contracts": 0,
+        }
+
+    if fees is None or fees < 0:
+        return {
+            "ok": False,
+            "reason": "INVALID_FEE_ESTIMATE",
+            "contracts": 0,
+        }
+
+    premium_cost = ask * OPTION_MULTIPLIER
+
+    estimated_cost_per_contract = (
+        premium_cost
+        + slippage * OPTION_MULTIPLIER
+        + fees
+    )
+
+    if estimated_cost_per_contract <= 0:
+        return {
+            "ok": False,
+            "reason": "INVALID_ESTIMATED_COST",
+            "contracts": 0,
+        }
+
+    quantity_from_budget = int(
+        math.floor(risk_budget / estimated_cost_per_contract)
+    )
+
+    quantity = min(
+        quantity_from_budget,
+        max(0, int(max_contracts)),
+    )
+
+    if quantity < 1:
+        return {
+            "ok": False,
+            "reason": "RISK_BUDGET_TOO_SMALL",
+            "contracts": 0,
+            "risk_budget": risk_budget,
+            "estimated_cost_per_contract": estimated_cost_per_contract,
+        }
+
+    total_estimated_cost = (
+        quantity * estimated_cost_per_contract
+    )
+
+    return {
+        "ok": True,
+        "reason": "SIZE_OK",
+        "contracts": quantity,
+        "risk_budget": risk_budget,
+        "premium_per_contract": premium_cost,
+        "estimated_cost_per_contract": estimated_cost_per_contract,
+        "estimated_total_cost": total_estimated_cost,
+        "estimated_budget_remaining": (
+            risk_budget - total_estimated_cost
+        ),
+        "maximum_premium_loss_before_fees": (
+            quantity * premium_cost
+        ),
+        "note": (
+            "Estimate only; actual fills, fees and slippage may differ."
+        ),
+    }
+
+
+# ============================================================
+# 47. DAILY RISK GUARD
+# ============================================================
+
+def daily_risk_guard(
+    realized_daily_pnl: float,
+    trades_today: int,
+    open_positions: int,
+) -> tuple[bool, str]:
+    """
+    Check externally tracked daily limits.
+
+    This bot does not execute trades, so P&L, trade count and open
+    positions must come from a trustworthy journal or account source.
+    Do not pass invented values.
+    """
+    pnl = safe_float(realized_daily_pnl)
+
+    if pnl is None:
+        return False, "DAILY_PNL_UNAVAILABLE"
+
+    if pnl <= -abs(MAX_DAILY_LOSS):
+        return False, "MAX_DAILY_LOSS_REACHED"
+
+    if int(trades_today) >= MAX_TRADES_PER_DAY:
+        return False, "MAX_TRADES_PER_DAY_REACHED"
+
+    if int(open_positions) >= MAX_OPEN_POSITIONS:
+        return False, "MAX_OPEN_POSITIONS_REACHED"
+
+    return True, "DAILY_RISK_OK"
+
+
+# ============================================================
+# 48. COMPLETE CONTRACT SELECTION WORKFLOW
+# ============================================================
+
+def find_option_recommendation_candidate(
+    underlying_price: float,
+    expected_direction: str,
+    underlying: str = PRIMARY_UNDERLYING,
+    current_time: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """
+    Fetch contracts and quotes, apply filters, rank candidates,
+    then calculate an estimated affordable contract quantity.
+
+    This function returns a recommendation candidate only.
+    It never submits an order.
+    """
+    direction = expected_direction.strip().upper()
+
+    if direction not in {"CALL", "PUT"}:
+        return {
+            "ok": False,
+            "reason": "INVALID_DIRECTION",
+        }
+
+    current = to_ny(current_time or now_ny())
+
+    if current is None:
+        return {
+            "ok": False,
+            "reason": "INVALID_CURRENT_TIME",
+        }
+
+    session_ok, session_reason = session_window_status(current)
+
+    if not session_ok:
+        return {
+            "ok": False,
+            "reason": "SESSION_BLOCKED",
+            "details": session_reason,
+        }
+
+    underlying_value = safe_positive_float(underlying_price)
+
+    if underlying_value is None:
+        return {
+            "ok": False,
+            "reason": "INVALID_UNDERLYING_PRICE",
+        }
+
+    try:
+        contracts = fetch_option_contracts(
+            underlying=underlying,
+            expiration=current.date(),
+            option_type=direction.lower(),
+        )
+    except Exception as exc:
+        log.exception("Option contract fetch failed.")
+        return {
+            "ok": False,
+            "reason": f"CONTRACT_FETCH_FAILED:{exc}",
+        }
+
+    if not contracts:
+        return {
+            "ok": False,
+            "reason": "NO_ACTIVE_CONTRACTS",
+            "underlying": underlying,
+            "expiration": current.date().isoformat(),
+        }
+
+    symbols = [
+        contract["symbol"]
+        for contract in contracts
+        if contract.get("symbol")
+    ]
+
+    try:
+        quotes = fetch_latest_option_quotes(symbols)
+    except Exception as exc:
+        log.exception("Option quote fetch failed.")
+        return {
+            "ok": False,
+            "reason": f"QUOTE_FETCH_FAILED:{exc}",
+        }
+
+    selection = select_best_contract(
+        contracts=contracts,
+        quotes=quotes,
+        underlying_price=underlying_value,
+        expected_direction=direction,
+        current_time=current,
+    )
+
+    if not selection.get("ok"):
+        return {
+            "ok": False,
+            "reason": selection.get("reason"),
+            "underlying": underlying,
+            "direction": direction,
+            "details": selection,
+        }
+
+    candidate = selection["contract"]
+
+    sizing = calculate_contract_quantity(
+        ask_price=candidate["ask"],
+    )
+
+    if not sizing.get("ok"):
+        return {
+            "ok": False,
+            "reason": sizing.get("reason"),
+            "underlying": underlying,
+            "direction": direction,
+            "candidate": candidate,
+            "sizing": sizing,
+        }
+
+    return {
+        "ok": True,
+        "reason": "RECOMMENDATION_CANDIDATE_READY",
+        "underlying": underlying,
+        "underlying_price": underlying_value,
+        "direction": direction,
+        "candidate": candidate,
+        "sizing": sizing,
+        "candidate_count": selection.get("candidate_count", 0),
+        "rejection_counts": selection.get(
+            "rejection_counts", {}
+        ),
+        "generated_at_utc": now_utc().isoformat(),
+        "mode": "RECOMMENDATION_ONLY",
+    }
+
+
+# ============================================================
+# END OF PART 4/6
+# ============================================================
+
+# ============================================================
+# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+# PART 5/6
+# Signal Journal • Quote Observations • Paper Outcome Tracking
+#
+# Paste directly below PART 4/6.
+# NO ORDER EXECUTION.
+# ============================================================
+
+# ============================================================
+# 49. JOURNAL CONFIGURATION
+# ============================================================
+
+JOURNAL_VERSION = "21.4"
+
+JOURNAL_DIR = Path(
+    _s("JOURNAL_DIR", "journal")
+)
+
+SIGNAL_JOURNAL_FILE = JOURNAL_DIR / "signals.csv"
+QUOTE_JOURNAL_FILE = JOURNAL_DIR / "quotes.csv"
+OUTCOME_JOURNAL_FILE = JOURNAL_DIR / "outcomes.csv"
+MODEL_JOURNAL_FILE = JOURNAL_DIR / "model_runs.csv"
+
+JOURNAL_FLUSH_EVERY_WRITE = _b(
+    "JOURNAL_FLUSH_EVERY_WRITE", True
+)
+
+# Track price observations for a signal after the alert is generated.
+OBSERVATION_INTERVAL_SECONDS = _i(
+    "OBSERVATION_INTERVAL_SECONDS", 30
+)
+
+OBSERVATION_HORIZON_MINUTES = _i(
+    "OBSERVATION_HORIZON_MINUTES", 5
+)
+
+MAX_OBSERVATION_AGE_SECONDS = _i(
+    "MAX_OBSERVATION_AGE_SECONDS", 60
+)
+
+# Never claim a paper outcome when the required quotes are missing.
+MIN_OBSERVATIONS_FOR_OUTCOME = _i(
+    "MIN_OBSERVATIONS_FOR_OUTCOME", 2
+)
+
+
+# ============================================================
+# 50. JOURNAL SCHEMAS
+# ============================================================
+
+SIGNAL_COLUMNS = [
+    "journal_version",
+    "signal_id",
+    "created_at_utc",
+    "created_at_ny",
+    "underlying",
+    "underlying_price",
+    "direction",
+    "probability_up",
+    "probability_down",
+    "confidence",
+    "model_threshold",
+    "model_enabled",
+    "option_symbol",
+    "option_type",
+    "strike",
+    "expiration_date",
+    "bid",
+    "ask",
+    "midpoint",
+    "spread_percent",
+    "quote_timestamp_utc",
+    "quote_age_seconds",
+    "delta",
+    "estimated_contracts",
+    "estimated_cost_per_contract",
+    "estimated_total_cost",
+    "reason",
+    "status",
+]
+
+QUOTE_COLUMNS = [
+    "journal_version",
+    "signal_id",
+    "observed_at_utc",
+    "quote_timestamp_utc",
+    "quote_age_seconds",
+    "option_symbol",
+    "bid",
+    "ask",
+    "midpoint",
+    "spread_percent",
+    "underlying_price",
+    "observation_number",
+    "observation_status",
+]
+
+OUTCOME_COLUMNS = [
+    "journal_version",
+    "signal_id",
+    "created_at_utc",
+    "evaluated_at_utc",
+    "option_symbol",
+    "entry_reference_ask",
+    "entry_reference_bid",
+    "entry_reference_midpoint",
+    "final_bid",
+    "final_ask",
+    "final_midpoint",
+    "observations_seen",
+    "elapsed_seconds",
+    "midpoint_change_percent",
+    "bid_to_ask_change_percent",
+    "outcome_status",
+    "is_actual_execution",
+    "notes",
+]
+
+MODEL_COLUMNS = [
+    "journal_version",
+    "trained_at_utc",
+    "enabled",
+    "threshold",
+    "train_rows",
+    "validation_rows",
+    "holdout_rows",
+    "validation_auc",
+    "validation_brier",
+    "holdout_auc",
+    "holdout_brier",
+    "holdout_signal_count",
+    "holdout_signal_accuracy",
+    "reasons",
+]
+
+
+# ============================================================
+# 51. JOURNAL INITIALIZATION
+# ============================================================
+
+def initialize_journal() -> None:
+    """
+    Create journal directory and CSV headers when absent.
+    Existing journals are not overwritten.
+    """
+    JOURNAL_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    schemas = {
+        SIGNAL_JOURNAL_FILE: SIGNAL_COLUMNS,
+        QUOTE_JOURNAL_FILE: QUOTE_COLUMNS,
+        OUTCOME_JOURNAL_FILE: OUTCOME_COLUMNS,
+        MODEL_JOURNAL_FILE: MODEL_COLUMNS,
+    }
+
+    for path, columns in schemas.items():
+        if not path.exists():
+            pd.DataFrame(
+                columns=columns
+            ).to_csv(
+                path,
+                index=False,
+                encoding="utf-8",
+            )
+
+
+# ============================================================
+# 52. SAFE JOURNAL APPEND
+# ============================================================
+
+def append_journal_row(
+    path: Path,
+    columns: list[str],
+    row: dict[str, Any],
+) -> tuple[bool, str]:
+    """
+    Append one row without replacing prior history.
+
+    Unknown fields are ignored; missing schema fields are blank.
+    """
+    try:
+        initialize_journal()
+
+        normalized = {
+            column: row.get(column)
+            for column in columns
+        }
+
+        frame = pd.DataFrame(
+            [normalized],
+            columns=columns,
+        )
+
+        frame.to_csv(
+            path,
+            mode="a",
+            header=not path.exists() or path.stat().st_size == 0,
+            index=False,
+            encoding="utf-8",
+        )
+
+        if JOURNAL_FLUSH_EVERY_WRITE:
+            # File writes are synchronous; no additional buffer is
+            # intentionally retained by this function.
+            pass
+
+        return True, "JOURNAL_ROW_APPENDED"
+
+    except Exception as exc:
+        log.exception(
+            "Journal write failed for %s.",
+            path,
+        )
+        return False, f"JOURNAL_WRITE_FAILED:{exc}"
+
+
+# ============================================================
+# 53. SIGNAL ID GENERATION
+# ============================================================
+
+def create_signal_id(
+    underlying: str,
+    direction: str,
+    option_symbol: str,
+    created_at: Optional[datetime] = None,
+) -> str:
+    """
+    Generate a deterministic-unique signal identifier using time
+    and a short digest. This is an identifier, not a security token.
+    """
+    timestamp = to_utc(created_at or now_utc())
+
+    if timestamp is None:
+        timestamp = now_utc()
+
+    material = "|".join([
+        JOURNAL_VERSION,
+        timestamp.isoformat(),
+        str(underlying).upper(),
+        str(direction).upper(),
+        str(option_symbol).upper(),
+        str(uuid.uuid4()),
+    ])
+
+    digest = hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:12].upper()
+
+    compact_time = timestamp.strftime("%Y%m%dT%H%M%S")
+
+    return f"SF-{compact_time}-{digest}"
+
+
+# ============================================================
+# 54. JOURNAL A SIGNAL
+# ============================================================
+
+def journal_signal(
+    signal_id: str,
+    prediction: dict[str, Any],
+    recommendation: dict[str, Any],
+    model_bundle: Optional[dict[str, Any]] = None,
+    reason: str = "",
+) -> tuple[bool, str]:
+    """
+    Save a recommendation and its reference quote.
+
+    The record describes a recommendation, not an actual fill.
+    """
+    if not recommendation.get("ok", False):
+        return False, "CANNOT_JOURNAL_INVALID_RECOMMENDATION"
+
+    candidate = recommendation.get("candidate", {})
+    sizing = recommendation.get("sizing", {})
+
+    if not isinstance(candidate, dict):
+        return False, "MISSING_CONTRACT_CANDIDATE"
+
+    if not isinstance(sizing, dict):
+        return False, "MISSING_SIZING_DATA"
+
+    created_utc = now_utc()
+    created_ny = to_ny(created_utc)
+
+    model_bundle = model_bundle or {}
+
+    row = {
+        "journal_version": JOURNAL_VERSION,
+        "signal_id": signal_id,
+        "created_at_utc": created_utc.isoformat(),
+        "created_at_ny": (
+            created_ny.isoformat()
+            if created_ny is not None
+            else None
+        ),
+        "underlying": recommendation.get("underlying"),
+        "underlying_price": recommendation.get(
+            "underlying_price"
+        ),
+        "direction": prediction.get("signal"),
+        "probability_up": prediction.get("probability_up"),
+        "probability_down": prediction.get("probability_down"),
+        "confidence": prediction.get("confidence"),
+        "model_threshold": prediction.get("threshold"),
+        "model_enabled": bool(model_bundle.get("enabled", False)),
+        "option_symbol": candidate.get("symbol"),
+        "option_type": candidate.get("type"),
+        "strike": candidate.get("strike"),
+        "expiration_date": candidate.get("expiration_date"),
+        "bid": candidate.get("bid"),
+        "ask": candidate.get("ask"),
+        "midpoint": candidate.get("midpoint"),
+        "spread_percent": candidate.get("spread_percent"),
+        "quote_timestamp_utc": (
+            candidate.get("quote_timestamp").isoformat()
+            if isinstance(
+                candidate.get("quote_timestamp"),
+                datetime,
+            )
+            else candidate.get("quote_timestamp")
+        ),
+        "quote_age_seconds": candidate.get("age_seconds"),
+        "delta": candidate.get("delta"),
+        "estimated_contracts": sizing.get("contracts"),
+        "estimated_cost_per_contract": sizing.get(
+            "estimated_cost_per_contract"
+        ),
+        "estimated_total_cost": sizing.get(
+            "estimated_total_cost"
+        ),
+        "reason": reason or prediction.get("reason", ""),
+        "status": "RECOMMENDATION_RECORDED_NOT_EXECUTED",
+    }
+
+    return append_journal_row(
+        SIGNAL_JOURNAL_FILE,
+        SIGNAL_COLUMNS,
+        row,
+    )
+
+
+# ============================================================
+# 55. LOAD A RECORDED SIGNAL
+# ============================================================
+
+def load_signal_record(
+    signal_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the newest journal row for the supplied signal ID."""
+    try:
+        if not SIGNAL_JOURNAL_FILE.exists():
+            return None
+
+        frame = pd.read_csv(
+            SIGNAL_JOURNAL_FILE,
+            dtype={"signal_id": str},
+        )
+
+        if frame.empty or "signal_id" not in frame.columns:
+            return None
+
+        matches = frame[
+            frame["signal_id"].astype(str) == str(signal_id)
+        ]
+
+        if matches.empty:
+            return None
+
+        return matches.iloc[-1].to_dict()
+
+    except Exception:
+        log.exception("Unable to load signal record.")
+        return None
+
+
+# ============================================================
+# 56. RECORD A QUOTE OBSERVATION
+# ============================================================
+
+def record_quote_observation(
+    signal_id: str,
+    option_symbol: str,
+    quote: dict[str, Any],
+    underlying_price: Optional[float] = None,
+    observation_number: int = 1,
+    target_time: Optional[datetime] = None,
+    observed_at: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """
+    Record a fresh quote observation.
+
+    A quote is rejected if it is missing, stale, materially future
+    dated, crossed or otherwise invalid. The source quote timestamp
+    is preserved separately from the local observation timestamp.
+    """
+    observed_time = to_utc(observed_at or now_utc())
+    target = to_utc(target_time or observed_time)
+
+    if observed_time is None or target is None:
+        return {
+            "ok": False,
+            "reason": "INVALID_OBSERVATION_TIME",
+        }
+
+    if not isinstance(quote, dict):
+        return {
+            "ok": False,
+            "reason": "QUOTE_MISSING",
+        }
+
+    quote_time = quote_timestamp(quote)
+
+    if quote_time is None:
+        return {
+            "ok": False,
+            "reason": "SOURCE_TIMESTAMP_MISSING",
+        }
+
+    # Never allow a quote timestamp to be meaningfully in the future.
+    if (
+        quote_time - observed_time
+    ).total_seconds() > 2.0:
+        return {
+            "ok": False,
+            "reason": "SOURCE_TIMESTAMP_IN_FUTURE",
+        }
+
+    age = (
+        observed_time - quote_time
+    ).total_seconds()
+
+    if age < 0:
+        age = 0.0
+
+    if age > MAX_OBSERVATION_AGE_SECONDS:
+        return {
+            "ok": False,
+            "reason": "SOURCE_QUOTE_TOO_OLD",
+            "age_seconds": age,
+        }
+
+    # Do not silently accept a quote from far before the intended
+    # observation time. This prevents stale data being presented as
+    # if it had been observed at the target time.
+    target_difference = abs(
+        (quote_time - target).total_seconds()
+    )
+
+    if target_difference > MAX_OBSERVATION_AGE_SECONDS:
+        return {
+            "ok": False,
+            "reason": "QUOTE_TOO_FAR_FROM_TARGET_TIME",
+            "target_difference_seconds": target_difference,
+        }
+
+    quote_ok, quote_reason, metrics = validate_option_quote(
+        quote,
+        current_time=observed_time,
+    )
+
+    if not quote_ok:
+        return {
+            "ok": False,
+            "reason": quote_reason,
+            "details": metrics,
+        }
+
+    row = {
+        "journal_version": JOURNAL_VERSION,
+        "signal_id": signal_id,
+        "observed_at_utc": observed_time.isoformat(),
+        "quote_timestamp_utc": quote_time.isoformat(),
+        "quote_age_seconds": age,
+        "option_symbol": option_symbol,
+        "bid": metrics.get("bid"),
+        "ask": metrics.get("ask"),
+        "midpoint": metrics.get("midpoint"),
+        "spread_percent": metrics.get("spread_percent"),
+        "underlying_price": safe_float(underlying_price),
+        "observation_number": int(observation_number),
+        "observation_status": "VALID_SOURCE_QUOTE",
+    }
+
+    ok, status = append_journal_row(
+        QUOTE_JOURNAL_FILE,
+        QUOTE_COLUMNS,
+        row,
+    )
+
+    return {
+        "ok": ok,
+        "reason": status,
+        "row": row if ok else None,
+    }
+
+
+# ============================================================
+# 57. READ OBSERVATIONS FOR A SIGNAL
+# ============================================================
+
+def load_quote_observations(
+    signal_id: str,
+) -> pd.DataFrame:
+    """Load observations for one signal, ordered by observation time."""
+    if not QUOTE_JOURNAL_FILE.exists():
+        return pd.DataFrame(columns=QUOTE_COLUMNS)
+
+    try:
+        frame = pd.read_csv(
+            QUOTE_JOURNAL_FILE,
+            dtype={"signal_id": str},
+        )
+
+        if frame.empty:
+            return pd.DataFrame(columns=QUOTE_COLUMNS)
+
+        matches = frame[
+            frame["signal_id"].astype(str) == str(signal_id)
+        ].copy()
+
+        if matches.empty:
+            return matches
+
+        matches["_parsed_time"] = pd.to_datetime(
+            matches["observed_at_utc"],
+            utc=True,
+            errors="coerce",
+        )
+
+        matches = matches.dropna(
+            subset=["_parsed_time"]
+        ).sort_values("_parsed_time")
+
+        return matches.drop(
+            columns=["_parsed_time"],
+            errors="ignore",
+        )
+
+    except Exception:
+        log.exception(
+            "Unable to load quote observations for %s.",
+            signal_id,
+        )
+        return pd.DataFrame(columns=QUOTE_COLUMNS)
+
+
+# ============================================================
+# 58. EVALUATE A PAPER OUTCOME
+# ============================================================
+
+def evaluate_observed_outcome(
+    signal_id: str,
+    minimum_observations: int = MIN_OBSERVATIONS_FOR_OUTCOME,
+) -> dict[str, Any]:
+    """
+    Compare the initial reference quote with the latest valid quote.
+
+    This is an observed-price comparison only. It is NOT an actual
+    executed trade, realized P&L, or proof that a fill was possible.
+    """
+    signal = load_signal_record(signal_id)
+
+    if signal is None:
+        return {
+            "ok": False,
+            "reason": "SIGNAL_NOT_FOUND",
+        }
+
+    observations = load_quote_observations(signal_id)
+
+    if observations.empty:
+        return {
+            "ok": False,
+            "reason": "NO_VALID_QUOTE_OBSERVATIONS",
+        }
+
+    if len(observations) < max(1, int(minimum_observations)):
+        return {
+            "ok": False,
+            "reason": "INSUFFICIENT_OBSERVATIONS",
+            "observations_seen": int(len(observations)),
+        }
+
+    initial_bid = safe_positive_float(signal.get("bid"))
+    initial_ask = safe_positive_float(signal.get("ask"))
+    initial_midpoint = safe_positive_float(signal.get("midpoint"))
+
+    if initial_ask is None or initial_midpoint is None:
+        return {
+            "ok": False,
+            "reason": "INVALID_INITIAL_REFERENCE_QUOTE",
+        }
+
+    last = observations.iloc[-1]
+
+    final_bid = safe_positive_float(last.get("bid"))
+    final_ask = safe_positive_float(last.get("ask"))
+    final_midpoint = safe_positive_float(last.get("midpoint"))
+
+    if (
+        final_bid is None
+        or final_ask is None
+        or final_midpoint is None
+    ):
+        return {
+            "ok": False,
+            "reason": "INVALID_FINAL_REFERENCE_QUOTE",
+        }
+
+    if initial_midpoint <= 0:
+        return {
+            "ok": False,
+            "reason": "INITIAL_MIDPOINT_NOT_POSITIVE",
+        }
+
+    midpoint_change_pct = (
+        (final_midpoint - initial_midpoint)
+        / initial_midpoint
+    ) * 100.0
+
+    # This deliberately uses the initial ask and final bid as a
+    # conservative reference for a hypothetical long-option entry
+    # and exit. It still does not prove either fill was available.
+    bid_to_ask_change_pct = (
+        (final_bid - initial_ask)
+        / initial_ask
+    ) * 100.0
+
+    created = to_utc(signal.get("created_at_utc"))
+    evaluated = now_utc()
+
+    elapsed_seconds = None
+
+    if created is not None:
+        elapsed_seconds = max(
+            0.0,
+            (evaluated - created).total_seconds(),
+        )
+
+    result = {
+        "ok": True,
+        "signal_id": signal_id,
+        "option_symbol": signal.get("option_symbol"),
+        "entry_reference_ask": initial_ask,
+        "entry_reference_bid": initial_bid,
+        "entry_reference_midpoint": initial_midpoint,
+        "final_bid": final_bid,
+        "final_ask": final_ask,
+        "final_midpoint": final_midpoint,
+        "observations_seen": int(len(observations)),
+        "elapsed_seconds": elapsed_seconds,
+        "midpoint_change_percent": midpoint_change_pct,
+        "bid_to_ask_change_percent": bid_to_ask_change_pct,
+        "outcome_status": "OBSERVED_PRICE_CHANGE_NOT_EXECUTED_PNL",
+        "is_actual_execution": False,
+        "notes": (
+            "Quote-based estimate only. No order was submitted; "
+            "fills, fees and slippage are not verified."
+        ),
+    }
+
+    row = {
+        "journal_version": JOURNAL_VERSION,
+        "signal_id": signal_id,
+        "created_at_utc": signal.get("created_at_utc"),
+        "evaluated_at_utc": evaluated.isoformat(),
+        "option_symbol": signal.get("option_symbol"),
+        "entry_reference_ask": initial_ask,
+        "entry_reference_bid": initial_bid,
+        "entry_reference_midpoint": initial_midpoint,
+        "final_bid": final_bid,
+        "final_ask": final_ask,
+        "final_midpoint": final_midpoint,
+        "observations_seen": int(len(observations)),
+        "elapsed_seconds": elapsed_seconds,
+        "midpoint_change_percent": midpoint_change_pct,
+        "bid_to_ask_change_percent": bid_to_ask_change_pct,
+        "outcome_status": result["outcome_status"],
+        "is_actual_execution": False,
+        "notes": result["notes"],
+    }
+
+    ok, status = append_journal_row(
+        OUTCOME_JOURNAL_FILE,
+        OUTCOME_COLUMNS,
+        row,
+    )
+
+    result["journal_saved"] = ok
+    result["journal_status"] = status
+
+    return result
+
+
+# ============================================================
+# 59. JOURNAL MODEL QUALITY RESULTS
+# ============================================================
+
+def journal_model_run(
+    model_bundle: dict[str, Any],
+) -> tuple[bool, str]:
+    """Save model metrics and gate results for later diagnostics."""
+    if not isinstance(model_bundle, dict):
+        return False, "INVALID_MODEL_BUNDLE"
+
+    metrics = model_bundle.get("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    validation = metrics.get("validation", {})
+    if not isinstance(validation, dict):
+        validation = {}
+
+    holdout = metrics.get("holdout", {})
+    if not isinstance(holdout, dict):
+        holdout = {}
+
+    holdout_signals = metrics.get("holdout_signals", {})
+    if not isinstance(holdout_signals, dict):
+        holdout_signals = {}
+
+    split_rows = model_bundle.get("split_rows", {})
+    if not isinstance(split_rows, dict):
+        split_rows = {}
+
+    row = {
+        "journal_version": JOURNAL_VERSION,
+        "trained_at_utc": model_bundle.get(
+            "trained_at_utc",
+            now_utc().isoformat(),
+        ),
+        "enabled": bool(model_bundle.get("enabled", False)),
+        "threshold": model_bundle.get("threshold"),
+        "train_rows": split_rows.get("train"),
+        "validation_rows": split_rows.get("validation"),
+        "holdout_rows": split_rows.get("holdout"),
+        "validation_auc": validation.get("auc"),
+        "validation_brier": validation.get("brier"),
+        "holdout_auc": holdout.get("auc"),
+        "holdout_brier": holdout.get("brier"),
+        "holdout_signal_count": holdout_signals.get(
+            "signal_count"
+        ),
+        "holdout_signal_accuracy": holdout_signals.get(
+            "signal_accuracy"
+        ),
+        "reasons": " ; ".join(
+            str(item)
+            for item in model_bundle.get("reasons", [])
+        ),
+    }
+
+    return append_journal_row(
+        MODEL_JOURNAL_FILE,
+        MODEL_COLUMNS,
+        row,
+    )
+
+
+# ============================================================
+# 60. JOURNAL SUMMARY
+# ============================================================
+
+def get_journal_summary() -> dict[str, Any]:
+    """
+    Return counts and descriptive outcome statistics.
+
+    These are journal statistics, not a verified brokerage statement.
+    """
+    summary: dict[str, Any] = {
+        "journal_version": JOURNAL_VERSION,
+        "signals_recorded": 0,
+        "quote_observations": 0,
+        "outcomes_recorded": 0,
+        "actual_executions": 0,
+        "mean_midpoint_change_percent": None,
+        "mean_bid_to_ask_change_percent": None,
+    }
+
+    try:
+        if SIGNAL_JOURNAL_FILE.exists():
+            signals = pd.read_csv(SIGNAL_JOURNAL_FILE)
+            summary["signals_recorded"] = int(len(signals))
+
+        if QUOTE_JOURNAL_FILE.exists():
+            quotes = pd.read_csv(QUOTE_JOURNAL_FILE)
+            summary["quote_observations"] = int(len(quotes))
+
+        if OUTCOME_JOURNAL_FILE.exists():
+            outcomes = pd.read_csv(OUTCOME_JOURNAL_FILE)
+            summary["outcomes_recorded"] = int(len(outcomes))
+
+            if "is_actual_execution" in outcomes.columns:
+                actual_values = (
+                    outcomes["is_actual_execution"]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                )
+
+                summary["actual_executions"] = int(
+                    actual_values.isin(
+                        {"true", "1", "yes"}
+                    ).sum()
+                )
+
+            if "midpoint_change_percent" in outcomes.columns:
+                values = pd.to_numeric(
+                    outcomes["midpoint_change_percent"],
+                    errors="coerce",
+                ).dropna()
+
+                if not values.empty:
+                    summary["mean_midpoint_change_percent"] = (
+                        float(values.mean())
+                    )
+
+            if "bid_to_ask_change_percent" in outcomes.columns:
+                values = pd.to_numeric(
+                    outcomes["bid_to_ask_change_percent"],
+                    errors="coerce",
+                ).dropna()
+
+                if not values.empty:
+                    summary["mean_bid_to_ask_change_percent"] = (
+                        float(values.mean())
+                    )
+
+    except Exception:
+        log.exception("Unable to build journal summary.")
+        summary["error"] = "JOURNAL_SUMMARY_FAILED"
+
+    return summary
+
+
+# ============================================================
+# END OF PART 5/6
+# ============================================================
+
+# ============================================================
+# صَفاء التحليل — SPY 0DTE AI ADVISOR v21.4
+# PART 6/6 — FINAL VALIDATION • TELEGRAM • MAIN LOOP
+#
+# RECOMMENDATIONS ONLY
+# NO AUTOMATIC ORDER EXECUTION
+# ============================================================
+
+import os
+import time
+import inspect
+import requests
+from datetime import datetime, timedelta, timezone
+
+
+# ============================================================
+# 61. TELEGRAM CONFIGURATION
+# ============================================================
+
+TG_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", ""
+).strip()
+
+TG_CHAT = os.getenv(
+    "TELEGRAM_CHAT_ID", ""
+).strip()
+
+TELEGRAM_TIMEOUT_SECONDS = _i(
+    "TELEGRAM_TIMEOUT_SECONDS", 12
+)
+
+TELEGRAM_ENABLED = _b(
+    "TELEGRAM_ENABLED", True
+)
+
+POLL_SECONDS = max(
+    10,
+    _i("POLL_SECONDS", 30),
+)
+
+SIGNAL_COOLDOWN_MINUTES = max(
+    1,
+    _i("SIGNAL_COOLDOWN_MINUTES", 20),
+)
+
+MAX_DATA_AGE_SECONDS = max(
+    30,
+    _i("MAX_DATA_AGE_SECONDS", 600),
+)
+
+FINAL_SPOT_CHANGE_LIMIT_PERCENT = max(
+    0.0,
+    _f("FINAL_SPOT_CHANGE_LIMIT_PERCENT", 0.15),
+)
+
+# Local in-process state. Restarting the program resets this state;
+# journal records remain available on disk.
+_LAST_SIGNAL_AT = {}
+_LAST_SIGNAL_KEY = None
+_STOP_REQUESTED = False
+
+
+# ============================================================
+# 62. GENERAL HELPERS
+# ============================================================
+
+def _resolve_callable(*names):
+    """Find the first available callable from a list of names."""
+    for name in names:
+        candidate = globals().get(name)
+
+        if callable(candidate):
+            return candidate
+
+    return None
+
+
+def _call_compatible(function, **kwargs):
+    """
+    Call a function using only keyword parameters it accepts.
+    If signature inspection is unavailable, try the full keyword set.
+    """
+    try:
+        signature = inspect.signature(function)
+
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+        if accepts_kwargs:
+            return function(**kwargs)
+
+        accepted = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
+
+        return function(**accepted)
+
     except (TypeError, ValueError):
-        return default
+        return function(**kwargs)
 
 
-def directional_votes(latest):
-    rsi = _num(latest, "rsi")
-    macd = _num(latest, "macd_hist_pct")
-    velocity = _num(latest, "momentum_velocity", 0.0)
+def _normalise_direction(value):
+    """Normalize common model direction labels."""
+    text_value = str(value or "").strip().upper()
 
-    spx_up = (_num(latest, "ret_1") > 0 and _num(latest, "ema_spread") > 0 and macd > 0 and 45 <= rsi <= 75 and velocity > -0.2)
-    spx_down = (_num(latest, "ret_1") < 0 and _num(latest, "ema_spread") < 0 and macd < 0 and 25 <= rsi <= 55 and velocity < 0.2)
+    if text_value in {
+        "CALL", "BULL", "BULLISH", "UP", "BUY_CALL"
+    }:
+        return "CALL"
 
-    spy_up = (_num(latest, "spy_ret_1") > 0 and _num(latest, "spy_ema_spread") > 0 and _num(latest, "spy_macd_hist_pct") > 0 and 45 <= _num(latest, "spy_rsi") <= 75)
-    spy_down = (_num(latest, "spy_ret_1") < 0 and _num(latest, "spy_ema_spread") < 0 and _num(latest, "spy_macd_hist_pct") < 0 and 25 <= _num(latest, "spy_rsi") <= 55)
+    if text_value in {
+        "PUT", "BEAR", "BEARISH", "DOWN", "BUY_PUT"
+    }:
+        return "PUT"
 
-    qqq_up = (_num(latest, "qqq_ret_1") > 0 and _num(latest, "qqq_ema_spread") > 0 and _num(latest, "qqq_macd_hist_pct") > 0 and 45 <= _num(latest, "qqq_rsi") <= 75)
-    qqq_down = (_num(latest, "qqq_ret_1") < 0 and _num(latest, "qqq_ema_spread") < 0 and _num(latest, "qqq_macd_hist_pct") < 0 and 25 <= _num(latest, "qqq_rsi") <= 55)
-
-    m15_up = (_num(latest, "m15_ret_1") > 0 and _num(latest, "m15_ema_spread") > 0 and _num(latest, "m15_macd_hist_pct") > 0)
-    m15_down = (_num(latest, "m15_ret_1") < 0 and _num(latest, "m15_ema_spread") < 0 and _num(latest, "m15_macd_hist_pct") < 0)
-
-    up = sum(map(bool, [spx_up, spy_up, qqq_up, m15_up]))
-    down = sum(map(bool, [spx_down, spy_down, qqq_down, m15_down]))
-    return up, down
+    return "WAIT"
 
 
-def calculate_signal(df, model, feature_cols, auc):
-    if not np.isfinite(auc) or auc < MIN_AUC:
-        return "WAIT", 0.0, f"AUC={auc:.3f} أقل من الحد"
+def _as_float(value):
+    try:
+        result = float(value)
 
-    latest = df.iloc[-1]
-    x = latest[feature_cols].to_frame().T
+        if not math.isfinite(result):
+            return None
 
-    p_up = float(model.predict_proba(x)[0, 1])
-    p_down = 1.0 - p_up
+        return result
 
-    up_votes, down_votes = directional_votes(latest)
-    adx = _num(latest, "adx")
-    velocity = abs(_num(latest, "momentum_velocity", 0.0))
-
-    if np.isfinite(adx) and adx < 14:
-        return "WAIT", max(p_up, p_down), f"ADX={adx:.1f}: سوق عرضي"
-    if np.isfinite(velocity) and velocity < 0.15:
-        return "WAIT", max(p_up, p_down), f"سرعة الزخم منخفضة ({velocity:.2f})"
-
-    if p_up >= MIN_CONFIDENCE and up_votes >= MIN_DIRECTION_VOTES:
-        if down_votes > 0:
-            return "WAIT", p_up, "تعارض مع الهبوط"
-        return "CALL", p_up, f"صعودي={p_up:.1%}"
-
-    if p_down >= MIN_CONFIDENCE and down_votes >= MIN_DIRECTION_VOTES:
-        if up_votes > 0:
-            return "WAIT", p_down, "تعارض مع الصعود"
-        return "PUT", p_down, f"هبوطي={p_down:.1%}"
-
-    return "WAIT", max(p_up, p_down), "ثقة غير كافية"
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
-# ======================== TELEGRAM ===========================
+def _utc_datetime(value):
+    if isinstance(value, datetime):
+        return to_utc(value)
+
+    if value is None:
+        return None
+
+    return to_utc(value)
+
+
+def _data_timestamp_is_fresh(timestamp, max_age_seconds=None):
+    """
+    Fail closed when a timestamp is absent, invalid, or too old.
+    A small future timestamp tolerance accommodates clock skew.
+    """
+    parsed = _utc_datetime(timestamp)
+
+    if parsed is None:
+        return False, "TIMESTAMP_MISSING_OR_INVALID"
+
+    current = now_utc()
+    age = (current - parsed).total_seconds()
+
+    if age < -2:
+        return False, "TIMESTAMP_IN_FUTURE"
+
+    maximum = (
+        max_age_seconds
+        if max_age_seconds is not None
+        else MAX_DATA_AGE_SECONDS
+    )
+
+    if age > maximum:
+        return False, f"STALE_DATA_{age:.1f}_SECONDS"
+
+    return True, "FRESH"
+
+
+# ============================================================
+# 63. TELEGRAM DELIVERY
+# ============================================================
 
 def send_telegram(message):
+    """
+    Send one Telegram message.
+    Returns True only when Telegram confirms successful delivery.
+    """
+    if not TELEGRAM_ENABLED:
+        log.info("Telegram is disabled.")
+        return False
+
     if not TG_TOKEN or not TG_CHAT:
-        return False
-    try:
-        response = HTTP.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": message, "disable_web_page_preview": True},
-            timeout=20,
+        log.warning(
+            "Telegram unavailable: TELEGRAM_BOT_TOKEN or "
+            "TELEGRAM_CHAT_ID is missing."
         )
-        return response.status_code < 400 and response.json().get("ok", False)
-    except Exception:
         return False
 
+    endpoint = (
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    )
 
-# ======================== OPTIONS CONTRACTS =================-
-
-def get_spxw_contracts(direction):
-    try:
-        today = ny_now().date().isoformat()
-        params = {
-            "underlying_symbols": "SPX",
-            "expiration_date": today,
-            "type": "call" if direction == "CALL" else "put",
-            "status": "active",
-            "limit": 1000,
-        }
-        response = HTTP.get(f"{TRADE_URL}/v2/options/contracts", headers=alpaca_headers(), params=params, timeout=25)
-        if response.status_code >= 400:
-            return []
-        payload = response.json()
-        contracts = payload.get("option_contracts") or payload.get("contracts") or []
-        results = []
-        for item in contracts:
-            symbol = item.get("symbol", "")
-            root = item.get("root_symbol", "")
-            if not symbol or (root != "SPXW" and not symbol.startswith("SPXW")):
-                continue
-            try:
-                strike = float(item["strike_price"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if str(item.get("expiration_date", ""))[:10] != today:
-                continue
-            results.append({"symbol": symbol, "strike": strike, "expiration": today})
-        return results
-    except Exception:
-        return []
-
-
-def get_option_quotes(symbols):
-    results = {}
-    endpoint = f"{DATA_URL}/v1beta1/options/quotes/latest"
-    for start in range(0, len(symbols), 100):
-        batch = symbols[start:start + 100]
-        try:
-            response = HTTP.get(endpoint, headers=alpaca_headers(), params={"symbols": ",".join(batch), "feed": OPTIONS_FEED}, timeout=25)
-            if response.status_code < 400:
-                quotes = response.json().get("quotes", {}) or {}
-                if isinstance(quotes, dict):
-                    results.update(quotes)
-        except Exception:
-            pass
-    return results
-
-
-def get_option_snapshots(symbols):
-    results = {}
-    endpoint = f"{DATA_URL}/v1beta1/options/snapshots"
-    for start in range(0, len(symbols), 100):
-        batch = symbols[start:start + 100]
-        try:
-            response = HTTP.get(endpoint, headers=alpaca_headers(), params={"symbols": ",".join(batch), "feed": OPTIONS_FEED}, timeout=25)
-            if response.status_code < 400:
-                payload = response.json().get("snapshots", {}) or {}
-                if isinstance(payload, dict):
-                    results.update(payload)
-        except Exception:
-            pass
-    return results
-
-
-def quote_timestamp(quote):
-    if not isinstance(quote, dict):
-        return None
-    for key in ("t", "timestamp", "time"):
-        ts = parse_timestamp(quote.get(key))
-        if ts is not None:
-            return ts
-    return None
-
-
-def number_from(quote, *keys):
-    if not isinstance(quote, dict):
-        return None
-    for key in keys:
-        try:
-            value = float(quote.get(key))
-            if np.isfinite(value):
-                return value
-        except (TypeError, ValueError):
-            pass
-    return None
-
-
-def normalize_quote(quote):
-    if not isinstance(quote, dict):
-        return None
-    ts = quote_timestamp(quote)
-    age = age_seconds(ts) if ts else None
-    if age is None or age < -30 or age > MAX_OPTION_QUOTE_AGE_SECONDS:
-        return None
-
-    bid = number_from(quote, "bp", "bid_price", "bid")
-    ask = number_from(quote, "ap", "ask_price", "ask")
-    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
-        return None
-    mid = (bid + ask) / 2
-    if mid <= 0:
-        return None
-    return {
-        "bid": bid, "ask": ask, "mid": mid,
-        "spread_pct": (ask - bid) / mid,
-        "quote_ts": ts, "quote_age_seconds": age,
+    payload = {
+        "chat_id": TG_CHAT,
+        "text": str(message),
+        "disable_web_page_preview": True,
     }
 
-
-def find_greeks_timestamp(snapshot, greeks):
-    for container in (greeks, snapshot):
-        if not isinstance(container, dict):
-            continue
-        for key in ("greeks_timestamp", "greeks_time", "calculated_at", "calculation_timestamp"):
-            ts = parse_timestamp(container.get(key))
-            if ts is not None:
-                return ts
-    return None
-
-
-def validate_real_delta(direction, snapshot):
-    if not isinstance(snapshot, dict):
-        return None, None, "لا توجد لقطة"
-    greeks = snapshot.get("greeks") or {}
     try:
-        delta = float(greeks.get("delta"))
-    except (TypeError, ValueError):
-        return None, None, "Delta غير متاحة"
-    if not np.isfinite(delta) or delta == 0 or abs(delta) > 1:
-        return None, None, "Delta غير صالحة"
-    if direction == "CALL" and delta <= 0:
-        return None, None, "Delta لا تتوافق مع CALL"
-    if direction == "PUT" and delta >= 0:
-        return None, None, "Delta لا تتوافق مع PUT"
-    if not MIN_ABS_DELTA <= abs(delta) <= MAX_ABS_DELTA:
-        return None, None, "Delta خارج النطاق"
-    
-    greeks_ts = find_greeks_timestamp(snapshot, greeks)
-    if greeks_ts is not None:
-        if age_seconds(greeks_ts) > MAX_DELTA_QUOTE_AGE_SECONDS:
-            return None, None, "وقت Greeks قديم"
-        return delta, greeks_ts, "وقت Greeks مستقل"
-    
-    if REQUIRE_INDEPENDENT_GREEKS_TIMESTAMP:
-        return None, None, "المصدر لا يوفر توقيت Greeks مستقل"
-    
-    latest_quote = snapshot.get("latestQuote") or snapshot.get("latest_quote") or {}
-    proxy_ts = quote_timestamp(latest_quote)
-    if age_seconds(proxy_ts) > MAX_DELTA_QUOTE_AGE_SECONDS:
-        return None, None, "توقيت Delta المرجعي قديم"
-    return delta, proxy_ts, "توقيت مرجعي تقريبي"
-
-
-def get_dynamic_max_spread():
-    now = ny_now()
-    current_minutes = now.hour * 60 + now.minute
-    close_minutes = 16 * 60
-    if (close_minutes - current_minutes) <= 30:
-        return BASE_MAX_SPREAD_PCT * 0.75
-    return BASE_MAX_SPREAD_PCT
-
-
-def evaluate_contract(contract, direction, spot_price, spot_ts, quote, snapshot):
-    q = normalize_quote(quote)
-    if q is None:
-        return None
-    if q["spread_pct"] > get_dynamic_max_spread():
-        return None
-    if not MIN_OPTION_PREMIUM <= q["ask"] <= MAX_OPTION_PREMIUM:
-        return None
-
-    delta, delta_ts, delta_basis = validate_real_delta(direction, snapshot)
-    if delta is None or delta_ts is None:
-        return None
-
-    spot_quote_gap = timestamp_gap_seconds(spot_ts, q["quote_ts"])
-    if spot_quote_gap is None or spot_quote_gap > MAX_SPOT_OPTION_GAP_SECONDS:
-        return None
-
-    return {
-        **contract, **q,
-        "delta": delta,
-        "delta_ts": delta_ts,
-        "delta_timestamp_basis": delta_basis,
-        "delta_quote_age_seconds": age_seconds(delta_ts),
-        "distance": abs(contract["strike"] - spot_price),
-        "spot_quote_gap_seconds": spot_quote_gap,
-    }
-
-
-def choose_contract(direction, spot_price, spot_ts):
-    if not valid_timestamp_age(spot_ts, MAX_SPOT_AGE_SECONDS):
-        return None
-    contracts = get_spxw_contracts(direction)
-    if not contracts:
-        return None
-
-    if direction == "CALL":
-        contracts = [c for c in contracts if MIN_TARGET_DISTANCE <= c["strike"] - spot_price <= MAX_TARGET_DISTANCE]
-    else:
-        contracts = [c for c in contracts if MIN_TARGET_DISTANCE <= spot_price - c["strike"] <= MAX_TARGET_DISTANCE]
-
-    if not contracts:
-        return None
-
-    contracts.sort(key=lambda c: abs(c["strike"] - spot_price))
-    candidates = contracts[:MAX_CONTRACTS_TO_CHECK]
-    symbols = [c["symbol"] for c in candidates]
-
-    quotes = get_option_quotes(symbols)
-    snapshots = get_option_snapshots(symbols)
-    viable = []
-
-    for contract in candidates:
-        selected = evaluate_contract(
-            contract, direction, spot_price, spot_ts,
-            quotes.get(contract["symbol"]), snapshots.get(contract["symbol"])
+        response = requests.post(
+            endpoint,
+            json=payload,
+            timeout=TELEGRAM_TIMEOUT_SECONDS,
         )
-        if selected:
-            viable.append(selected)
 
-    if not viable:
-        return None
+        response.raise_for_status()
 
-    viable.sort(key=lambda c: (abs(abs(c["delta"]) - TARGET_ABS_DELTA), c["spread_pct"], c["distance"]))
-    return viable[0]
+        body = response.json()
+
+        if not body.get("ok", False):
+            log.error(
+                "Telegram rejected message: %s",
+                body,
+            )
+            return False
+
+        log.info("Telegram message delivered successfully.")
+        return True
+
+    except Exception:
+        log.exception("Telegram delivery failed.")
+        return False
 
 
-# ======================== OUTCOME JOURNAL ====================
+# ============================================================
+# 64. MESSAGE FORMATTING
+# ============================================================
 
-def journal_columns():
-    cols = [
-        "signal_time_utc", "direction", "symbol", "spot", "spot_quote_time_utc",
-        "strike", "entry_bid_observed", "entry_ask_observed", "entry_mid_observed",
-        "entry_delta", "delta_timestamp_basis", "confidence", "auc_direction_only",
-        "quote_time_utc", "journal_type",
+def build_telegram_message(
+    signal_id,
+    prediction,
+    recommendation,
+):
+    """
+    Format a concise recommendation.
+    Values are observations, not guaranteed fills or profits.
+    """
+    candidate = recommendation.get("candidate", {})
+    sizing = recommendation.get("sizing", {})
+
+    direction = _normalise_direction(
+        prediction.get("signal")
+        or prediction.get("direction")
+    )
+
+    direction_ar = (
+        "شراء كول (CALL)"
+        if direction == "CALL"
+        else "شراء بوت (PUT)"
+        if direction == "PUT"
+        else "انتظار"
+    )
+
+    spot = _as_float(
+        recommendation.get("underlying_price")
+    )
+
+    confidence = _as_float(
+        prediction.get("confidence")
+    )
+
+    if confidence is not None and confidence <= 1:
+        confidence *= 100
+
+    probability_up = _as_float(
+        prediction.get("probability_up")
+    )
+
+    probability_down = _as_float(
+        prediction.get("probability_down")
+    )
+
+    if probability_up is not None and probability_up <= 1:
+        probability_up *= 100
+
+    if probability_down is not None and probability_down <= 1:
+        probability_down *= 100
+
+    symbol = str(candidate.get("symbol") or "غير متاح")
+    expiry = str(
+        candidate.get("expiration_date") or "غير متاح"
+    )
+
+    strike = _as_float(candidate.get("strike"))
+    bid = _as_float(candidate.get("bid"))
+    ask = _as_float(candidate.get("ask"))
+    midpoint = _as_float(candidate.get("midpoint"))
+    spread = _as_float(candidate.get("spread_percent"))
+    delta = _as_float(candidate.get("delta"))
+
+    contracts = sizing.get("contracts")
+    cost = _as_float(
+        sizing.get("estimated_cost_per_contract")
+    )
+    total_cost = _as_float(
+        sizing.get("estimated_total_cost")
+    )
+
+    def fmt(value, digits=2):
+        return (
+            f"{value:,.{digits}f}"
+            if value is not None
+            else "غير متاح"
+        )
+
+    lines = [
+        "📊 صَفاء التحليل — SPY 0DTE",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📌 الإشارة: {direction_ar}",
+        f"🆔 رقم التوصية: {signal_id}",
+        f"💹 سعر SPY وقت الفحص: {fmt(spot)}",
+        f"🧠 ثقة النموذج: {fmt(confidence, 1)}%",
     ]
-    for minutes in OUTCOME_MINUTES:
-        cols += [
-            f"bid_observed_after_{minutes}m", f"ask_observed_after_{minutes}m",
-            f"observation_time_{minutes}m_utc", f"source_quote_time_{minutes}m_utc",
-            f"observation_delay_seconds_{minutes}m", f"observed_bid_change_vs_entry_ask_{minutes}m",
-        ]
-    return cols
+
+    if probability_up is not None:
+        lines.append(
+            f"📈 احتمال الصعود المقدّر: {fmt(probability_up, 1)}%"
+        )
+
+    if probability_down is not None:
+        lines.append(
+            f"📉 احتمال الهبوط المقدّر: {fmt(probability_down, 1)}%"
+        )
+
+    lines.extend([
+        "",
+        "📑 تفاصيل العقد المرصود",
+        f"🔹 الرمز: {symbol}",
+        f"🎯 سعر التنفيذ: {fmt(strike)}",
+        f"📅 الانتهاء: {expiry}",
+        f"🟢 Bid: {fmt(bid)}",
+        f"🔴 Ask: {fmt(ask)}",
+        f"💵 Midpoint: {fmt(midpoint)}",
+        f"↔️ السبريد: {fmt(spread, 3)}%",
+        f"Δ Delta: {fmt(delta, 3)}",
+    ])
+
+    if contracts is not None:
+        lines.append(
+            f"📦 الحجم التقديري: {contracts} عقد"
+        )
+
+    if cost is not None:
+        lines.append(
+            f"💰 تكلفة العقد التقديرية: ${fmt(cost)}"
+        )
+
+    if total_cost is not None:
+        lines.append(
+            f"💰 التكلفة الإجمالية التقديرية: ${fmt(total_cost)}"
+        )
+
+    reason = (
+        prediction.get("reason")
+        or recommendation.get("reason")
+        or "اجتازت التوصية الفلاتر المتاحة"
+    )
+
+    lines.extend([
+        "",
+        f"📝 السبب: {reason}",
+        "",
+        "⚠️ توصية آلية وليست ضمانًا للربح.",
+        "⚠️ الأسعار قد تتغير قبل تنفيذ أي شراء يدوي.",
+        "ℹ️ البوت لا ينفّذ أوامر شراء أو بيع.",
+    ])
+
+    return "\n".join(lines)
 
 
-def read_journal():
-    if not os.path.exists(SIGNAL_LOG_PATH):
-        return pd.DataFrame(columns=journal_columns())
-    df = pd.read_csv(SIGNAL_LOG_PATH)
-    for col in journal_columns():
-        if col not in df.columns:
-            df[col] = np.nan
-    return df
+# ============================================================
+# 65. COOLDOWN / DUPLICATE PROTECTION
+# ============================================================
+
+def signal_key(
+    direction,
+    option_symbol,
+):
+    return (
+        f"{str(direction).upper()}|"
+        f"{str(option_symbol).upper()}"
+    )
 
 
-def write_journal(df):
-    for col in journal_columns():
-        if col not in df.columns:
-            df[col] = np.nan
-    df[journal_columns()].to_csv(SIGNAL_LOG_PATH, index=False)
+def cooldown_active(key):
+    last_time = _LAST_SIGNAL_AT.get(key)
+
+    if last_time is None:
+        return False
+
+    elapsed = (
+        now_utc() - last_time
+    ).total_seconds()
+
+    return elapsed < SIGNAL_COOLDOWN_MINUTES * 60
 
 
-def append_signal_journal(row):
+def mark_signal_sent(key):
+    _LAST_SIGNAL_AT[key] = now_utc()
+
+
+# ============================================================
+# 66. FINAL REVALIDATION
+# ============================================================
+
+def final_revalidation(
+    recommendation,
+    original_spot=None,
+):
+    """
+    Final fail-closed validation before Telegram delivery.
+
+    The underlying and option quote must be re-read using available
+    data functions. If this code cannot identify a compatible live
+    data function, it refuses to send rather than pretending the
+    original quote is still current.
+    """
+    if not isinstance(recommendation, dict):
+        return False, "INVALID_RECOMMENDATION", None
+
+    if not recommendation.get("ok", False):
+        return False, "RECOMMENDATION_NOT_APPROVED", None
+
+    candidate = recommendation.get("candidate")
+
+    if not isinstance(candidate, dict):
+        return False, "MISSING_OPTION_CANDIDATE", None
+
+    option_symbol = candidate.get("symbol")
+
+    if not option_symbol:
+        return False, "MISSING_OPTION_SYMBOL", None
+
+    # Find a live option quote function from the earlier parts.
+    quote_function = _resolve_callable(
+        "get_option_quote",
+        "fetch_option_quote",
+        "get_latest_option_quote",
+        "get_option_quotes",
+    )
+
+    if quote_function is None:
+        return False, "NO_LIVE_OPTION_QUOTE_FUNCTION", None
+
     try:
-        df = read_journal()
-        write_journal(pd.concat([df, pd.DataFrame([row])], ignore_index=True))
-    except Exception:
-        pass
+        fresh_quote = _call_compatible(
+            quote_function,
+            symbol=option_symbol,
+            option_symbol=option_symbol,
+            symbols=[option_symbol],
+            current_time=now_utc(),
+        )
+
+    except Exception as exc:
+        log.exception("Final option quote recheck failed.")
+        return False, f"FINAL_OPTION_QUOTE_ERROR:{exc}", None
+
+    # Some implementations return a dictionary keyed by symbol.
+    if (
+        isinstance(fresh_quote, dict)
+        and option_symbol in fresh_quote
+        and isinstance(fresh_quote[option_symbol], dict)
+    ):
+        fresh_quote = fresh_quote[option_symbol]
+
+    # Some implementations return {"quotes": {...}}.
+    if isinstance(fresh_quote, dict):
+        quote_container = fresh_quote.get("quotes")
+
+        if isinstance(quote_container, dict):
+            fresh_quote = quote_container.get(
+                option_symbol,
+                fresh_quote,
+            )
+
+        elif isinstance(quote_container, list):
+            fresh_quote = next(
+                (
+                    item for item in quote_container
+                    if isinstance(item, dict)
+                    and str(
+                        item.get("symbol")
+                        or item.get("S")
+                        or ""
+                    ).upper() == str(option_symbol).upper()
+                ),
+                fresh_quote,
+            )
+
+    if not isinstance(fresh_quote, dict):
+        return False, "FINAL_OPTION_QUOTE_NOT_FOUND", None
+
+    current = now_utc()
+
+    valid_quote, quote_reason, quote_metrics = (
+        validate_option_quote(
+            fresh_quote,
+            current_time=current,
+        )
+    )
+
+    if not valid_quote:
+        return (
+            False,
+            f"FINAL_QUOTE_REJECTED:{quote_reason}",
+            None,
+        )
+
+    # Reject a material quote deterioration compared with the
+    # contract originally selected.
+    original_ask = _as_float(candidate.get("ask"))
+    fresh_ask = _as_float(quote_metrics.get("ask"))
+
+    if original_ask is None or fresh_ask is None:
+        return False, "MISSING_ASK_FOR_FINAL_COMPARISON", None
+
+    if original_ask <= 0 or fresh_ask <= 0:
+        return False, "INVALID_ASK_FOR_FINAL_COMPARISON", None
+
+    ask_change_pct = (
+        abs(fresh_ask - original_ask) / original_ask
+    ) * 100.0
+
+    # Use the configured limit as a percentage-point guard.
+    # A zero limit means the ask must remain unchanged.
+    if ask_change_pct > max(
+        FINAL_SPOT_CHANGE_LIMIT_PERCENT,
+        0.01,
+    ):
+        return (
+            False,
+            f"OPTION_ASK_CHANGED_{ask_change_pct:.3f}_PCT",
+            None,
+        )
+
+    # Underlying spot must also be refreshed if a compatible
+    # spot function exists. If unavailable, do not claim a fresh
+    # underlying check was completed.
+    spot_function = _resolve_callable(
+        "get_spot",
+        "get_underlying_spot",
+        "get_latest_spot",
+        "get_live_spot",
+    )
+
+    fresh_spot = None
+
+    if spot_function is not None:
+        try:
+            fresh_spot = _call_compatible(
+                spot_function,
+                symbol=PRIMARY_UNDERLYING,
+                underlying=PRIMARY_UNDERLYING,
+                current_time=current,
+            )
+
+            if isinstance(fresh_spot, dict):
+                fresh_spot = (
+                    fresh_spot.get("price")
+                    or fresh_spot.get("spot")
+                    or fresh_spot.get("close")
+                )
+
+            fresh_spot = _as_float(fresh_spot)
+
+        except Exception:
+            log.exception("Final underlying spot recheck failed.")
+            return False, "FINAL_SPOT_RECHECK_FAILED", None
+
+        if fresh_spot is None or fresh_spot <= 0:
+            return False, "FINAL_SPOT_INVALID", None
+
+        baseline_spot = _as_float(original_spot)
+
+        if baseline_spot is not None and baseline_spot > 0:
+            spot_change_pct = (
+                abs(fresh_spot - baseline_spot)
+                / baseline_spot
+            ) * 100.0
+
+            if spot_change_pct > FINAL_SPOT_CHANGE_LIMIT_PERCENT:
+                return (
+                    False,
+                    f"UNDERLYING_MOVED_{spot_change_pct:.3f}_PCT",
+                    None,
+                )
+
+    else:
+        return False, "NO_LIVE_SPOT_RECHECK_FUNCTION", None
+
+    refreshed_candidate = dict(candidate)
+    refreshed_candidate.update({
+        "bid": quote_metrics.get("bid"),
+        "ask": quote_metrics.get("ask"),
+        "midpoint": quote_metrics.get("midpoint"),
+        "spread_percent": quote_metrics.get("spread_percent"),
+        "quote_timestamp": quote_timestamp(fresh_quote),
+        "age_seconds": quote_metrics.get("age_seconds"),
+    })
+
+    refreshed = dict(recommendation)
+    refreshed["candidate"] = refreshed_candidate
+    refreshed["underlying_price"] = fresh_spot
+    refreshed["final_revalidation_at_utc"] = current.isoformat()
+
+    return True, "FINAL_REVALIDATION_PASSED", refreshed
 
 
-def update_outcome_journal():
+# ============================================================
+# 67. MODEL PREDICTION ADAPTER
+# ============================================================
+
+def get_current_prediction():
+    """
+    Adapter for the earlier parts.
+
+    Expected model function:
+        predict_direction(model_bundle, feature_frame)
+
+    Expected market-data function:
+        get_live_bars(symbol=PRIMARY_UNDERLYING, ...)
+
+    Missing or incompatible functions cause a safe WAIT.
+    """
+    bars_function = _resolve_callable(
+        "get_live_bars",
+        "get_market_bars",
+        "get_underlying_bars",
+    )
+
+    feature_function = _resolve_callable(
+        "make_features",
+        "build_features",
+        "create_features",
+    )
+
+    training_function = _resolve_callable(
+        "train_model",
+        "train_direction_model",
+        "get_model",
+    )
+
+    prediction_function = _resolve_callable(
+        "predict_direction",
+        "calculate_prediction",
+    )
+
+    if bars_function is None:
+        return {
+            "ok": False,
+            "reason": "LIVE_BARS_FUNCTION_NOT_FOUND",
+        }
+
+    if feature_function is None:
+        return {
+            "ok": False,
+            "reason": "FEATURE_FUNCTION_NOT_FOUND",
+        }
+
+    if training_function is None:
+        return {
+            "ok": False,
+            "reason": "MODEL_TRAINING_FUNCTION_NOT_FOUND",
+        }
+
+    if prediction_function is None:
+        return {
+            "ok": False,
+            "reason": "PREDICTION_FUNCTION_NOT_FOUND",
+        }
+
     try:
-        if not os.path.exists(SIGNAL_LOG_PATH):
-            return
-        df = read_journal()
-        if df.empty:
-            return
+        bars = _call_compatible(
+            bars_function,
+            symbol=PRIMARY_UNDERLYING,
+            timeframe=TIMEFRAME,
+            history_days=HISTORY_DAYS,
+            days=HISTORY_DAYS,
+        )
 
-        now = utc_now()
-        pending = {}
-        for idx, row in df.iterrows():
-            symbol = row.get("symbol")
-            start = parse_timestamp(row.get("signal_time_utc"))
-            if not isinstance(symbol, str) or not symbol or start is None:
-                continue
-            elapsed = (now - start).total_seconds()
-            for minutes in OUTCOME_MINUTES:
-                if pd.isna(row.get(f"bid_observed_after_{minutes}m")) and elapsed >= minutes * 60:
-                    pending.setdefault(symbol, []).append({"idx": idx, "start": start, "minutes": minutes, "entry_ask": row.get("entry_ask_observed")})
+        if bars is None or len(bars) == 0:
+            return {
+                "ok": False,
+                "reason": "NO_LIVE_BARS",
+            }
 
-        if not pending:
-            return
+        # Require a timestamp column or datetime index. A frame
+        # without a verifiable latest timestamp is rejected.
+        latest_timestamp = None
 
-        quotes = get_option_quotes(list(pending.keys()))
-        changed = False
-        for symbol, entries in pending.items():
-            q = normalize_quote(quotes.get(symbol))
-            if q is None:
-                continue
-            for item in entries:
-                idx, minutes, target = item["idx"], item["minutes"], item["start"] + timedelta(minutes=minutes)
-                if q["quote_ts"] < target:
-                    continue
-                df.at[idx, f"bid_observed_after_{minutes}m"] = q["bid"]
-                df.at[idx, f"ask_observed_after_{minutes}m"] = q["ask"]
-                df.at[idx, f"observation_time_{minutes}m_utc"] = now.isoformat()
-                df.at[idx, f"source_quote_time_{minutes}m_utc"] = q["quote_ts"].isoformat()
-                df.at[idx, f"observation_delay_seconds_{minutes}m"] = max(0.0, (q["quote_ts"] - target).total_seconds())
-                try:
-                    ea = float(item["entry_ask"])
-                    df.at[idx, f"observed_bid_change_vs_entry_ask_{minutes}m"] = (q["bid"] - ea) / ea if ea > 0 else np.nan
-                except Exception:
-                    pass
-                changed = True
-        if changed:
-            write_journal(df)
-    except Exception:
-        pass
+        if isinstance(bars, pd.DataFrame):
+            for column in (
+                "timestamp",
+                "time",
+                "datetime",
+                "t",
+            ):
+                if column in bars.columns:
+                    latest_timestamp = bars[column].iloc[-1]
+                    break
+
+            if latest_timestamp is None:
+                latest_timestamp = bars.index[-1]
+
+        fresh, freshness_reason = _data_timestamp_is_fresh(
+            latest_timestamp
+        )
+
+        if not fresh:
+            return {
+                "ok": False,
+                "reason": f"UNDERLYING_DATA_{freshness_reason}",
+            }
+
+        features = _call_compatible(
+            feature_function,
+            bars=bars,
+            df=bars,
+            data=bars,
+        )
+
+        if features is None or len(features) == 0:
+            return {
+                "ok": False,
+                "reason": "FEATURE_FRAME_EMPTY",
+            }
+
+        model_bundle = _call_compatible(
+            training_function,
+            data=features,
+            features=features,
+            df=features,
+        )
+
+        if isinstance(model_bundle, tuple):
+            # Accommodate common train_model returns:
+            # (model, feature_names, auc, accuracy).
+            model = model_bundle[0] if model_bundle else None
+
+            model_bundle = {
+                "model": model,
+                "enabled": model is not None,
+                "reasons": [],
+            }
+
+        if not isinstance(model_bundle, dict):
+            model_bundle = {
+                "model": model_bundle,
+                "enabled": model_bundle is not None,
+                "reasons": [],
+            }
+
+        journal_model_run(model_bundle)
+
+        if not model_bundle.get("enabled", False):
+            return {
+                "ok": False,
+                "reason": "MODEL_GATE_DISABLED",
+                "model_bundle": model_bundle,
+            }
+
+        latest_features = features.tail(1)
+
+        prediction = _call_compatible(
+            prediction_function,
+            model_bundle=model_bundle,
+            model=model_bundle,
+            features=latest_features,
+            latest=latest_features,
+            data=latest_features,
+        )
+
+        if not isinstance(prediction, dict):
+            return {
+                "ok": False,
+                "reason": "PREDICTION_RETURN_TYPE_UNSUPPORTED",
+            }
+
+        direction = _normalise_direction(
+            prediction.get("signal")
+            or prediction.get("direction")
+        )
+
+        if direction == "WAIT":
+            return {
+                "ok": False,
+                "reason": prediction.get(
+                    "reason",
+                    "MODEL_DIRECTION_IS_WAIT",
+                ),
+                "prediction": prediction,
+                "model_bundle": model_bundle,
+            }
+
+        prediction["signal"] = direction
+
+        return {
+            "ok": True,
+            "prediction": prediction,
+            "model_bundle": model_bundle,
+            "bars": bars,
+            "features": features,
+            "latest_features": latest_features,
+        }
+
+    except Exception as exc:
+        log.exception("Current prediction failed.")
+        return {
+            "ok": False,
+            "reason": f"PREDICTION_PIPELINE_ERROR:{exc}",
+        }
 
 
-def is_duplicate(direction, symbol):
-    key = f"{direction}:{symbol}"
-    last = LAST_ALERTS.get(key)
-    return bool(last and (utc_now() - last).total_seconds() < ALERT_COOLDOWN_MINUTES * 60)
+# ============================================================
+# 68. UNDERLYING SPOT ADAPTER
+# ============================================================
+
+def get_current_underlying_spot():
+    spot_function = _resolve_callable(
+        "get_spot",
+        "get_underlying_spot",
+        "get_latest_spot",
+        "get_live_spot",
+    )
+
+    if spot_function is None:
+        return None, "SPOT_FUNCTION_NOT_FOUND"
+
+    try:
+        result = _call_compatible(
+            spot_function,
+            symbol=PRIMARY_UNDERLYING,
+            underlying=PRIMARY_UNDERLYING,
+            current_time=now_utc(),
+        )
+
+        if isinstance(result, dict):
+            price = (
+                result.get("price")
+                or result.get("spot")
+                or result.get("close")
+            )
+        else:
+            price = result
+
+        price = _as_float(price)
+
+        if price is None or price <= 0:
+            return None, "SPOT_INVALID"
+
+        return price, "SPOT_OK"
+
+    except Exception as exc:
+        log.exception("Unable to fetch current spot.")
+        return None, f"SPOT_ERROR:{exc}"
 
 
-def mark_alert_sent(direction, symbol):
-    LAST_ALERTS[f"{direction}:{symbol}"] = utc_now()
+# ============================================================
+# 69. CONTRACT SELECTION ADAPTER
+# ============================================================
 
+def get_recommendation_candidate(
+    direction,
+    spot,
+):
+    """
+    Use the contract-selection function defined in earlier parts.
+    No candidate means no alert.
+    """
+    selector = _resolve_callable(
+        "find_option_recommendation_candidate",
+        "choose_option_candidate",
+        "select_option_candidate",
+        "choose_contract",
+    )
+
+    if selector is None:
+        return {
+            "ok": False,
+            "reason": "OPTION_SELECTION_FUNCTION_NOT_FOUND",
+        }
+
+    try:
+        result = _call_compatible(
+            selector,
+            direction=direction,
+            signal=direction,
+            underlying=PRIMARY_UNDERLYING,
+            underlying_price=spot,
+            spot=spot,
+            current_time=now_utc(),
+        )
+
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "reason": "OPTION_SELECTOR_RETURN_TYPE_UNSUPPORTED",
+            }
+
+        # A selector may return a candidate directly rather than
+        # the full {"ok": ..., "candidate": ...} structure.
+        if (
+            "candidate" not in result
+            and result.get("symbol")
+        ):
+            result = {
+                "ok": True,
+                "candidate": result,
+                "underlying": PRIMARY_UNDERLYING,
+                "underlying_price": spot,
+                "sizing": {},
+            }
+
+        if not result.get("ok", False):
+            return result
+
+        if not isinstance(result.get("candidate"), dict):
+            return {
+                "ok": False,
+                "reason": "OPTION_CANDIDATE_MISSING",
+            }
+
+        result.setdefault("underlying", PRIMARY_UNDERLYING)
+        result.setdefault("underlying_price", spot)
+        result.setdefault("sizing", {})
+
+        return result
+
+    except Exception as exc:
+        log.exception("Option candidate selection failed.")
+        return {
+            "ok": False,
+            "reason": f"OPTION_SELECTION_ERROR:{exc}",
+        }
+
+
+# ============================================================
+# 70. MAIN SCAN
+# ============================================================
 
 def run_scan():
-    log(f"========== بدء فحص | {BOT_NAME} v{VERSION} ==========")
-    update_outcome_journal()
+    """
+    One scan cycle.
 
-    if not API_KEY or not API_SECRET:
-        return
+    Workflow:
+      1. Obtain fresh model prediction.
+      2. Obtain fresh underlying spot.
+      3. Select an option contract.
+      4. Apply final quote and spot revalidation.
+      5. Check duplicate cooldown.
+      6. Journal recommendation.
+      7. Send Telegram.
 
-    spx = get_spx_bars()
-    spy = get_stock_bars("SPY")
-    qqq = get_stock_bars("QQQ")
+    No orders are submitted.
+    """
+    log.info("Starting scan for %s.", PRIMARY_UNDERLYING)
 
-    if spx.empty or spy.empty or qqq.empty:
-        return
+    prediction_result = get_current_prediction()
 
-    # ربط حداثة الإشارة بالتوقيت الحقيقي لآخر شمعة مكتملة
-    last_bar_ts = spx.index[-1].to_pydatetime()
-    bar_age_sec = (utc_now() - last_bar_ts).total_seconds()
-    if bar_age_sec > MAX_SIGNAL_AGE_BEFORE_SEND_SECONDS + 60:
-        log("[الإشارة] WAIT — الشمعة الأخيرة قديمة جداً لتوليد إشارة موثوقة", "warning")
-        return
+    if not prediction_result.get("ok", False):
+        log.info(
+            "No signal: %s",
+            prediction_result.get("reason"),
+        )
+        return {
+            "ok": False,
+            "stage": "PREDICTION",
+            "reason": prediction_result.get("reason"),
+        }
 
-    spot_price, spot_ts = get_spx_spot()
-    if spot_price is None or spot_ts is None:
-        return
+    prediction = prediction_result["prediction"]
+    model_bundle = prediction_result.get("model_bundle", {})
 
-    try:
-        merged = make_features(spx, spy, qqq)
-        model, columns, auc, accuracy, baseline = train_model(merged)
-        direction, confidence, reason = calculate_signal(merged, model, columns, auc)
+    direction = _normalise_direction(
+        prediction.get("signal")
+        or prediction.get("direction")
+    )
 
-        log(f"[الإشارة] {direction} | الثقة={confidence:.1%} | AUC={auc:.3f} | السبب={reason}")
-        if direction == "WAIT":
-            return
+    if direction == "WAIT":
+        log.info("Patient mode: model direction is WAIT.")
+        return {
+            "ok": False,
+            "stage": "DIRECTION",
+            "reason": "DIRECTION_WAIT",
+        }
 
-        contract = choose_contract(direction, spot_price, spot_ts)
-        if contract is None or is_duplicate(direction, contract["symbol"]):
-            return
+    spot, spot_reason = get_current_underlying_spot()
 
-        # ==========================================
-        # إعادة التحقق الفوري (Pre-Send Re-Validation)
-        # ==========================================
-        fresh_spot, fresh_spot_ts = get_spx_spot()
-        if fresh_spot is None or not valid_timestamp_age(fresh_spot_ts, MAX_SPOT_AGE_SECONDS):
-            log("[الإشارة] WAIT — فشل التحقق الفوري لـ SPX قبل الإرسال", "warning")
-            return
+    if spot is None:
+        log.warning("No recommendation: %s", spot_reason)
+        return {
+            "ok": False,
+            "stage": "SPOT",
+            "reason": spot_reason,
+        }
 
-        fresh_quotes = get_option_quotes([contract["symbol"]])
-        fresh_snapshots = get_option_snapshots([contract["symbol"]])
-        rechecked_contract = evaluate_contract(
-            contract, direction, fresh_spot, fresh_spot_ts,
-            fresh_quotes.get(contract["symbol"]), fresh_snapshots.get(contract["symbol"])
+    recommendation = get_recommendation_candidate(
+        direction=direction,
+        spot=spot,
+    )
+
+    if not recommendation.get("ok", False):
+        reason = recommendation.get(
+            "reason",
+            "NO_QUALIFIED_OPTION",
         )
 
-        if rechecked_contract is None:
-            log("[الإشارة] WAIT — العقد لم يعد يجتاز الشروط الصارمة عند إعادة التحقق الفوري", "warning")
-            return
+        log.info("Patient mode: %s", reason)
 
-        contract.update(rechecked_contract)
-        signal_time = utc_now()
+        return {
+            "ok": False,
+            "stage": "CONTRACT",
+            "reason": reason,
+        }
 
-        # فحص الحداثة النهائي قبل الإرسال الفعلي
-        if (signal_time - last_bar_ts).total_seconds() > MAX_SIGNAL_AGE_BEFORE_SEND_SECONDS + 120:
-            log("[الإشارة] WAIT — تجاوز وقت الإرسال الحد الأقصى للحداثة", "warning")
-            return
+    # Re-read spot and option quote immediately before any alert.
+    passed, recheck_reason, refreshed = final_revalidation(
+        recommendation=recommendation,
+        original_spot=spot,
+    )
 
-        message = (
-            f"🦅 صَفاء التحليل — v{VERSION}\n"
-            f"🟢 اتجاه: {direction} | ثقة: {confidence:.1%}\n"
-            f"💹 SPX (المُحقق): {fresh_spot:,.2f} | التنفيذ: {contract['strike']:,.2f}\n"
-            f"🧮 Delta: {contract['delta']:+.3f} | السبريد: {contract['spread_pct']:.1%}\n"
-            f"📌 السبب: {reason}"
+    if not passed:
+        log.info(
+            "Final revalidation rejected the signal: %s",
+            recheck_reason,
+        )
+        return {
+            "ok": False,
+            "stage": "FINAL_REVALIDATION",
+            "reason": recheck_reason,
+        }
+
+    recommendation = refreshed
+
+    candidate = recommendation["candidate"]
+
+    key = signal_key(
+        direction,
+        candidate.get("symbol"),
+    )
+
+    if cooldown_active(key):
+        log.info(
+            "Duplicate signal suppressed by cooldown: %s",
+            key,
+        )
+        return {
+            "ok": False,
+            "stage": "COOLDOWN",
+            "reason": "DUPLICATE_SIGNAL_COOLDOWN",
+        }
+
+    signal_id = create_signal_id(
+        underlying=PRIMARY_UNDERLYING,
+        direction=direction,
+        option_symbol=candidate.get("symbol"),
+        created_at=now_utc(),
+    )
+
+    journal_ok, journal_status = journal_signal(
+        signal_id=signal_id,
+        prediction=prediction,
+        recommendation=recommendation,
+        model_bundle=model_bundle,
+        reason=prediction.get("reason", ""),
+    )
+
+    # If the recommendation cannot be journaled, do not send an
+    # alert that cannot be audited afterward.
+    if not journal_ok:
+        log.error(
+            "Signal suppressed because journal write failed: %s",
+            journal_status,
+        )
+        return {
+            "ok": False,
+            "stage": "JOURNAL",
+            "reason": journal_status,
+        }
+
+    message = build_telegram_message(
+        signal_id=signal_id,
+        prediction=prediction,
+        recommendation=recommendation,
+    )
+
+    delivered = send_telegram(message)
+
+    if delivered:
+        mark_signal_sent(key)
+
+        log.info(
+            "Recommendation sent. signal_id=%s symbol=%s",
+            signal_id,
+            candidate.get("symbol"),
         )
 
-        if send_telegram(message):
-            mark_alert_sent(direction, contract["symbol"])
-            append_signal_journal({
-                "signal_time_utc": signal_time.isoformat(),
-                "direction": direction,
-                "symbol": contract["symbol"],
-                "spot": fresh_spot,
-                "spot_quote_time_utc": fresh_spot_ts.isoformat(),
-                "strike": contract["strike"],
-                "entry_bid_observed": contract["bid"],
-                "entry_ask_observed": contract["ask"],
-                "entry_mid_observed": contract["mid"],
-                "entry_delta": contract["delta"],
-                "delta_timestamp_basis": contract["delta_timestamp_basis"],
-                "confidence": confidence,
-                "auc_direction_only": auc,
-                "quote_time_utc": contract["quote_ts"].isoformat(),
-                "journal_type": "OBSERVED_QUOTES_ONLY_NOT_ACTUAL_EXECUTION",
-            })
-    except Exception as exc:
-        log(f"[خطأ الفحص] {exc}", "error")
+        return {
+            "ok": True,
+            "signal_id": signal_id,
+            "symbol": candidate.get("symbol"),
+            "direction": direction,
+            "telegram_sent": True,
+            "orders_submitted": False,
+        }
+
+    log.warning(
+        "Telegram was not delivered. Signal remains journaled: %s",
+        signal_id,
+    )
+
+    return {
+        "ok": False,
+        "stage": "TELEGRAM",
+        "reason": "TELEGRAM_DELIVERY_FAILED",
+        "signal_id": signal_id,
+        "orders_submitted": False,
+    }
 
 
-def market_is_open():
-    now = ny_now()
-    if now.weekday() >= 5:
-        return False
-    minutes = now.hour * 60 + now.minute
-    return (9 * 60 + 30) <= minutes < 16 * 60
-
+# ============================================================
+# 71. CONTINUOUS MAIN LOOP
+# ============================================================
 
 def main():
-    log(f"بدء تشغيل {BOT_NAME} — v{VERSION}")
-    while True:
-        try:
-            if market_is_open():
-                run_scan()
-            else:
-                log("[السوق] مغلق حالياً")
-        except KeyboardInterrupt:
-            break
-        except Exception as exc:
-            log(f"[خطأ رئيسي] {exc}", "error")
-        time.sleep(SCAN_SECONDS)
+    """
+    Start the recommendation-only advisor.
+    """
+    log.info("=" * 60)
+    log.info("%s — VERSION %s", BOT_NAME, BOT_VERSION)
+    log.info("Underlying: %s", PRIMARY_UNDERLYING)
+    log.info("Mode: RECOMMENDATIONS ONLY")
+    log.info("Automatic order execution: DISABLED")
+    log.info("=" * 60)
 
+    try:
+        initialize_journal()
+    except Exception:
+        log.exception("Journal initialization failed.")
+        raise
+
+    if not TG_TOKEN or not TG_CHAT:
+        log.warning(
+            "Telegram credentials are missing. "
+            "The scanner can run, but alerts cannot be delivered."
+        )
+
+    while not _STOP_REQUESTED:
+        started = time.monotonic()
+
+        try:
+            result = run_scan()
+
+            if result.get("ok"):
+                log.info(
+                    "Scan complete: recommendation delivered."
+                )
+            else:
+                log.info(
+                    "Scan complete: no alert. stage=%s reason=%s",
+                    result.get("stage"),
+                    result.get("reason"),
+                )
+
+        except KeyboardInterrupt:
+            log.info("Shutdown requested by keyboard.")
+            break
+
+        except Exception:
+            log.exception(
+                "Unexpected scan error; waiting for next cycle."
+            )
+
+        elapsed = time.monotonic() - started
+
+        sleep_seconds = max(
+            1,
+            POLL_SECONDS - int(elapsed),
+        )
+
+        try:
+            time.sleep(sleep_seconds)
+        except KeyboardInterrupt:
+            log.info("Shutdown requested.")
+            break
+
+    log.info("صَفاء التحليل stopped.")
+
+
+# ============================================================
+# 72. ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================
+# END OF PART 6/6
+# ============================================================
