@@ -5708,6 +5708,16 @@ def get_current_prediction():
 
         journal_model_run(model_bundle)
 
+        log.warning(
+            "MODEL TRAIN RESULT | enabled=%s | reasons=%s | "
+            "metrics=%s | threshold=%s | split_rows=%s",
+            model_bundle.get("enabled"),
+            model_bundle.get("reasons", []),
+            model_bundle.get("metrics", {}),
+            model_bundle.get("threshold"),
+            model_bundle.get("split_rows", {}),
+        )
+
         if not model_bundle.get("enabled", False):
             return {
                 "ok": False,
