@@ -6040,10 +6040,11 @@ def run_scan():
         direction=direction,
         spot=spot,
     )
-  try:
-calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
-except Exception:
-    pass
+
+    try:
+        calculate_and_send_outlook(bars, TG_TOKEN, TG_CHAT)
+    except Exception:
+        pass
 
     if not recommendation.get("ok", False):
         reason = recommendation.get(
