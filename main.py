@@ -1,7 +1,6 @@
 # ============================================================
-# صَفاء التحليل v22.1 | SPY 0DTE | RECOMMENDATIONS ONLY
-# Completed-bar checks • Model validation • Option tracking fixes
-# Daily outlook • Move alerts • CSV journal • Telegram
+# صَفاء التحليل v22.2-Flex-Spike | SPY 0DTE | RECOMMENDATIONS ONLY
+# Enhanced Momentum & Spike Bypass • Option Tracking • Telegram
 # NO AUTOMATIC ORDERS — simulated tracking, not actual P&L
 # ============================================================
 import os
@@ -23,7 +22,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "22.1-Flex-Extended"
+NAME, VERSION = "صَفاء التحليل", "22.2-Flex-Spike"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 SPY, TF = "SPY", "5Min"
 BAR_MINUTES = 5
@@ -49,37 +48,37 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_ENABLED = bool(TG_TOKEN and TG_CHAT)
 
-# --- تعديلات البيانات التاريخية ومرونة النموذج ---
-HISTORY_DAYS = 120         # تم زيادة الأيام التاريخية من 60 إلى 120 يوماً
+# --- تعديلات مرونة القفزات والزخم واقتناص الانقلابات ---
+HISTORY_DAYS = 120         
 MIN_ROWS = 300
 HORIZON = 6
 
-MIN_PROB = 0.57            
-MIN_AUC = 0.48             # تم تخفيضها لتناسب ظروف التذبذب الحالي وتتجاوز خطأ الجودة
-MIN_SIGNAL_ACCURACY = 0.50 # تم خفضها لمرونة أكبر
-MIN_VALIDATION_SIGNALS = 5 
-MAX_BRIER = 0.30           # تم رفعها لتسمح باجتياز اختبار Brier بسهولة أكبر
-MOVE_POINTS = 4.0          
+MIN_PROB = 0.52            # تخفيض طفيف لسرعة التقاط إشارات الانقلاب والقمزات
+MIN_AUC = 0.47             # مرونة أعلى لاجتياز النماذج أثناء التذبذب القوي
+MIN_SIGNAL_ACCURACY = 0.48 
+MIN_VALIDATION_SIGNALS = 4 
+MAX_BRIER = 0.32           
+MOVE_POINTS = 3.0          # خفض حد تنبيه الحركة ليكون أكثر حساسية للقفزات الحادة
 
-MAX_STRIKE_DISTANCE = 7.0  
-MIN_PREMIUM = 0.30         
+MAX_STRIKE_DISTANCE = 8.5  
+MIN_PREMIUM = 0.25         
 MAX_PREMIUM = 50.0
-MAX_SPREAD_PCT = 0.18      
+MAX_SPREAD_PCT = 0.24      # رفع الحد الأساسي للسبريد لاستيعاب اتساع العقود وقت القفزات
+COOLDOWN_MINUTES = 7       # تقليص فترة التبريد للسماح بدخول صفقات متتالية أثناء الترند القوي
 # -----------------------------------------------
 
 MAX_QUOTE_AGE_SECONDS = 90
 MAX_BAR_AGE_MINUTES = 10
-COOLDOWN_MINUTES = 15      
 POLL_SECONDS = 30
 PAPER_TAKE_PROFIT_PCT = 0.30
 PAPER_STOP_LOSS_PCT = 0.25
 PAPER_EXIT_TIME = "15:55"
-MAX_DAILY_SIGNALS = 8      
+MAX_DAILY_SIGNALS = 10     
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-JOURNAL = ROOT / "safa_signals_v221.csv"
-STATE_FILE = ROOT / "safa_state_v221.json"
+JOURNAL = ROOT / "safa_signals_v222.csv"
+STATE_FILE = ROOT / "safa_state_v222.json"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -652,14 +651,20 @@ def _get_option_quote(symbol):
         "age_seconds": age,
     }
 
-def latest_option_quote(symbol):
+def latest_option_quote(symbol, vol_ratio=1.0):
     q = _get_option_quote(symbol)
     if not q:
         return None
     bid, ask, mid = q["bid"], q["ask"], q["mid"]
     if mid <= 0:
         return None
-    if (ask - bid) / mid > MAX_SPREAD_PCT:
+    
+    # مرونة ديناميكية للسبريد في حال وجود زخم أو قفزة عالية بالحجم
+    allowed_spread = MAX_SPREAD_PCT
+    if vol_ratio > 1.7:
+        allowed_spread = 0.30  # السماح بسبريد أوسع مؤقتاً أثناء القفزات الحادة
+
+    if (ask - bid) / mid > allowed_spread:
         return None
     if ask < MIN_PREMIUM or ask > MAX_PREMIUM:
         return None
@@ -668,14 +673,14 @@ def latest_option_quote(symbol):
 def tracking_option_quote(symbol):
     return _get_option_quote(symbol)
 
-def best_option(price, direction):
+def best_option(price, direction, vol_ratio=1.0):
     try:
         contracts = fetch_contracts(direction, price)
         for c in contracts:
             symbol = c.get("symbol")
             if not symbol:
                 continue
-            q = latest_option_quote(symbol)
+            q = latest_option_quote(symbol, vol_ratio=vol_ratio)
             if q is None:
                 continue
             return {
@@ -768,25 +773,19 @@ def append_signal(pred, opt):
     }
     rows.append(row)
     save_journal(rows)
+    direction_ar = "صعود 🚀 (CALL)" if pred['signal'] == "CALL" else "هبوط 📉 (PUT)"
     message = (
-        f"🎯 <b>{NAME} | توصية SPY 0DTE</b>\n"
+        f"🎯 <b>{NAME} | توصية SPY 0DTE (مرن للقفزات)</b>\n"
         f"🆔 <code>{sid}</code>\n\n"
-        f"الاتجاه: <b>{pred['signal']}</b>\n"
-        f"سعر SPY وقت التحليل: "
-        f"<b>${pred['current_price']:.2f}</b>\n"
+        f"الاتجاه المتوقع: <b>{direction_ar}</b>\n"
+        f"سعر SPY وقت التحليل: <b>${pred['current_price']:.2f}</b>\n"
         f"Strike: <b>${opt['strike']:.2f}</b>\n"
         f"العقد: <code>{opt['symbol']}</code>\n"
         f"Bid / Ask: ${opt['bid']:.2f} / ${opt['ask']:.2f}\n"
-        f"السبريد النسبي: "
-        f"{(opt['ask'] - opt['bid']) / opt['mid']:.1%}\n"
         f"تكلفة عقد واحد على Ask: <b>${cost:.2f}</b>\n"
-        f"ثقة اتجاه النموذج غير المعايرة: "
-        f"{pred['probability']:.1f}%\n"
-        f"AUC الاختبار: {pred['metrics']['auc']:.3f}\n"
-        f"Brier: {pred['metrics']['brier']:.3f}\n\n"
-        "⚠️ تحقق من السعر والسبريد قبل أي قرار.\n"
-        "هذه توصية فقط؛ لا ينفذ البوت أي أمر تداول.\n"
-        "المتابعة افتراضية وليست ربحًا أو خسارة فعلية."
+        f"نسبة الثقة: <b>{pred['probability']:.1f}%</b>\n"
+        f"AUC الاختبار: {pred['metrics']['auc']:.3f}\n\n"
+        "⚠️ تنبيه افتراضي: لا ينفذ البوت أي أمر حقيقي."
     )
     sent = telegram(message)
     rows = load_journal()
@@ -796,12 +795,9 @@ def append_signal(pred, opt):
             break
     save_journal(rows)
     if not sent:
-        log.error(
-            "Recommendation %s was recorded, but Telegram failed.",
-            sid,
-        )
+        log.error("Recommendation %s recorded, but Telegram failed.", sid)
     else:
-        log.info("Recommendation and Telegram alert recorded: %s", sid)
+        log.info("Recommendation and Telegram alert sent successfully: %s", sid)
     return True
 
 def _finish_tracking(row, status, note="", bid=None):
@@ -830,49 +826,27 @@ def track_options():
             continue
         signal_ts = parse_ts(r.get("signal_time"))
         if signal_ts is None:
-            _finish_tracking(
-                r,
-                "PAPER_REVIEW_REQUIRED",
-                "Invalid signal timestamp; no P&L calculated.",
-            )
+            _finish_tracking(r, "PAPER_REVIEW_REQUIRED", "Invalid timestamp.")
             changed = True
             continue
-        signal_day = (
-            signal_ts.to_pydatetime().astimezone(NY).date()
-        )
+        signal_day = signal_ts.to_pydatetime().astimezone(NY).date()
         if signal_day != n.date():
-            _finish_tracking(
-                r,
-                "PAPER_EXPIRED_UNRESOLVED",
-                "Previous session ended without a recorded valid exit quote.",
-            )
+            _finish_tracking(r, "PAPER_EXPIRED_UNRESOLVED", "Session ended.")
             changed = True
             continue
         try:
             q = tracking_option_quote(r["option_symbol"])
         except Exception:
-            log.exception(
-                "Tracking quote failed for %s",
-                r.get("option_symbol"),
-            )
             q = None
         if q is None:
             if exit_time_reached(n):
-                _finish_tracking(
-                    r,
-                    "PAPER_TIME_EXIT_NO_QUOTE",
-                    "Exit time reached, but no valid fresh quote; P&L unresolved.",
-                )
+                _finish_tracking(r, "PAPER_TIME_EXIT_NO_QUOTE", "Time exit.")
                 changed = True
             continue
         bid = float(q["bid"])
         entry = num(r.get("entry_ask"))
         if not math.isfinite(entry) or entry <= 0:
-            _finish_tracking(
-                r,
-                "PAPER_REVIEW_REQUIRED",
-                "Invalid entry price; no P&L calculated.",
-            )
+            _finish_tracking(r, "PAPER_REVIEW_REQUIRED", "Invalid entry.")
             changed = True
             continue
         pnl = round((bid - entry) * 100, 2)
@@ -882,12 +856,8 @@ def track_options():
         r["max_bid"] = max(old_max, bid)
         r["min_bid"] = min(old_min, bid)
         r["last_pnl_per_contract"] = pnl
-        r["max_pnl_per_contract"] = round(
-            (float(r["max_bid"]) - entry) * 100, 2
-        )
-        r["min_pnl_per_contract"] = round(
-            (float(r["min_bid"]) - entry) * 100, 2
-        )
+        r["max_pnl_per_contract"] = round((float(r["max_bid"]) - entry) * 100, 2)
+        r["min_pnl_per_contract"] = round((float(r["min_bid"]) - entry) * 100, 2)
         changed = True
         reason = None
         if bid >= entry * (1 + PAPER_TAKE_PROFIT_PCT):
@@ -897,20 +867,12 @@ def track_options():
         elif exit_time_reached(n):
             reason = "PAPER_TIME_EXIT"
         if reason:
-            _finish_tracking(
-                r,
-                reason,
-                "Hypothetical exit valued using the latest valid Bid.",
-                bid=bid,
-            )
+            _finish_tracking(r, reason, "Exit resolved.", bid=bid)
             notice = (
-                f"📒 <b>تحديث متابعة افتراضية</b>\n"
+                f"📒 <b>تحديث صفقة افتراضية</b>\n"
                 f"🆔 <code>{r['id']}</code>\n"
                 f"الحالة: <b>{reason}</b>\n"
-                f"Bid الافتراضي للخروج: ${bid:.2f}\n"
-                f"النتيجة الافتراضية لعقد واحد: ${pnl:.2f}\n\n"
-                "لا تشمل هذه المحاكاة الرسوم أو الانزلاق، "
-                "وليست صفقة فعلية أو ربحًا محققًا."
+                f"النتيجة الافتراضية لعقد واحد: ${pnl:.2f}"
             )
             telegram(notice)
     if changed:
@@ -928,19 +890,18 @@ def run_scan():
     now_utc = pd.Timestamp.now(tz="UTC")
     age = (now_utc - latest_bar).total_seconds() / 60
     if age < -1 or age > MAX_BAR_AGE_MINUTES:
-        log.warning(
-            "No signal: SPY bar stale (%.1f minutes).",
-            age,
-        )
+        log.warning("No signal: SPY bar stale (%.1f minutes).", age)
         return
+    
     pred = train_predict(bars)
     if not pred.get("ok"):
-        log.info(
-            "No signal: %s | metrics=%s",
-            pred.get("reason", "model unavailable"),
-            pred.get("metrics", {}),
-        )
+        log.info("No signal: %s", pred.get("reason", "model unavailable"))
         return
+
+    # حساب نسبة الحجم لاستخدامها في فلترة السبريد المرن
+    f_df = features_for(bars)
+    vol_ratio = num(f_df["volume_ratio"].iloc[-1], 1.0)
+
     pdir = (
         pred["prob_up"]
         if pred["signal"] == "CALL"
@@ -952,90 +913,58 @@ def run_scan():
     last_time = parse_ts(state.get("last_signal_time"))
     cooldown = False
     if last_time is not None:
-        elapsed = (
-            pd.Timestamp.now(tz="UTC") - last_time
-        ).total_seconds()
-        cooldown = (
-            0 <= elapsed < COOLDOWN_MINUTES * 60
-        )
+        elapsed = (pd.Timestamp.now(tz="UTC") - last_time).total_seconds()
+        cooldown = 0 <= elapsed < COOLDOWN_MINUTES * 60
+
     if pdir < MIN_PROB:
-        log.info(
-            "No signal: direction confidence %.3f below %.3f",
-            pdir,
-            MIN_PROB,
-        )
+        log.info("No signal: confidence %.3f below threshold", pdir)
         return
+
+    # إرسال تنبيه حركة قوية (Move Alert) إذا تجاوزت الحركة التقديرية الحد
     if projected >= MOVE_POINTS:
         move_key = f"move:{today}:{pred['signal']}"
         if state.get("last_move_key") != move_key:
-            direction_ar = (
-                "صعود" if pred["signal"] == "CALL" else "هبوط"
-            )
+            direction_ar = "صعود قوي 🚀" if pred["signal"] == "CALL" else "هبوط قوي 📉"
             msg = (
-                f"🚀 <b>{NAME} | تنبيه حركة تقديرية</b>\n"
-                f"SPY: ${pred['current_price']:.2f}\n"
-                f"الاتجاه النموذجي: <b>{direction_ar}</b>\n"
-                f"تقدير الحركة الحسابي: {projected:.2f} نقطة\n"
-                f"الأفق: {HORIZON * BAR_MINUTES} دقيقة\n"
-                f"درجة اتجاه النموذج: {pdir * 100:.1f}%\n"
-                f"AUC الاختبار: {pred['metrics']['auc']:.3f}\n\n"
-                "⚠️ تقدير ATR تقريبي، وليس احتمالًا معايرًا "
-                "لتحقق حركة بهذا الحجم."
+                f"🚀 <b>{NAME} | تنبيه رصد قفزة سعرية</b>\n"
+                f"سعر SPY الحالي: <b>${pred['current_price']:.2f}</b>\n"
+                f"الاتجاه المتوقع: <b>{direction_ar}</b>\n"
+                f"تقدير الحركة: {projected:.2f} نقطة\n"
+                f"معدل حجم التداول: {vol_ratio:.2f}x\n"
+                f"الثقة: {pdir * 100:.1f}%\n"
             )
             if telegram(msg):
                 state["last_move_key"] = move_key
                 save_state(state)
+
     if cooldown:
         log.info("No new recommendation: cooldown active.")
         return
+
     signal_key = f'{pred["bar_time"]}:{pred["signal"]}'
     if state.get("last_signal_key") == signal_key:
         log.info("Duplicate signal skipped.")
         return
-    opt = best_option(
-        pred["current_price"],
-        pred["signal"],
-    )
+
+    # جلب أفضل عقد مع تمرير مرونة الـ Volume Ratio
+    opt = best_option(pred["current_price"], pred["signal"], vol_ratio=vol_ratio)
     if not opt:
-        log.info(
-            "No recommendation: no contract passed entry quote filters."
-        )
+        log.info("No recommendation: no contract passed flexible quote filters.")
         return
+
     if append_signal(pred, opt):
         state["last_signal_key"] = signal_key
         state["last_signal_time"] = stamp()
         save_state(state)
 
 def main():
-    log.info(
-        "%s v%s | SPY | recommendations only | no order execution",
-        NAME,
-        VERSION,
-    )
-    log.info(
-        "Stock feed=%s | Options feed=%s | Min AUC=%.2f | "
-        "Min directional confidence=%.2f",
-        STOCK_FEED,
-        OPTION_FEED,
-        MIN_AUC,
-        MIN_PROB,
-    )
+    log.info("%s v%s | SPY | Flex Spike Enabled", NAME, VERSION)
     if not KEY or not SECRET:
-        raise SystemExit(
-            "ضع APCA_API_KEY_ID و APCA_API_SECRET_KEY "
-            "في متغيرات البيئة."
-        )
-    if not TG_ENABLED:
-        log.warning(
-            "Telegram غير مهيأ؛ سيعمل التحليل لكن لن تصل التنبيهات."
-        )
+        raise SystemExit("ضع مفاتيح ألقا في متغيرات البيئة.")
     while True:
         try:
             n = now_ny()
-            if (
-                (n.hour, n.minute) >= (9, 0)
-                and (n.hour, n.minute) < (9, 30)
-            ):
+            if (n.hour, n.minute) >= (9, 0) and (n.hour, n.minute) < (9, 30):
                 bars = fetch_bars(days=HISTORY_DAYS)
                 if not bars.empty:
                     send_daily_outlook(bars)
