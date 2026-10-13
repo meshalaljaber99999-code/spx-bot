@@ -21,8 +21,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
+
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "22.1"
+NAME, VERSION = "صَفاء التحليل", "22.1-Flex"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 SPY, TF = "SPY", "5Min"
 BAR_MINUTES = 5
@@ -47,31 +48,39 @@ OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_ENABLED = bool(TG_TOKEN and TG_CHAT)
+
 HISTORY_DAYS = 60
 MIN_ROWS = 300
 HORIZON = 6
-MIN_PROB = 0.64
-MIN_AUC = 0.55
-MIN_SIGNAL_ACCURACY = 0.55
-MIN_VALIDATION_SIGNALS = 10
-MAX_BRIER = 0.25
-MOVE_POINTS = 5.0
-MAX_STRIKE_DISTANCE = 5.0
-MIN_PREMIUM = 0.50
+
+# --- تعديلات المرونة لتقليل القيود وتوليد إشارات أكثر ---
+MIN_PROB = 0.57            # تم تخفيضها من 0.64 إلى 0.57
+MIN_AUC = 0.52             # تم تخفيضها قليلاً لتساهل أدنى مع النموذج
+MIN_SIGNAL_ACCURACY = 0.52 # تم تخفيضها من 0.55
+MIN_VALIDATION_SIGNALS = 5 # تم تخفيضها من 10
+MAX_BRIER = 0.28           # تم رفعها قليلاً لتكون أكثر تساهلاً
+MOVE_POINTS = 4.0          # تم خفض تنبيه الحركة من 5 إلى 4 نقاط
+
+MAX_STRIKE_DISTANCE = 7.0  # تم توسيع نطاق السترايك من 5 إلى 7 نقاط
+MIN_PREMIUM = 0.30         # تم خفض الحد الأدنى لسعر العقد من 0.50 إلى 0.30
 MAX_PREMIUM = 50.0
-MAX_SPREAD_PCT = 0.12
+MAX_SPREAD_PCT = 0.18      # تم توسيع السبريد المقبول من 12% إلى 18%
+# ------------------------------------------------------
+
 MAX_QUOTE_AGE_SECONDS = 90
 MAX_BAR_AGE_MINUTES = 10
-COOLDOWN_MINUTES = 20
+COOLDOWN_MINUTES = 15      # تم خفض وقت الانتظار بين التوصيات من 20 إلى 15 دقيقة
 POLL_SECONDS = 30
 PAPER_TAKE_PROFIT_PCT = 0.30
 PAPER_STOP_LOSS_PCT = 0.25
 PAPER_EXIT_TIME = "15:55"
-MAX_DAILY_SIGNALS = 5
+MAX_DAILY_SIGNALS = 8      # رفع الحد الأقصى للتوصيات اليومية إلى 8
+
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
 JOURNAL = ROOT / "safa_signals_v221.csv"
 STATE_FILE = ROOT / "safa_state_v221.json"
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -81,22 +90,27 @@ logging.basicConfig(
 log = logging.getLogger("safaa")
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": f"SafaaAnalysis/{VERSION}"})
+
 # -------------------- GENERAL HELPERS --------------------
 def now_ny():
     return datetime.now(NY)
+
 def stamp():
     return datetime.now(UTC).isoformat()
+
 def num(value, default=np.nan):
     try:
         x = float(value)
         return x if math.isfinite(x) else default
     except (TypeError, ValueError):
         return default
+
 def read_state():
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
 def save_state(state):
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(
@@ -104,6 +118,7 @@ def save_state(state):
         encoding="utf-8",
     )
     tmp.replace(STATE_FILE)
+
 def parse_ts(value):
     try:
         t = pd.Timestamp(value)
@@ -112,6 +127,7 @@ def parse_ts(value):
         return t.tz_convert("UTC")
     except Exception:
         return None
+
 def alpaca_get(url, params=None):
     if not KEY or not SECRET:
         raise RuntimeError(
@@ -144,6 +160,7 @@ def alpaca_get(url, params=None):
             if attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"Alpaca request failed: {last}")
+
 def telegram(message):
     if not TG_ENABLED:
         log.warning("Telegram غير مضبوط؛ لم يتم إرسال الرسالة.")
@@ -173,6 +190,7 @@ def telegram(message):
     except Exception:
         log.exception("Telegram send failed")
         return False
+
 def market_open():
     n = now_ny()
     return (
@@ -180,6 +198,7 @@ def market_open():
         and (n.hour, n.minute) >= (9, 30)
         and (n.hour, n.minute) < (16, 0)
     )
+
 def in_signal_window():
     n = now_ny()
     return (
@@ -187,6 +206,7 @@ def in_signal_window():
         and (n.hour, n.minute) >= (9, 40)
         and (n.hour, n.minute) < (15, 30)
     )
+
 def exit_time_reached(n=None):
     n = n or now_ny()
     try:
@@ -195,7 +215,8 @@ def exit_time_reached(n=None):
     except (ValueError, AttributeError):
         log.error("PAPER_EXIT_TIME غير صالح: %r", PAPER_EXIT_TIME)
         return False
-        # -------------------- STOCK DATA --------------------
+
+# -------------------- STOCK DATA --------------------
 def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
     end = datetime.now(UTC)
     params = {
@@ -210,7 +231,6 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
     url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
     all_bars = []
     token = None
-    # Pagination with a hard safety limit.
     for _ in range(20):
         p = dict(params)
         if token:
@@ -254,8 +274,6 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
         .sort_values("timestamp")
         .set_index("timestamp")
     )
-    # Alpaca bar timestamps represent the beginning of the bar.
-    # Exclude the currently forming 5-minute bar.
     now_utc = pd.Timestamp.now(tz="UTC")
     current_bucket_minute = (
         now_utc.minute // BAR_MINUTES
@@ -267,12 +285,14 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
     )
     df = df.loc[df.index < current_bucket]
     return df
+
 FEATURES = [
     "ret1", "ret3", "ret6", "ret12",
     "ema_spread", "ema_trend", "rsi", "atr_pct",
     "range_pct", "body_pct", "close_location",
     "volume_ratio",
 ]
+
 def features_for(bars):
     f = bars.copy()
     c = f["close"]
@@ -300,7 +320,6 @@ def features_for(bars):
     ).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi = (100 - 100 / (1 + rs)) / 100
-    # Handle uninterrupted upward movement without producing infinity.
     rsi = rsi.mask((loss == 0) & (gain > 0), 1.0)
     rsi = rsi.mask((gain == 0) & (loss > 0), 0.0)
     rsi = rsi.mask((gain == 0) & (loss == 0), 0.5)
@@ -331,6 +350,7 @@ def features_for(bars):
         f["volume"] / vmean.replace(0, np.nan)
     )
     return f.replace([np.inf, -np.inf], np.nan)
+
 # -------------------- MODEL VALIDATION --------------------
 def build_model():
     return make_pipeline(
@@ -344,6 +364,7 @@ def build_model():
             n_jobs=-1,
         ),
     )
+
 def train_predict(bars):
     if bars.empty or len(bars) < MIN_ROWS:
         return {
@@ -351,8 +372,6 @@ def train_predict(bars):
             "reason": "INSUFFICIENT_ROWS",
         }
     f = features_for(bars)
-    # Label: whether SPY closes higher after HORIZON bars.
-    # This is a direction label, NOT an option-profit label.
     future = bars["close"].shift(-HORIZON)
     f["target"] = np.where(
         future.notna(),
@@ -372,7 +391,6 @@ def train_predict(bars):
             "reason": "INVALID_TIME_SPLIT",
         }
     valid_start_time = ds.index[split]
-    # Use a time-based embargo, not just a row-count gap.
     embargo_cutoff = (
         valid_start_time
         - pd.Timedelta(minutes=BAR_MINUTES * HORIZON)
@@ -399,7 +417,6 @@ def train_predict(bars):
         else 0.5
     )
     brier = brier_score_loss(y, p)
-    # High-confidence predictions in either direction.
     chosen = (p >= MIN_PROB) | (p <= 1 - MIN_PROB)
     signal_count = int(chosen.sum())
     signal_accuracy = (
@@ -435,7 +452,6 @@ def train_predict(bars):
             "reason": "HOLDOUT_SIGNALS_FAILED",
             "metrics": metrics,
         }
-    # Train the final model on available labeled history.
     final_model = build_model()
     final_model.fit(
         ds[FEATURES],
@@ -474,7 +490,8 @@ def train_predict(bars):
         "metrics": metrics,
         "bar_time": bars.index[-1].isoformat(),
     }
-    # -------------------- DAILY OUTLOOK --------------------
+
+# -------------------- DAILY OUTLOOK --------------------
 def daily_bars(bars):
     if bars.empty:
         return pd.DataFrame()
@@ -490,6 +507,7 @@ def daily_bars(bars):
         low=("low", "min"),
         close=("close", "last"),
     ).dropna()
+
 def send_daily_outlook(bars):
     n = now_ny()
     state = read_state()
@@ -504,7 +522,6 @@ def send_daily_outlook(bars):
     if d.empty:
         log.warning("Daily outlook skipped: no regular-session bars.")
         return
-    # Use only sessions strictly before today's date.
     d = d.loc[d.index < n.date()]
     if len(d) < 10:
         log.warning(
@@ -563,6 +580,7 @@ def send_daily_outlook(bars):
     if telegram(msg):
         state["daily_outlook_day"] = day
         save_state(state)
+
 # -------------------- OPTIONS DATA --------------------
 def fetch_contracts(direction, price):
     today = now_ny().date().isoformat()
@@ -589,7 +607,6 @@ def fetch_contracts(direction, price):
         option_type = str(c.get("type") or "").lower()
         if not symbol or not math.isfinite(strike):
             continue
-        # Recheck contract details rather than relying only on API filters.
         if expiration and expiration[:10] != today:
             continue
         expected_type = "call" if direction == "CALL" else "put"
@@ -600,6 +617,7 @@ def fetch_contracts(direction, price):
             candidates.append((distance, c))
     candidates.sort(key=lambda item: item[0])
     return [c for _, c in candidates[:30]]
+
 def _get_option_quote(symbol):
     payload = alpaca_get(
         f"{DATA_URL}/v1beta1/options/quotes/latest",
@@ -617,7 +635,6 @@ def _get_option_quote(symbol):
     age = (
         pd.Timestamp.now(tz="UTC") - ts
     ).total_seconds()
-    # Reject stale quotes and timestamps suspiciously in the future.
     if age < -2 or age > MAX_QUOTE_AGE_SECONDS:
         return None
     if not math.isfinite(bid) or bid <= 0:
@@ -634,8 +651,8 @@ def _get_option_quote(symbol):
         "time": ts.isoformat(),
         "age_seconds": age,
     }
+
 def latest_option_quote(symbol):
-    # Strict entry filters: only for choosing a new recommendation.
     q = _get_option_quote(symbol)
     if not q:
         return None
@@ -647,12 +664,10 @@ def latest_option_quote(symbol):
     if ask < MIN_PREMIUM or ask > MAX_PREMIUM:
         return None
     return q
+
 def tracking_option_quote(symbol):
-    # Monitoring uses freshness and valid bid/ask only.
-    # Do not apply entry premium/spread filters here:
-    # otherwise an existing paper position may never be evaluated
-    # for target, stop, or time exit.
     return _get_option_quote(symbol)
+
 def best_option(price, direction):
     try:
         contracts = fetch_contracts(direction, price)
@@ -672,7 +687,8 @@ def best_option(price, direction):
     except Exception:
         log.exception("Option scan failed")
     return None
-    # -------------------- JOURNAL & PAPER TRACKING --------------------
+
+# -------------------- JOURNAL & PAPER TRACKING --------------------
 FIELDS = [
     "id", "signal_time", "signal", "spy_price", "probability",
     "option_symbol", "strike", "entry_bid", "entry_ask",
@@ -682,6 +698,7 @@ FIELDS = [
     "exit_pnl_per_contract", "model_auc", "model_brier",
     "alert_status", "tracking_note",
 ]
+
 def load_journal():
     if not JOURNAL.exists():
         return []
@@ -693,6 +710,7 @@ def load_journal():
     except Exception:
         log.exception("Journal read failed")
         return []
+
 def save_journal(rows):
     tmp = JOURNAL.with_suffix(".tmp")
     with tmp.open("w", newline="", encoding="utf-8") as f:
@@ -704,6 +722,7 @@ def save_journal(rows):
         writer.writeheader()
         writer.writerows(rows)
     tmp.replace(JOURNAL)
+
 def append_signal(pred, opt):
     rows = load_journal()
     day = now_ny().date().isoformat()
@@ -770,7 +789,6 @@ def append_signal(pred, opt):
         "المتابعة افتراضية وليست ربحًا أو خسارة فعلية."
     )
     sent = telegram(message)
-    # Persist alert status independently of simulated position status.
     rows = load_journal()
     for r in rows:
         if r.get("id") == sid:
@@ -784,9 +802,8 @@ def append_signal(pred, opt):
         )
     else:
         log.info("Recommendation and Telegram alert recorded: %s", sid)
-    # Return True if the record exists, preventing repeated records
-    # for the same signal even if Telegram is temporarily unavailable.
     return True
+
 def _finish_tracking(row, status, note="", bid=None):
     row["status"] = status
     row["exit_time"] = stamp()
@@ -801,9 +818,9 @@ def _finish_tracking(row, status, note="", bid=None):
             row["exit_bid"] = ""
             row["exit_pnl_per_contract"] = ""
     else:
-        # No valid exit quote: do not fabricate a P&L.
         row["exit_bid"] = ""
         row["exit_pnl_per_contract"] = ""
+
 def track_options():
     rows = load_journal()
     changed = False
@@ -823,8 +840,6 @@ def track_options():
         signal_day = (
             signal_ts.to_pydatetime().astimezone(NY).date()
         )
-        # A 0DTE contract must not remain tracked as an active
-        # same-day position after its session has passed.
         if signal_day != n.date():
             _finish_tracking(
                 r,
@@ -833,7 +848,6 @@ def track_options():
             )
             changed = True
             continue
-        # If it is time to stop tracking, try a fresh quote first.
         try:
             q = tracking_option_quote(r["option_symbol"])
         except Exception:
@@ -901,6 +915,7 @@ def track_options():
             telegram(notice)
     if changed:
         save_journal(rows)
+
 # -------------------- ALERTS & SCAN LOOP --------------------
 def run_scan():
     if not in_signal_window():
@@ -931,8 +946,6 @@ def run_scan():
         if pred["signal"] == "CALL"
         else 1 - pred["prob_up"]
     )
-    # ATR-based movement estimate only; it is not a calibrated
-    # probability that SPY will move by this amount.
     projected = pred["atr"] * math.sqrt(HORIZON) * 1.5
     state = read_state()
     today = now_ny().date().isoformat()
@@ -952,7 +965,6 @@ def run_scan():
             MIN_PROB,
         )
         return
-    # Large-move alert is separate from an option recommendation.
     if projected >= MOVE_POINTS:
         move_key = f"move:{today}:{pred['signal']}"
         if state.get("last_move_key") != move_key:
@@ -993,6 +1005,7 @@ def run_scan():
         state["last_signal_key"] = signal_key
         state["last_signal_time"] = stamp()
         save_state(state)
+
 def main():
     log.info(
         "%s v%s | SPY | recommendations only | no order execution",
@@ -1035,6 +1048,6 @@ def main():
         except Exception:
             log.exception("Main loop error")
         time.sleep(max(5, POLL_SECONDS))
+
 if __name__ == "__main__":
     main()
-    
