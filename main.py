@@ -5132,7 +5132,7 @@ def _utc_datetime(value):
 def _data_timestamp_is_fresh(timestamp, max_age_seconds=None):
     """
     Fail closed when a timestamp is absent, invalid, or too old,
-    unless we are in pre-market or after-hours review windows.
+    unless we are in pre-market or after-hours review windows or weekend.
     """
     parsed = _utc_datetime(timestamp)
 
@@ -5151,23 +5151,27 @@ def _data_timestamp_is_fresh(timestamp, max_age_seconds=None):
         else MAX_DATA_AGE_SECONDS
     )
 
-    # --- استثناء أوقات الراحة (قبل وبعد السوق) ---
-    # إذا كان السوق مغلقاً ونحن في فترات التحضير أو المراجعة، نتغاضى عن قدم البيانات
+    # التحقق من حالة السوق والتوقيت المحلي (New York)
     ny_current = to_ny(current)
     if ny_current is not None:
+        # إذا كان يوم عطلة نهاية أسبوع (سبت أو أحد)، نعتبر آخر إغلاق لبيانات الجمعة مقبولاً تماماً
+        if ny_current.weekday() >= 5:
+            return True, "FRESH_WEEKEND_CLOSE"
+
         start, end = regular_session_bounds(ny_current.date())
-        pre_start = start - timedelta(hours=1)
-        after_end = end + timedelta(hours=2)
+        pre_start = start - timedelta(hours=2)
+        after_end = end + timedelta(hours=4)
         
-        # إذا كنا في فترة ما قبل الافتتاح أو بعد الإغلاق المسموحة، نقبل البيانات بهدوء
-        if (pre_start <= ny_current < start) or (end <= ny_current < after_end):
-            return True, "FRESH_OFF_HOURS"
-    # ---------------------------------------------
+        # إذا كنا خارج ساعات التداول الرسمية ولكن ضمن نطاق المراجعة، نقبل آخر شمعة إغلاق متوفرة
+        if not (start <= ny_current < end):
+            if pre_start <= ny_current < start or end <= ny_current < after_end:
+                return True, "FRESH_OFF_HOURS"
 
     if age > maximum:
         return False, f"STALE_DATA_{age:.1f}_SECONDS"
 
     return True, "FRESH"
+
 
 # ============================================================
 # 63. TELEGRAM DELIVERY
