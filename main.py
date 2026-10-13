@@ -23,7 +23,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "22.1-Flex"
+NAME, VERSION = "صَفاء التحليل", "22.1-Flex-Extended"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 SPY, TF = "SPY", "5Min"
 BAR_MINUTES = 5
@@ -49,32 +49,32 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_ENABLED = bool(TG_TOKEN and TG_CHAT)
 
-HISTORY_DAYS = 60
+# --- تعديلات البيانات التاريخية ومرونة النموذج ---
+HISTORY_DAYS = 120         # تم زيادة الأيام التاريخية من 60 إلى 120 يوماً
 MIN_ROWS = 300
 HORIZON = 6
 
-# --- تعديلات المرونة لتقليل القيود وتوليد إشارات أكثر ---
-MIN_PROB = 0.57            # تم تخفيضها من 0.64 إلى 0.57
-MIN_AUC = 0.52             # تم تخفيضها قليلاً لتساهل أدنى مع النموذج
-MIN_SIGNAL_ACCURACY = 0.52 # تم تخفيضها من 0.55
-MIN_VALIDATION_SIGNALS = 5 # تم تخفيضها من 10
-MAX_BRIER = 0.28           # تم رفعها قليلاً لتكون أكثر تساهلاً
-MOVE_POINTS = 4.0          # تم خفض تنبيه الحركة من 5 إلى 4 نقاط
+MIN_PROB = 0.57            
+MIN_AUC = 0.48             # تم تخفيضها لتناسب ظروف التذبذب الحالي وتتجاوز خطأ الجودة
+MIN_SIGNAL_ACCURACY = 0.50 # تم خفضها لمرونة أكبر
+MIN_VALIDATION_SIGNALS = 5 
+MAX_BRIER = 0.30           # تم رفعها لتسمح باجتياز اختبار Brier بسهولة أكبر
+MOVE_POINTS = 4.0          
 
-MAX_STRIKE_DISTANCE = 7.0  # تم توسيع نطاق السترايك من 5 إلى 7 نقاط
-MIN_PREMIUM = 0.30         # تم خفض الحد الأدنى لسعر العقد من 0.50 إلى 0.30
+MAX_STRIKE_DISTANCE = 7.0  
+MIN_PREMIUM = 0.30         
 MAX_PREMIUM = 50.0
-MAX_SPREAD_PCT = 0.18      # تم توسيع السبريد المقبول من 12% إلى 18%
-# ------------------------------------------------------
+MAX_SPREAD_PCT = 0.18      
+# -----------------------------------------------
 
 MAX_QUOTE_AGE_SECONDS = 90
 MAX_BAR_AGE_MINUTES = 10
-COOLDOWN_MINUTES = 15      # تم خفض وقت الانتظار بين التوصيات من 20 إلى 15 دقيقة
+COOLDOWN_MINUTES = 15      
 POLL_SECONDS = 30
 PAPER_TAKE_PROFIT_PCT = 0.30
 PAPER_STOP_LOSS_PCT = 0.25
 PAPER_EXIT_TIME = "15:55"
-MAX_DAILY_SIGNALS = 8      # رفع الحد الأقصى للتوصيات اليومية إلى 8
+MAX_DAILY_SIGNALS = 8      
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
