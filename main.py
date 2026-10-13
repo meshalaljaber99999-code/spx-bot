@@ -1,6 +1,6 @@
 # ============================================================
-# صَفاء التحليل v24.0-Precision-MegaCaps | SPY & Precision Synthetic SPX
-# Enhanced Momentum • 11-Leader Basket Options Tracking • Telegram
+# صَفاء التحليل v25.0-Points-Speed-MegaCaps | SPY & Synthetic SPX
+# Dynamic Points Projection • Spike Speed Meter • 11-Leader Options
 # تصميم أبو سحاب
 # NO AUTOMATIC ORDERS — simulated tracking, not actual P&L
 # ============================================================
@@ -23,7 +23,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
 
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "24.0-Precision-MegaCaps"
+NAME, VERSION = "صَفاء التحليل", "25.0-Points-Speed-MegaCaps"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 SPY, TF = "SPY", "5Min"
 BAR_MINUTES = 5
@@ -94,8 +94,8 @@ MAX_DAILY_SIGNALS = 10
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-JOURNAL = ROOT / "safa_signals_v240.csv"
-STATE_FILE = ROOT / "safa_state_v240.json"
+JOURNAL = ROOT / "safa_signals_v250.csv"
+STATE_FILE = ROOT / "safa_state_v250.json"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -222,15 +222,6 @@ def in_signal_window():
         and (n.hour, n.minute) >= (9, 40)
         and (n.hour, n.minute) < (15, 30)
     )
-
-def exit_time_reached(n=None):
-    n = n or now_ny()
-    try:
-        hour, minute = map(int, PAPER_EXIT_TIME.split(":"))
-        return (n.hour, n.minute) >= (hour, minute)
-    except (ValueError, AttributeError):
-        log.error("PAPER_EXIT_TIME غير صالح: %r", PAPER_EXIT_TIME)
-        return False
 
 # -------------------- STOCK & PRECISION SYNTHETIC SPX DATA --------------------
 def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
@@ -416,6 +407,8 @@ def train_predict(bars):
     atr_pct = num(f["atr_pct"].iloc[-1])
     price = num(bars["close"].iloc[-1])
     atr = atr_pct * price if math.isfinite(atr_pct) and atr_pct > 0 else 0.0
+    vol_ratio = num(f["volume_ratio"].iloc[-1], 1.0)
+    
     return {
         "ok": True,
         "signal": "CALL" if prob_up >= 0.5 else "PUT",
@@ -423,6 +416,7 @@ def train_predict(bars):
         "probability": max(prob_up, 1 - prob_up) * 100,
         "current_price": price,
         "atr": atr,
+        "vol_ratio": vol_ratio,
         "metrics": metrics,
         "bar_time": bars.index[-1].isoformat(),
     }
@@ -519,6 +513,17 @@ def append_and_send_alert(pred, opt_spy, market_data):
     sid = f"SF-{now_ny():%Y%m%d-%H%M%S}"
     cost = round(float(opt_spy["ask"]) * 100, 2)
     
+    # حساب النقاط المتوقعة والسرعة
+    expected_points = pred["atr"] * math.sqrt(HORIZON) * 1.5
+    vol_ratio = pred["vol_ratio"]
+    
+    if vol_ratio >= 2.0:
+        speed_text = "⚡ صاروخية وعنيفة جداً (High Spike Velocity)"
+    elif vol_ratio >= 1.4:
+        speed_text = "🚀 سريعة وقوية (Strong Momentum)"
+    else:
+        speed_text = "🌊 متدرجة وثابتة (Steady Trend)"
+
     leaders_text = ""
     for ticker, info in market_data["leaders"].items():
         dir_t = "CALL" if info["change_pct"] >= 0 else "PUT"
@@ -541,7 +546,9 @@ def append_and_send_alert(pred, opt_spy, market_data):
         f"🆔 <code>{sid}</code>\n\n"
         f"📊 <b>مؤشر SPY الأساسي:</b> ${pred['current_price']:.2f}\n"
         f"📈 <b>مؤشر SPX الاصطناعي (عالي الدقة):</b> ${synth_spx:.2f} ({synth_chg:+.2f}%)\n"
-        f" الاتجاه المتوقع لـ SPY: <b>{direction_ar}</b>\n"
+        f" الاتجاه المتوقع: <b>{direction_ar}</b>\n"
+        f" النطاق المتوقع للحركة: <b>±{expected_points:.2f} نقطة</b>\n"
+        f" سرعة الزخم المتوقعة: <b>{speed_text}</b>\n"
         f" نسبة الثقة: <b>{pred['probability']:.1f}%</b>\n\n"
         f"🎯 <b>عقد SPY الموصى به (0DTE):</b>\n"
         f"▫️ الرمز: <code>{opt_spy['symbol']}</code>\n"
@@ -554,7 +561,7 @@ def append_and_send_alert(pred, opt_spy, market_data):
     
     sent = telegram(message)
     if sent:
-        log.info("Precision comprehensive alert sent successfully: %s", sid)
+        log.info("Points & Speed comprehensive alert sent successfully: %s", sid)
 
 # -------------------- MAIN SCAN LOOP --------------------
 def run_scan():
@@ -574,7 +581,7 @@ def run_scan():
         return
 
     market_data = get_precision_synthetic_spx()
-    opt_spy = best_option(SPY, pred["current_price"], pred["signal"])
+    opt_spy = best_option(SPY, pred["current_price"], pred["signal"], vol_ratio=pred["vol_ratio"])
     if not opt_spy:
         return
 
@@ -584,7 +591,7 @@ def run_scan():
     save_state(state)
 
 def main():
-    log.info("%s v%s | SPY & Precision Leaders Enabled", NAME, VERSION)
+    log.info("%s v%s | SPY, Points & Speed Enabled", NAME, VERSION)
     if not KEY or not SECRET:
         raise SystemExit("ضع مفاتيح ألقا في متغيرات البيئة.")
     while True:
