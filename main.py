@@ -496,10 +496,15 @@ def best_option(symbol, price, direction, vol_ratio=1.0, strict_today=True):
 
 # -------------------- SPLIT TELEGRAM ALERTS --------------------
 def send_market_prediction_alert(pred, market_data):
-    """1. رسالة توقع المؤشر مستقلة (صعود أو نزول + المدة + النقاط)"""
+    """1. رسالة توقع المؤشر مستقلة (لا ترسل إلا إذا كانت الحركة المتوقعة 5 نقاط فأكثر)"""
+    expected_points = round(pred["atr"] * math.sqrt(HORIZON), 2)
+    
+    # شرط ألا يتم الإرسال إلا إذا كانت الحركة المتوقعة 5 نقاط أو أكثر
+    if expected_points < 5.0:
+        return
+
     direction = pred["signal"]
     expected_minutes = HORIZON * BAR_MINUTES
-    expected_points = round(pred["atr"] * math.sqrt(HORIZON), 2)
     
     msg = (
         f"📊 <b>توقع اتجاه مؤشر SPX</b>\n\n"
@@ -510,6 +515,7 @@ def send_market_prediction_alert(pred, market_data):
         f"⚠️ تنبيه تحليلي افتراضي"
     )
     telegram(msg)
+
 
 def send_spy_contract_alert(pred, opt_spy):
     """2. رسالة عقد SPY مستقلة"""
