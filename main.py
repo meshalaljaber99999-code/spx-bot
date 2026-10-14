@@ -1,7 +1,6 @@
 # ============================================================
 # صَفاء التحليل v25.4-Points-Speed-MegaCaps | Pre-Market & NY Session
 # Pre-Market Reports • SPX Calls/Puts • 5-Point Spike • Open Premiums
-# تصميم أبو سحاب
 # NO AUTOMATIC ORDERS — simulated tracking, not actual P&L
 # ============================================================
 import os
@@ -307,13 +306,13 @@ def get_precision_synthetic_spx():
     precision_synthetic_spx = base_spx_estimate * (1.0 + weighted_dollar_move)
 
     if weighted_dollar_move > 0.003:
-        market_prediction = "اتجاه صاعد قوي ومؤشر SPX يستهدف الصعود 🚀 (CALL)"
-    elif weighted_dollar_move > 0:
-        market_prediction = "ميل طفيف للصعود واستقرار إيجابي 🟢"
+        market_prediction = "صعود 🚀"
+    elif weighted_dollar_move >= 0:
+        market_prediction = "صعود طفيف 🟢"
     elif weighted_dollar_move < -0.003:
-        market_prediction = "ضغوط بيعية واضحة ومؤشر SPX يتجه للهبوط 📉 (PUT)"
+        market_prediction = "نزول 📉"
     else:
-        market_prediction = "حركة عرضية وتماسك بانتظار العزم ⚪"
+        market_prediction = "نزول طفيف 🔴"
 
     return {
         "synthetic_spx": precision_synthetic_spx,
@@ -413,7 +412,7 @@ def train_predict(bars):
     
     return {
         "ok": True,
-        "signal": "CALL" if prob_up >= 0.5 else "PUT",
+        "signal": "صعود 🚀" if prob_up >= 0.5 else "نزول 📉",
         "prob_up": prob_up,
         "probability": max(prob_up, 1 - prob_up) * 100,
         "current_price": price,
@@ -429,7 +428,7 @@ def fetch_contracts(symbol, direction, price, strict_today=True):
     params = {
         "underlying_symbols": symbol,
         "status": "active",
-        "type": "call" if direction == "CALL" else "put",
+        "type": "call" if direction == "صعود 🚀" else "put",
         "limit": 500,
     }
     if strict_today:
@@ -494,149 +493,54 @@ def best_option(symbol, price, direction, vol_ratio=1.0, strict_today=True):
         log.exception(f"Option scan failed for {symbol}")
     return None
 
-# -------------------- JOURNAL & TELEGRAM ALERTS --------------------
+# -------------------- SPLIT TELEGRAM ALERTS --------------------
+def send_market_prediction_alert(pred, market_data):
+    """1. رسالة توقع المؤشر مستقلة (صعود أو نزول + المدة + النقاط)"""
+    direction = pred["signal"]
+    expected_minutes = HORIZON * BAR_MINUTES
+    expected_points = round(pred["atr"] * math.sqrt(HORIZON), 2)
+    
+    msg = (
+        f"📊 <b>توقع اتجاه مؤشر SPX</b>\n\n"
+        f" الاتجاه المتوقع: <b>{direction}</b>\n"
+        f" الإطار الزمني للهدف: خلال <b>{expected_minutes} دقيقة</b> القادمة\n"
+        f" الحركة المتوقعة: <b>±{expected_points} نقطة</b>\n"
+        f" نسبة الثقة: <b>{pred['probability']:.1f}%</b>\n\n"
+        f"⚠️ تنبيه تحليلي افتراضي"
+    )
+    telegram(msg)
+
+def send_spy_contract_alert(pred, opt_spy):
+    """2. رسالة عقد SPY مستقلة"""
+    if not opt_spy:
+        return
+    cost = round(float(opt_spy["ask"]) * 100, 2)
+    exp_date = opt_spy.get("expiration", "اليوم (0DTE)")
+    
+    msg = (
+        f"🎯 <b>عقد SPY الموصى به (0DTE)</b>\n\n"
+        f"▫️ الرمز: <code>{opt_spy['symbol']}</code>\n"
+        f"▫️ Strike: ${opt_spy['strike']:.2f}\n"
+        f"▫️ تاريخ الانتهاء: <b>{exp_date}</b>\n"
+        f"▫️ التكلفة التقديرية لعقد واحد: <b>${cost:.2f}</b>\n\n"
+        f"⚠️ تنبيه افتراضي تحليلي"
+    )
+    telegram(msg)
+
 def send_spike_alert(price_diff, current_price, synthetic_spx):
     direction = "صعوداً 🚀" if price_diff > 0 else "هبوطاً 📉"
     message = (
-        f"⚡ تنبيه حركة قوية (SPIKE ALERT)\n"
-        f"تصميم أبو سحاب\n\n"
-        f"⚠️ تحرك مفاجئ في المؤشر بمقدار {abs(price_diff):.2f} نقطة {direction}!\n"
+        f"⚡ <b>تنبيه حركة قوية (SPIKE ALERT)</b>\n\n"
+        f"⚠️ تحرك مفاجئ بمقدار {abs(price_diff):.2f} نقطة {direction}!\n"
         f"📊 سعر SPY الحالي: ${current_price:.2f}\n"
-        f"📈 مؤشر SPX الاصطناعي: ${synthetic_spx:.2f}\n\n"
-        f"⏳ يرجى مراقبة السوق لاقتناص الفرصة اللحظية."
+        f"📈 SPX الاصطناعي: ${synthetic_spx:.2f}"
     )
     telegram(message)
-
-def send_pre_market_report():
-    market_data = get_precision_synthetic_spx()
-    synth_spx = market_data["synthetic_spx"]
-    market_prediction = market_data["market_prediction"]
-    
-    spy_bars = fetch_bars(SPY, days=2)
-    spy_price = float(spy_bars["close"].iloc[-1]) if not spy_bars.empty else 500.0
-
-    spx_call_target = synth_spx + 15.0
-    spx_put_target = synth_spx - 15.0
-
-    spy_call_opt = best_option(SPY, spy_price, "CALL", strict_today=True)
-    spy_put_opt = best_option(SPY, spy_price, "PUT", strict_today=True)
-
-    leaders_text = ""
-    for ticker, info in market_data["leaders"].items():
-        dir_t = "CALL" if info["change_pct"] >= 0 else "PUT"
-        best_opt_ldr = best_option(ticker, info["price"], dir_t, strict_today=False)
-        strike_ldr = f"${best_opt_ldr['strike']}" if best_opt_ldr else "N/A"
-        prem_ldr = f"${best_opt_ldr['ask']:.2f}" if best_opt_ldr else "N/A"
-        exp_date = best_opt_ldr["expiration"] if best_opt_ldr else "غير متوفر"
-        
-        leaders_text += (
-            f"🔹 {ticker}: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
-            f"   └ توقع العقد: {dir_t} | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: {exp_date}\n"
-        )
-
-    spy_c_sym = spy_call_opt['symbol'] if spy_call_opt else "N/A"
-    spy_p_sym = spy_put_opt['symbol'] if spy_put_opt else "N/A"
-
-    message = (
-        f"⏰ {NAME} | تقرير ما قبل السوق (تحضيري)\n"
-        f"تصميم أبو سحاب\n\n"
-        f"📊 مؤشر SPY: ${spy_price:.2f}\n"
-        f"📈 مؤشر SPX الاصطناعي: ${synth_spx:.2f} ({market_data['weighted_change']:+.2f}%)\n"
-        f" توقع اتجاه المؤشر: {market_prediction}\n\n"
-        f"🎯 توقعات خيارات مؤشر SPX (كول & بت) قبل الافتتاح:\n"
-        f"🟢 SPX CALL (صعود): مستهدف اختراق قرب {spx_call_target:.2f}\n"
-        f"🔴 SPX PUT (هبوط): مستهدف كسر قرب {spx_put_target:.2f}\n\n"
-        f"🎯 توقعات عقود SPY (0DTE):\n"
-        f"▫️ كول مقترح: {spy_c_sym}\n"
-        f"▫️ بت مقترح: {spy_p_sym}\n\n"
-        f"⭐ عقود الشركات القيادية المقترحة:\n"
-        f"{leaders_text}\n"
-        f"⚠️ تقرير استباقي قبل الافتتاح - تصميم أبو سحاب."
-    )
-    
-    sent = telegram(message)
-    if sent:
-        log.info("Pre-market report sent successfully.")
-
-def append_and_send_alert(pred, opt_spy, market_data):
-    sid = f"SF-{now_ny():%Y%m%d-%H%M%S}"
-    cost = round(float(opt_spy["ask"]) * 100, 2)
-    
-    expected_points = pred["atr"] * math.sqrt(HORIZON) * 1.5
-    vol_ratio = pred["vol_ratio"]
-    
-    if vol_ratio >= 2.0:
-        speed_text = "⚡ صاروخية وعنيفة جداً (High Spike Velocity)"
-    elif vol_ratio >= 1.4:
-        speed_text = "🚀 سريعة وقوية (Strong Momentum)"
-    else:
-        speed_text = "🌊 متدرجة وثابتة (Steady Trend)"
-
-    synth_spx = market_data["synthetic_spx"]
-    spx_call_target = synth_spx + (expected_points * 10)
-    spx_put_target = synth_spx - (expected_points * 10)
-
-    leaders_text = ""
-    for ticker, info in market_data["leaders"].items():
-        dir_t = "CALL" if info["change_pct"] >= 0 else "PUT"
-        best_opt_ldr = best_option(ticker, info["price"], dir_t, strict_today=False)
-        
-        if best_opt_ldr:
-            exp_date = best_opt_ldr["expiration"]
-            strike_ldr = f"${best_opt_ldr['strike']}"
-            prem_ldr = f"${best_opt_ldr['ask']:.2f}"
-        else:
-            exp_date = "غير متوفر"
-            strike_ldr = "N/A"
-            prem_ldr = "N/A"
-        
-        leaders_text += (
-            f"🔹 {ticker}: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
-            f"   └ التوقع: {dir_t} | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: {exp_date}\n"
-        )
-
-    direction_ar = "صعود 🚀 (CALL)" if pred['signal'] == "CALL" else "هبوط 📉 (PUT)"
-    synth_chg = market_data["weighted_change"]
-    market_prediction = market_data["market_prediction"]
-
-    message = (
-        f"🎯 {NAME} | التقرير الشامل وعقود السوق\n"
-        f"تصميم أبو سحاب\n"
-        f"🆔 {sid}\n\n"
-        f"📊 مؤشر SPY الأساسي (0DTE): ${pred['current_price']:.2f}\n"
-        f"📈 مؤشر SPX الاصطناعي: ${synth_spx:.2f} ({synth_chg:+.2f}%)\n"
-        f" توقع حركة المؤشر أثناء السوق: {market_prediction}\n\n"
-        f"🎯 توقعات خيارات مؤشر SPX (كول & بت):\n"
-        f"🟢 SPX CALL (صعود): مستهدف اختراق قرب {spx_call_target:.2f}\n"
-        f"🔴 SPX PUT (هبوط): مستهدف كسر قرب {spx_put_target:.2f}\n\n"
-        f" اتجاه نموذج البوت الذكي: {direction_ar}\n"
-        f" النطاق المتوقع للحركة: ±{expected_points:.2f} نقطة\n"
-        f" سرعة الزخم: {speed_text} (الثقة: {pred['probability']:.1f}%)\n\n"
-        f"🎯 عقد SPY الموصى به (0DTE - سعر مفتوح):\n"
-        f"▫️ الرمز: {opt_spy['symbol']}\n"
-        f"▫️ Strike: ${opt_spy['strike']:.2f} | ينتهي في: {opt_spy['expiration']}\n"
-        f"▫️ التكلفة التقديرية لعقد: ${cost:.2f}\n\n"
-        f"⭐ تحليل وعقود الشركات القيادية (عقود مرنة ومربحة):\n"
-        f"{leaders_text}\n"
-        f"⚠️ تنبيه افتراضي تحليلي - تصميم أبو سحاب."
-    )
-    
-    sent = telegram(message)
-    if sent:
-        log.info("Comprehensive alert sent successfully: %s", sid)
 
 # -------------------- MAIN SCAN LOOP --------------------
 def run_scan():
     state = read_state()
     current_time_str = now_ny().strftime("%Y-%m-%d %H:%M")
-
-    if is_pre_market_time():
-        last_pre_market = state.get("last_pre_market_date", "")
-        today_date_str = now_ny().strftime("%Y-%m-%d")
-        if last_pre_market != today_date_str:
-            send_pre_market_report()
-            state["last_pre_market_date"] = today_date_str
-            save_state(state)
 
     if not in_signal_window():
         return
@@ -665,17 +569,19 @@ def run_scan():
     if state.get("last_signal_key") == signal_key:
         return
 
-    opt_spy = best_option(SPY, pred["current_price"], pred["signal"], vol_ratio=pred["vol_ratio"], strict_today=True)
-    if not opt_spy:
-        return
+    opt_spy = best_option(SPY, pred["current_price"], pred["signal"] if "صعود" in pred["signal"] else "PUT", vol_ratio=pred["vol_ratio"], strict_today=True)
 
-    append_and_send_alert(pred, opt_spy, market_data)
+    # إرسال الرسائل بشكل منفصل تماماً
+    send_market_prediction_alert(pred, market_data)
+    if opt_spy:
+        send_spy_contract_alert(pred, opt_spy)
+
     state["last_signal_key"] = signal_key
     state["last_signal_time"] = stamp()
     save_state(state)
 
 # ============================================================
-# إضافة: عقود الشركات الكبرى (رسالة مستقلة) | تصميم أبو سحاب
+# رسالة عقود الشركات الكبرى المستقلة
 # ============================================================
 LDR_STATE_FILE = ROOT / "safa_leaders_state_v254.json"
 LDR_MIN_MOVE = 0.7          
@@ -734,7 +640,7 @@ def _ldr_contract(ticker, price, direction):
                 {
                     "underlying_symbols": und,
                     "status": "active",
-                    "type": "call" if direction == "CALL" else "put",
+                    "type": "call" if direction == "صعود 🚀" else "put",
                     "expiration_date": exp.isoformat(),
                     "strike_price_gte": str(round(price * 0.95, 2)),
                     "strike_price_lte": str(round(price * 1.05, 2)),
@@ -763,20 +669,15 @@ def _ldr_contract(ticker, price, direction):
     return None
 
 def _ldr_block(ticker, info, opt, spy_pct):
-    direction = "CALL" if info["pct"] > 0 else "PUT"
+    direction = "صعود 🚀" if info["pct"] > 0 else "نزول 📉"
     ask = opt["ask"]
-    conflict = ""
-    if math.isfinite(spy_pct) and (info["pct"] > 0) != (spy_pct > 0):
-        conflict = " ⚠️ يعاكس SPY"
-    kind = "0DTE" if opt["exp"] == now_ny().date() else "أسبوعي"
+    kind = "0DTE (ينتهي اليوم)" if opt["exp"] == now_ny().date() else f"أسبوعي (ينتهي {opt['exp'].strftime('%Y-%m-%d')})"
     return (
-        f"🔹 {ticker}: ${info['price']:.2f} ({info['pct']:+.2f}% عن الافتتاح){conflict}\n"
-        f"   ▫️ {opt['symbol']}\n"
-        f"   ▫️ Strike: ${opt['strike']:.2f} | ينتهي: {opt['exp'].strftime('%m/%d')} ({kind})\n"
+        f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['pct']:+.2f}%)\n"
+        f"   ▫️ الرمز: <code>{opt['symbol']}</code>\n"
+        f"   ▫️ Strike: ${opt['strike']:.2f} | <b>{kind}</b>\n"
         f"   ▫️ السعر: ${ask:.2f} | التكلفة: ${ask * 100:.2f}\n"
-        f"   ▫️ السبريد: {opt['spread']:.1f}% ✅\n"
-        f"   ▫️ 🎯 هدف +{LDR_TP * 100:.0f}%: ${ask * (1 + LDR_TP):.2f} | "
-        f"🛑 وقف −{LDR_SL * 100:.0f}%: ${ask * (1 - LDR_SL):.2f}\n\n"
+        f"   ▫️ 🎯 هدف +30%: ${ask * (1 + LDR_TP):.2f} | 🛑 وقف −25%: ${ask * (1 - LDR_SL):.2f}\n\n"
     ), direction
 
 def _ldr_send(text):
@@ -794,6 +695,7 @@ def _ldr_send(text):
     return ok
 
 def run_leaders_scan():
+    """3. رسالة عقود الشركات الكبرى المستقلة مع وقت انتهاء العقود"""
     state = _ldr_read()
     now_ts = time.time()
     tick_ts = state.get("tickers", {})
@@ -818,18 +720,16 @@ def run_leaders_scan():
         [(t, v) for t, v in leaders.items() if abs(v["pct"]) >= LDR_MIN_MOVE],
         key=lambda x: -abs(x[1]["pct"]),
     )
-    neutral = [t for t, v in leaders.items() if abs(v["pct"]) < LDR_MIN_MOVE]
     sent_any = False
 
     for t, v in strong:
-        direction = "CALL" if v["pct"] > 0 else "PUT"
+        direction = "صعود 🚀" if v["pct"] > 0 else "نزول 📉"
         opt = _ldr_contract(t, v["price"], direction)
         tick_ts[t] = now_ts
         if not opt:
-            neutral.append(f"{t}(لا عقد مناسب)")
             continue
         block, d = _ldr_block(t, v, opt, spy_pct)
-        if d == "CALL":
+        if d == "صعود 🚀":
             calls += block
         else:
             puts += block
@@ -844,91 +744,21 @@ def run_leaders_scan():
         return
 
     n = now_ny()
-    riyadh = n.astimezone(ZoneInfo("Asia/Riyadh"))
-    msg = (
-        f"⭐ {NAME} | عقود الشركات الكبرى\n"
-        f"تصميم أبو سحاب\n"
-        f"🕐 {n:%I:%M %p} نيويورك ({riyadh:%I:%M %p} الرياض)\n\n"
-    )
-    if spy:
-        msg += f"📈 SPY: ${spy['price']:.2f} ({spy['pct']:+.2f}% اليوم)\n\n"
+    msg = f"⭐ <b>عقود الشركات الكبرى (MegaCaps)</b>\n🕐 {n:%I:%M %p} نيويورك\n\n"
     if calls:
-        msg += "🟢 فرص CALL:\n" + calls
+        msg += "🟢 <b>فرص الصعود (CALL):</b>\n" + calls
     if puts:
-        msg += "🔴 فرص PUT:\n" + puts
-    if neutral:
-        msg += f"⚪ بدون إشارة واضحة:\n{', '.join(neutral)}\n\n"
-    msg += (
-        f"⏰ الخروج الإجباري: {PAPER_EXIT_TIME} نيويورك\n\n"
-        f"⚠️ تنبيه تحليلي افتراضي، وليس أمر تنفيذ."
-    )
-    if _ldr_send(msg):
-        log.info("Leaders contracts message sent.")
-
-
-# ============================================================
-# إضافة: توقع SPX اللحظي (3 مصادر + تصنيف ثقة) | تصميم أبو سحاب
-# ============================================================
-SPX_STATE_FILE = ROOT / "safa_spx_forecast_state_v254.json"
-SPX_UPDATE_SEC = 300          
-SPX_SPIKE_PCT = 0.5           
-SPX_VOL_RATIO_MIN = 1.3       
-SPX_MOVE_MIN_PCT = 0.3        
-SPX_ATR_LOOKBACK_DAYS = 30    
-SPX_TICKER = "^GSPC"
-
-def _spx_read():
-    try:
-        return json.loads(SPX_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-def _spx_save(state):
-    tmp = SPX_STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SPX_STATE_FILE)
-
-def _spx_real_price():
-    """سعر SPX الحقيقي (قد يتأخر دقائق) من yfinance، لا يُستخدم إلا للعرض."""
-    try:
-        data = yf.download(SPX_TICKER, period="5d", interval="5m", progress=False)
-        if data.empty:
-            raise RuntimeError("no data")
-        close = data["Close"].dropna()
-        last_price = float(close.iloc[-1].iloc[0]) if hasattr(close.iloc[-1], "iloc") else float(close.iloc[-1])
-        prev_close = float(close.iloc[0].iloc[0]) if hasattr(close.iloc[0], "iloc") else float(close.iloc[0])
-        pct = (last_price / prev_close - 1.0) * 100
-        return {"price": last_price, "pct": pct}
-    except Exception:
-        return None
-
-def run_spx_forecast_scan():
-    """فحص وإرسال توقعات SPX اللحظية والتحديثات."""
-    state = _spx_read()
-    now_ts = time.time()
-    last_update = state.get("last_update_ts", 0)
+        msg += "🔴 <b>فرص النزول (PUT):</b>\n" + puts
     
-    if now_ts - last_update < SPX_UPDATE_SEC:
-        return
+    msg += "⚠️ تنبيه تحليلي افتراضي"
+    _ldr_send(msg)
 
-    real_spx = _spx_real_price()
-    market_data = get_precision_synthetic_spx()
-    
-    synth_spx = market_data["synthetic_spx"]
-    synth_pct = market_data["weighted_change"]
-    
-    state["last_update_ts"] = now_ts
-    _spx_save(state)
-
-    log.info("SPX Forecast scan executed successfully. Synthetic SPX: %.2f", synth_spx)
-
-# -------------------- MAIN APP EXECUTION --------------------
 # -------------------- MAIN APP EXECUTION --------------------
 if __name__ == "__main__":
-    log.info(f"Starting {NAME} v{VERSION} - تصميم أبو سحاب")
+    log.info(f"Starting {NAME} v{VERSION}")
     
     try:
-        telegram(f"🚀 تم تشغيل نظام {NAME} بنجاح!\nتصميم أبو سحاب")
+        telegram(f"🚀 تم تشغيل نظام {NAME} بنجاح!")
     except Exception as e:
         log.error(f"Telegram startup message failed: {e}")
     
@@ -939,7 +769,6 @@ if __name__ == "__main__":
             if market_open():
                 run_scan()
                 run_leaders_scan()
-                run_spx_forecast_scan()
             else:
                 log.info("⏳ السوق مغلق حالياً.. البوت في وضع الاستعداد.")
                 
