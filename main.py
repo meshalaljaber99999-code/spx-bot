@@ -621,22 +621,30 @@ def _ldr_expiries():
     return out[:3]
 
 def _ldr_snapshots():
-    symbols = list(TOP_LEADERS.keys()) + [SPY]
+    # استبدال BRK-B بـ BRK.B ليتوافق مع متطلبات Alpaca للرمز
+    alpaca_symbols_map = {t: t.replace("-", ".") for t in list(TOP_LEADERS.keys()) + [SPY]}
+    reverse_map = {v: k for k, v in alpaca_symbols_map.items()}
+    
+    symbols_for_api = list(alpaca_symbols_map.values())
+    
     data = alpaca_get(
         f"{DATA_URL}/v2/stocks/snapshots",
-        {"symbols": ",".join(symbols), "feed": STOCK_FEED},
+        {"symbols": ",".join(symbols_for_api), "feed": STOCK_FEED},
     )
     data = data.get("snapshots", data)
     out = {}
-    for t in symbols:
-        s = data.get(t) or {}
+    for api_sym, original_ticker in reverse_map.items():
+        s = data.get(api_sym) or {}
         daily = s.get("dailyBar") or {}
         trade = s.get("latestTrade") or {}
         price = num(trade.get("p"), num(daily.get("c")))
         opn = num(daily.get("o"))
         if math.isfinite(price) and math.isfinite(opn) and opn > 0:
-            out[t] = {"price": price, "open": opn, "pct": (price / opn - 1) * 100}
+            out[original_ticker] = {"price": price, "open": opn, "pct": (price / opn - 1) * 100}
     return out
+
+
+
 
 def _ldr_contract(ticker, price, direction):
     und = ticker.replace(".", "")
