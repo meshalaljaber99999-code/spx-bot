@@ -680,6 +680,211 @@ def run_scan():
     state["last_signal_time"] = stamp()
     save_state(state)
 
+# ============================================================
+# إضافة: عقود الشركات الكبرى (رسالة مستقلة) | تصميم أبو سحاب
+# ============================================================
+LDR_STATE_FILE = ROOT / "safa_leaders_state_v254.json"
+LDR_MIN_MOVE = 0.7          # أقل حركة (%) عن الافتتاح لاعتبارها إشارة
+LDR_SPIKE_MOVE = 1.5        # حركة (%) تُرسل فوراً
+LDR_MAX_SPREAD = 0.15       # أقصى سبريد (15%)
+LDR_HOURLY_SEC = 3600       # إرسال دوري كل ساعة
+LDR_TICKER_COOLDOWN = 1800  # لا يتكرر نفس السهم قبل 30 دقيقة (للإرسال الفوري)
+LDR_TP, LDR_SL = 0.30, 0.25
+LDR_TG_LIMIT = 3800
+
+
+def _ldr_read():
+    try:
+        return json.loads(LDR_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _ldr_save(state):
+    tmp = LDR_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(LDR_STATE_FILE)
+
+
+def _ldr_expiries():
+    """اليوم (0DTE) أولاً، ثم أقرب جمعتين، بدون تكرار."""
+    today = now_ny().date()
+    out = [today]
+    d = today + timedelta(days=1)
+    for _ in range(14):
+        if d.weekday() == 4 and d not in out:
+            out.append(d)
+        d += timedelta(days=1)
+    return out[:3]
+
+
+def _ldr_snapshots():
+    """سعر اللحظة + افتتاح اليوم من Alpaca."""
+    symbols = list(TOP_LEADERS.keys()) + [SPY]
+    data = alpaca_get(
+        f"{DATA_URL}/v2/stocks/snapshots",
+        {"symbols": ",".join(symbols), "feed": STOCK_FEED},
+    )
+    data = data.get("snapshots", data)
+    out = {}
+    for t in symbols:
+        s = data.get(t) or {}
+        daily = s.get("dailyBar") or {}
+        trade = s.get("latestTrade") or {}
+        price = num(trade.get("p"), num(daily.get("c")))
+        opn = num(daily.get("o"))
+        if math.isfinite(price) and math.isfinite(opn) and opn > 0:
+            out[t] = {"price": price, "open": opn, "pct": (price / opn - 1) * 100}
+    return out
+
+
+def _ldr_contract(ticker, price, direction):
+    """أقرب Strike بتاريخ (اليوم ثم الجمعة) مع فلتر السبريد."""
+    und = ticker.replace(".", "")  # BRK.B -> BRKB للخيارات
+    for exp in _ldr_expiries():
+        try:
+            payload = alpaca_get(
+                f"{TRADING_URL}/v2/options/contracts",
+                {
+                    "underlying_symbols": und,
+                    "status": "active",
+                    "type": "call" if direction == "CALL" else "put",
+                    "expiration_date": exp.isoformat(),
+                    "strike_price_gte": str(round(price * 0.95, 2)),
+                    "strike_price_lte": str(round(price * 1.05, 2)),
+                    "limit": 200,
+                },
+            )
+            contracts = payload.get("option_contracts") or payload.get("contracts") or []
+            contracts = [c for c in contracts if c.get("symbol") and math.isfinite(num(c.get("strike_price")))]
+            contracts.sort(key=lambda c: abs(num(c.get("strike_price")) - price))
+            for c in contracts[:6]:
+                q = _get_option_quote(c["symbol"])
+                if q is None:
+                    continue
+                spread = (q["ask"] - q["bid"]) / q["mid"] if q["mid"] > 0 else 1.0
+                if spread > LDR_MAX_SPREAD:
+                    continue
+                return {
+                    "symbol": c["symbol"],
+                    "strike": num(c.get("strike_price")),
+                    "exp": exp,
+                    "ask": q["ask"],
+                    "spread": spread * 100,
+                }
+        except Exception:
+            log.exception("Leaders contract scan failed for %s", ticker)
+    return None
+
+
+def _ldr_block(ticker, info, opt, spy_pct):
+    direction = "CALL" if info["pct"] > 0 else "PUT"
+    ask = opt["ask"]
+    conflict = ""
+    if math.isfinite(spy_pct) and (info["pct"] > 0) != (spy_pct > 0):
+        conflict = " ⚠️ يعاكس SPY"
+    kind = "0DTE" if opt["exp"] == now_ny().date() else "أسبوعي"
+    return (
+        f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['pct']:+.2f}% عن الافتتاح){conflict}\n"
+        f"   ▫️ <code>{opt['symbol']}</code>\n"
+        f"   ▫️ Strike: ${opt['strike']:.2f} | ينتهي: {opt['exp'].strftime('%m/%d')} ({kind})\n"
+        f"   ▫️ السعر: ${ask:.2f} | التكلفة: <b>${ask * 100:.2f}</b>\n"
+        f"   ▫️ السبريد: {opt['spread']:.1f}% ✅\n"
+        f"   ▫️ 🎯 هدف +{LDR_TP * 100:.0f}%: ${ask * (1 + LDR_TP):.2f} | "
+        f"🛑 وقف −{LDR_SL * 100:.0f}%: ${ask * (1 - LDR_SL):.2f}\n\n"
+    ), direction
+
+
+def _ldr_send(text):
+    """تقسيم تلقائي إذا تجاوزت الرسالة حد تلقرام."""
+    parts, cur = [], ""
+    for line in text.split("\n\n"):
+        if len(cur) + len(line) + 2 > LDR_TG_LIMIT and cur:
+            parts.append(cur)
+            cur = ""
+        cur += line + "\n\n"
+    if cur.strip():
+        parts.append(cur)
+    ok = True
+    for p in parts:
+        ok = telegram(p.strip()) and ok
+    return ok
+
+
+def run_leaders_scan():
+    """رسالة مستقلة لعقود الشركات الكبرى: كل ساعة، أو فوراً عند حركة قوية."""
+    state = _ldr_read()
+    now_ts = time.time()
+    tick_ts = state.get("tickers", {})
+    hourly_due = now_ts - state.get("last_hourly_ts", 0) >= LDR_HOURLY_SEC
+
+    snaps = _ldr_snapshots()
+    spy = snaps.get(SPY)
+    leaders = {t: v for t, v in snaps.items() if t in TOP_LEADERS}
+    if not leaders:
+        return
+
+    spike_due = any(
+        abs(v["pct"]) >= LDR_SPIKE_MOVE and now_ts - tick_ts.get(t, 0) >= LDR_TICKER_COOLDOWN
+        for t, v in leaders.items()
+    )
+    if not (hourly_due or spike_due):
+        return
+
+    spy_pct = spy["pct"] if spy else float("nan")
+    calls, puts = "", ""
+    strong = sorted(
+        [(t, v) for t, v in leaders.items() if abs(v["pct"]) >= LDR_MIN_MOVE],
+        key=lambda x: -abs(x[1]["pct"]),
+    )
+    neutral = [t for t, v in leaders.items() if abs(v["pct"]) < LDR_MIN_MOVE]
+    sent_any = False
+
+    for t, v in strong:
+        direction = "CALL" if v["pct"] > 0 else "PUT"
+        opt = _ldr_contract(t, v["price"], direction)
+        tick_ts[t] = now_ts  # تبريد حتى لو ما وُجد عقد
+        if not opt:
+            neutral.append(f"{t}(لا عقد مناسب)")
+            continue
+        block, d = _ldr_block(t, v, opt, spy_pct)
+        if d == "CALL":
+            calls += block
+        else:
+            puts += block
+        sent_any = True
+
+    if hourly_due:
+        state["last_hourly_ts"] = now_ts
+    state["tickers"] = tick_ts
+    _ldr_save(state)
+
+    if not sent_any:
+        return
+
+    n = now_ny()
+    riyadh = n.astimezone(ZoneInfo("Asia/Riyadh"))
+    msg = (
+        f"⭐ <b>{NAME} | عقود الشركات الكبرى</b>\n"
+        f"<i>تصميم أبو سحاب</i>\n"
+        f"🕐 {n:%I:%M %p} نيويورك ({riyadh:%I:%M %p} الرياض)\n\n"
+    )
+    if spy:
+        msg += f"📈 <b>SPY:</b> ${spy['price']:.2f} ({spy['pct']:+.2f}% اليوم)\n\n"
+    if calls:
+        msg += "🟢 <b>فرص CALL:</b>\n" + calls
+    if puts:
+        msg += "🔴 <b>فرص PUT:</b>\n" + puts
+    if neutral:
+        msg += f"⚪ <b>بدون إشارة واضحة:</b>\n{', '.join(neutral)}\n\n"
+    msg += (
+        f"⏰ الخروج الإجباري: {PAPER_EXIT_TIME} نيويورك\n\n"
+        f"⚠️ تنبيه تحليلي افتراضي، وليس أمر تنفيذ."
+    )
+    if _ldr_send(msg):
+        log.info("Leaders contracts message sent.")
+
+
 def main():
     log.info("%s v%s | Pre-Market Reports, NY Session, 5-Point Spike & SPX Calls/Puts", NAME, VERSION)
     if not KEY or not SECRET:
@@ -688,6 +893,8 @@ def main():
         try:
             if market_open() or is_pre_market_time():
                 run_scan()
+            if in_signal_window():
+                run_leaders_scan()
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             break
