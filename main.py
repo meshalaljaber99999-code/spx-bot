@@ -200,7 +200,6 @@ def in_signal_window():
     )
 
 def is_pre_market_time():
-    """تحديد وقت ما قبل السوق بساعة (مثلاً بين 8:30 و 8:35 صباحاً بتوقيت نيويورك)"""
     n = now_ny()
     return (
         n.weekday() < 5
@@ -509,7 +508,6 @@ def send_spike_alert(price_diff, current_price, synthetic_spx):
     telegram(message)
 
 def send_pre_market_report():
-    """إرسال التقرير التحضيري قبل السوق بساعة (يشمل توقعات SPX وعقود الأوبشن للشركات والـ SPY)"""
     market_data = get_precision_synthetic_spx()
     synth_spx = market_data["synthetic_spx"]
     market_prediction = market_data["market_prediction"]
@@ -517,11 +515,9 @@ def send_pre_market_report():
     spy_bars = fetch_bars(SPY, days=2)
     spy_price = float(spy_bars["close"].iloc[-1]) if not spy_bars.empty else 500.0
 
-    # توقعات خيارات SPX قبل السوق
     spx_call_target = synth_spx + 15.0
     spx_put_target = synth_spx - 15.0
 
-    # عقد SPY تقريبي قبل السوق
     spy_call_opt = best_option(SPY, spy_price, "CALL", strict_today=True)
     spy_put_opt = best_option(SPY, spy_price, "PUT", strict_today=True)
 
@@ -634,7 +630,6 @@ def run_scan():
     state = read_state()
     current_time_str = now_ny().strftime("%Y-%m-%d %H:%M")
 
-    # 1. إرسال تقرير ما قبل السوق (مرة واحدة يومياً في وقته)
     if is_pre_market_time():
         last_pre_market = state.get("last_pre_market_date", "")
         today_date_str = now_ny().strftime("%Y-%m-%d")
@@ -643,7 +638,6 @@ def run_scan():
             state["last_pre_market_date"] = today_date_str
             save_state(state)
 
-    # 2. العمل أثناء الجلسة الرسمية
     if not in_signal_window():
         return
 
@@ -684,14 +678,13 @@ def run_scan():
 # إضافة: عقود الشركات الكبرى (رسالة مستقلة) | تصميم أبو سحاب
 # ============================================================
 LDR_STATE_FILE = ROOT / "safa_leaders_state_v254.json"
-LDR_MIN_MOVE = 0.7          # أقل حركة (%) عن الافتتاح لاعتبارها إشارة
-LDR_SPIKE_MOVE = 1.5        # حركة (%) تُرسل فوراً
-LDR_MAX_SPREAD = 0.15       # أقصى سبريد (15%)
-LDR_HOURLY_SEC = 3600       # إرسال دوري كل ساعة
-LDR_TICKER_COOLDOWN = 1800  # لا يتكرر نفس السهم قبل 30 دقيقة (للإرسال الفوري)
+LDR_MIN_MOVE = 0.7          
+LDR_SPIKE_MOVE = 1.5        
+LDR_MAX_SPREAD = 0.15       
+LDR_HOURLY_SEC = 3600       
+LDR_TICKER_COOLDOWN = 1800  
 LDR_TP, LDR_SL = 0.30, 0.25
 LDR_TG_LIMIT = 3800
-
 
 def _ldr_read():
     try:
@@ -699,15 +692,12 @@ def _ldr_read():
     except (OSError, ValueError):
         return {}
 
-
 def _ldr_save(state):
     tmp = LDR_STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(LDR_STATE_FILE)
 
-
 def _ldr_expiries():
-    """اليوم (0DTE) أولاً، ثم أقرب جمعتين، بدون تكرار."""
     today = now_ny().date()
     out = [today]
     d = today + timedelta(days=1)
@@ -717,9 +707,7 @@ def _ldr_expiries():
         d += timedelta(days=1)
     return out[:3]
 
-
 def _ldr_snapshots():
-    """سعر اللحظة + افتتاح اليوم من Alpaca."""
     symbols = list(TOP_LEADERS.keys()) + [SPY]
     data = alpaca_get(
         f"{DATA_URL}/v2/stocks/snapshots",
@@ -737,10 +725,8 @@ def _ldr_snapshots():
             out[t] = {"price": price, "open": opn, "pct": (price / opn - 1) * 100}
     return out
 
-
 def _ldr_contract(ticker, price, direction):
-    """أقرب Strike بتاريخ (اليوم ثم الجمعة) مع فلتر السبريد."""
-    und = ticker.replace(".", "")  # BRK.B -> BRKB للخيارات
+    und = ticker.replace(".", "")
     for exp in _ldr_expiries():
         try:
             payload = alpaca_get(
@@ -776,7 +762,6 @@ def _ldr_contract(ticker, price, direction):
             log.exception("Leaders contract scan failed for %s", ticker)
     return None
 
-
 def _ldr_block(ticker, info, opt, spy_pct):
     direction = "CALL" if info["pct"] > 0 else "PUT"
     ask = opt["ask"]
@@ -794,9 +779,7 @@ def _ldr_block(ticker, info, opt, spy_pct):
         f"🛑 وقف −{LDR_SL * 100:.0f}%: ${ask * (1 - LDR_SL):.2f}\n\n"
     ), direction
 
-
 def _ldr_send(text):
-    """تقسيم تلقائي إذا تجاوزت الرسالة حد تلقرام."""
     parts, cur = [], ""
     for line in text.split("\n\n"):
         if len(cur) + len(line) + 2 > LDR_TG_LIMIT and cur:
@@ -810,9 +793,7 @@ def _ldr_send(text):
         ok = telegram(p.strip()) and ok
     return ok
 
-
 def run_leaders_scan():
-    """رسالة مستقلة لعقود الشركات الكبرى: كل ساعة، أو فوراً عند حركة قوية."""
     state = _ldr_read()
     now_ts = time.time()
     tick_ts = state.get("tickers", {})
@@ -843,7 +824,7 @@ def run_leaders_scan():
     for t, v in strong:
         direction = "CALL" if v["pct"] > 0 else "PUT"
         opt = _ldr_contract(t, v["price"], direction)
-        tick_ts[t] = now_ts  # تبريد حتى لو ما وُجد عقد
+        tick_ts[t] = now_ts
         if not opt:
             neutral.append(f"{t}(لا عقد مناسب)")
             continue
@@ -889,13 +870,12 @@ def run_leaders_scan():
 # إضافة: توقع SPX اللحظي (3 مصادر + تصنيف ثقة) | تصميم أبو سحاب
 # ============================================================
 SPX_STATE_FILE = ROOT / "safa_spx_forecast_state_v254.json"
-SPX_UPDATE_SEC = 300          # تحديث كل 5 دقائق
-SPX_SPIKE_PCT = 0.5           # تغيّر مفاجئ (%) يرسل فوراً خارج الجدول
-SPX_VOL_RATIO_MIN = 1.3       # حجم تداول أعلى من المعتاد لاعتباره "داعم"
-SPX_MOVE_MIN_PCT = 0.3        # أقل حركة شركة لتُحتسب ضمن الزخم
-SPX_ATR_LOOKBACK_DAYS = 30    # أيام التذبذب التاريخي لحساب مدى اليوم
+SPX_UPDATE_SEC = 300          
+SPX_SPIKE_PCT = 0.5           
+SPX_VOL_RATIO_MIN = 1.3       
+SPX_MOVE_MIN_PCT = 0.3        
+SPX_ATR_LOOKBACK_DAYS = 30    
 SPX_TICKER = "^GSPC"
-
 
 def _spx_read():
     try:
@@ -903,12 +883,10 @@ def _spx_read():
     except (OSError, ValueError):
         return {}
 
-
 def _spx_save(state):
     tmp = SPX_STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(SPX_STATE_FILE)
-
 
 def _spx_real_price():
     """سعر SPX الحقيقي (قد يتأخر دقائق) من yfinance، لا يُستخدم إلا للعرض."""
@@ -919,4 +897,46 @@ def _spx_real_price():
         close = data["Close"].dropna()
         last_price = float(close.iloc[-1].iloc[0]) if hasattr(close.iloc[-1], "iloc") else float(close.iloc[-1])
         prev_close = float(close.iloc[0].iloc[0]) if hasattr(close.iloc[0], "iloc") else float(close.iloc[0])
-        pct = (last_price / prev_close -
+        pct = (last_price / prev_close - 1.0) * 100
+        return {"price": last_price, "pct": pct}
+    except Exception:
+        return None
+
+def run_spx_forecast_scan():
+    """فحص وإرسال توقعات SPX اللحظية والتحديثات."""
+    state = _spx_read()
+    now_ts = time.time()
+    last_update = state.get("last_update_ts", 0)
+    
+    if now_ts - last_update < SPX_UPDATE_SEC:
+        return
+
+    real_spx = _spx_real_price()
+    market_data = get_precision_synthetic_spx()
+    
+    synth_spx = market_data["synthetic_spx"]
+    synth_pct = market_data["weighted_change"]
+    
+    state["last_update_ts"] = now_ts
+    _spx_save(state)
+
+    log.info("SPX Forecast scan executed successfully. Synthetic SPX: %.2f", synth_spx)
+
+# -------------------- MAIN APP EXECUTION --------------------
+if __name__ == "__main__":
+    log.info(f"Starting {NAME} v{VERSION} - تصميم أبو سحاب")
+    telegram(f"🚀 تم تشغيل نظام {NAME} بنجاح!\nتصميم أبو سحاب")
+    
+    while True:
+        try:
+            if market_open():
+                run_scan()
+                run_leaders_scan()
+                run_spx_forecast_scan()
+            time.sleep(POLL_SECONDS)
+        except KeyboardInterrupt:
+            log.info("Stopped by user.")
+            break
+        except Exception:
+            log.exception("Error in main execution loop")
+            time.sleep(15)
