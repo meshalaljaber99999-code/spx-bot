@@ -1,6 +1,6 @@
 # ============================================================
-# صَفاء التحليل v25.0-Points-Speed-MegaCaps | SPY & Synthetic SPX
-# Dynamic Points Projection • Spike Speed Meter • 11-Leader Options
+# صَفاء التحليل v25.3-Points-Speed-MegaCaps | SPY & Synthetic SPX
+# Dynamic Points Projection • 5-Point Spike Alert • Open Premiums
 # تصميم أبو سحاب
 # NO AUTOMATIC ORDERS — simulated tracking, not actual P&L
 # ============================================================
@@ -21,9 +21,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
+import yfinance as yf
 
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "25.0-Points-Speed-MegaCaps"
+NAME, VERSION = "صَفاء التحليل", "25.3-Points-Speed-MegaCaps"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 SPY, TF = "SPY", "5Min"
 BAR_MINUTES = 5
@@ -76,11 +77,10 @@ MIN_SIGNAL_ACCURACY = 0.48
 MIN_VALIDATION_SIGNALS = 4 
 MAX_BRIER = 0.32           
 MOVE_POINTS = 3.0          
+SPIKE_THRESHOLD_POINTS = 5.0 # تفعيل تنبيه عند تحرك المؤشر 5 نقاط أو أكثر
 
-MAX_STRIKE_DISTANCE = 8.5  
-MIN_PREMIUM = 0.25         
-MAX_PREMIUM = 50.0
-MAX_SPREAD_PCT = 0.24      
+MAX_STRIKE_DISTANCE = 10.0  
+MAX_SPREAD_PCT = 0.35      
 COOLDOWN_MINUTES = 7       
 # -----------------------------------------------
 
@@ -94,8 +94,8 @@ MAX_DAILY_SIGNALS = 10
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-JOURNAL = ROOT / "safa_signals_v250.csv"
-STATE_FILE = ROOT / "safa_state_v250.json"
+JOURNAL = ROOT / "safa_signals_v253.csv"
+STATE_FILE = ROOT / "safa_state_v253.json"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -216,9 +216,10 @@ def market_open():
     )
 
 def in_signal_window():
+    """العمل حصرياً ضمن أوقات التداول الرسمية بتوقيت نيويورك من 9:40 صباحاً إلى 3:30 عصراً"""
     n = now_ny()
     return (
-        market_open()
+        n.weekday() < 5
         and (n.hour, n.minute) >= (9, 40)
         and (n.hour, n.minute) < (15, 30)
     )
@@ -287,36 +288,67 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
     return df
 
 def get_precision_synthetic_spx():
-    """حساب مؤشر اصطناعي فائق الدقة يعتمد على أكبر 11 شركة قيادية في السوق"""
     leaders_data = {}
     weighted_dollar_move = 0.0
     total_weight = sum(TOP_LEADERS.values())
 
-    for ticker, weight in TOP_LEADERS.items():
-        try:
-            df = fetch_bars(ticker, days=5)
-            if not df.empty and len(df) > 1:
-                last_close = float(df["close"].iloc[-1])
-                prev_close = float(df["close"].iloc[-2])
-                pct_change = (last_close / prev_close) - 1.0
-                
-                leaders_data[ticker] = {
-                    "price": last_close,
-                    "change_pct": pct_change * 100
-                }
-                weighted_dollar_move += pct_change * (weight / total_weight)
-        except Exception:
-            log.exception(f"Failed to fetch precision data for {ticker}")
+    try:
+        tickers_list = list(TOP_LEADERS.keys())
+        yf_data = yf.download(tickers_list, period="5d", interval="1d", progress=False)["Close"]
+        
+        for ticker, weight in TOP_LEADERS.items():
+            try:
+                if not yf_data.empty and ticker in yf_data:
+                    series = yf_data[ticker].dropna()
+                    if len(series) > 1:
+                        last_close = float(series.iloc[-1])
+                        prev_close = float(series.iloc[-2])
+                        pct_change = (last_close / prev_close) - 1.0
+                        
+                        leaders_data[ticker] = {
+                            "price": last_close,
+                            "change_pct": pct_change * 100
+                        }
+                        weighted_dollar_move += pct_change * (weight / total_weight)
+                        continue
+            except Exception:
+                pass
+            
+            try:
+                df = fetch_bars(ticker, days=5)
+                if not df.empty and len(df) > 1:
+                    last_close = float(df["close"].iloc[-1])
+                    prev_close = float(df["close"].iloc[-2])
+                    pct_change = (last_close / prev_close) - 1.0
+                    leaders_data[ticker] = {
+                        "price": last_close,
+                        "change_pct": pct_change * 100
+                    }
+                    weighted_dollar_move += pct_change * (weight / total_weight)
+            except Exception:
+                log.exception(f"Failed to fetch precision data for {ticker}")
+    except Exception:
+        log.exception("Multi-source leaders fetch error")
 
     spy_bars = fetch_bars(SPY, days=2)
     current_spy = float(spy_bars["close"].iloc[-1]) if not spy_bars.empty else 500.0
     base_spx_estimate = current_spy * 10.0
     precision_synthetic_spx = base_spx_estimate * (1.0 + weighted_dollar_move)
 
+    if weighted_dollar_move > 0.003:
+        market_prediction = "اتجاه صاعد قوي ومؤشر SPX يستهدف الصعود 🚀 (CALL)"
+    elif weighted_dollar_move > 0:
+        market_prediction = "ميل طفيف للصعود واستقرار إيجابي 🟢"
+    elif weighted_dollar_move < -0.003:
+        market_prediction = "ضغوط بيعية واضحة ومؤشر SPX يتجه للهبوط 📉 (PUT)"
+    else:
+        market_prediction = "حركة عرضية وتماسك بانتظار العزم ⚪"
+
     return {
         "synthetic_spx": precision_synthetic_spx,
         "weighted_change": weighted_dollar_move * 100,
-        "leaders": leaders_data
+        "leaders": leaders_data,
+        "market_prediction": market_prediction
     }
 
 FEATURES = [
@@ -422,33 +454,42 @@ def train_predict(bars):
     }
 
 # -------------------- OPTIONS DATA --------------------
-def fetch_contracts(symbol, direction, price):
-    today = now_ny().date().isoformat()
-    payload = alpaca_get(
-        f"{TRADING_URL}/v2/options/contracts",
-        {
-            "underlying_symbols": symbol,
-            "status": "active",
-            "expiration_date": today,
-            "type": "call" if direction == "CALL" else "put",
-            "limit": 500,
-        },
-    )
+def fetch_contracts(symbol, direction, price, strict_today=True):
+    today = now_ny().date()
+    params = {
+        "underlying_symbols": symbol,
+        "status": "active",
+        "type": "call" if direction == "CALL" else "put",
+        "limit": 500,
+    }
+    if strict_today:
+        params["expiration_date"] = today.isoformat()
+    
+    payload = alpaca_get(f"{TRADING_URL}/v2/options/contracts", params)
     contracts = payload.get("option_contracts") or payload.get("contracts") or []
     candidates = []
+    
     for c in contracts:
         strike = num(c.get("strike_price"))
         sym = c.get("symbol")
         expiration = str(c.get("expiration_date") or "")
         if not sym or not math.isfinite(strike):
             continue
-        if expiration and expiration[:10] != today:
+        
+        if not strict_today and expiration:
+            exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
+            if exp_date < today or (exp_date - today).days > 35:
+                continue
+        elif strict_today and expiration and expiration[:10] != today.isoformat():
             continue
+            
         distance = abs(strike - price)
-        if distance <= (MAX_STRIKE_DISTANCE if symbol == SPY else 15.0):
+        max_dist = MAX_STRIKE_DISTANCE if symbol == SPY else 25.0
+        if distance <= max_dist:
             candidates.append((distance, c))
+            
     candidates.sort(key=lambda item: item[0])
-    return [c for _, c in candidates[:15]]
+    return [c for _, c in candidates[:20]]
 
 def _get_option_quote(symbol):
     payload = alpaca_get(
@@ -463,17 +504,15 @@ def _get_option_quote(symbol):
     mid = (bid + ask) / 2
     return {"bid": bid, "ask": ask, "mid": mid, "expiration": q.get("expiration_date", "")}
 
-def best_option(symbol, price, direction, vol_ratio=1.0):
+def best_option(symbol, price, direction, vol_ratio=1.0, strict_today=True):
     try:
-        contracts = fetch_contracts(symbol, direction, price)
+        contracts = fetch_contracts(symbol, direction, price, strict_today=strict_today)
         for c in contracts:
             sym = c.get("symbol")
             if not sym:
                 continue
             q = _get_option_quote(sym)
             if q is None:
-                continue
-            if q["ask"] < MIN_PREMIUM or q["ask"] > MAX_PREMIUM:
                 continue
             return {
                 "symbol": sym,
@@ -509,11 +548,24 @@ def save_journal(rows):
         writer.writerows(rows)
     tmp.replace(JOURNAL)
 
+def send_spike_alert(price_diff, current_price, synthetic_spx):
+    """إرسال تنبيه فوري عند تحرك المؤشر بمقدار 5 نقاط أو أكثر"""
+    direction = "صعوداً 🚀" if price_diff > 0 else "هبوطاً 📉"
+    message = (
+        f"⚡ <b>تنبيه حركة قوية (SPIKE ALERT)</b>\n"
+        f"<i>تصميم أبو سحاب</i>\n\n"
+        f"⚠️ تحرك مفاجئ في المؤشر بمقدار <b>{abs(price_diff):.2f} نقطة</b> {direction}!\n"
+        f"📊 سعر SPY الحالي: <b>${current_price:.2f}</b>\n"
+        f"📈 مؤشر SPX الاصطناعي: <b>${synthetic_spx:.2f}</b>\n\n"
+        f"⏳ يرجى مراقبة السوق لاقتناص الفرصة اللحظية."
+    )
+    telegram(message)
+    log.info("Spike alert sent for movement of %.2f points", price_diff)
+
 def append_and_send_alert(pred, opt_spy, market_data):
     sid = f"SF-{now_ny():%Y%m%d-%H%M%S}"
     cost = round(float(opt_spy["ask"]) * 100, 2)
     
-    # حساب النقاط المتوقعة والسرعة
     expected_points = pred["atr"] * math.sqrt(HORIZON) * 1.5
     vol_ratio = pred["vol_ratio"]
     
@@ -524,44 +576,58 @@ def append_and_send_alert(pred, opt_spy, market_data):
     else:
         speed_text = "🌊 متدرجة وثابتة (Steady Trend)"
 
+    synth_spx = market_data["synthetic_spx"]
+    spx_call_target = synth_spx + (expected_points * 10)
+    spx_put_target = synth_spx - (expected_points * 10)
+
     leaders_text = ""
     for ticker, info in market_data["leaders"].items():
         dir_t = "CALL" if info["change_pct"] >= 0 else "PUT"
-        best_opt_ldr = best_option(ticker, info["price"], dir_t)
-        exp_date = best_opt_ldr["expiration"] if best_opt_ldr else "اليوم"
-        strike_ldr = f"${best_opt_ldr['strike']}" if best_opt_ldr else "N/A"
+        best_opt_ldr = best_option(ticker, info["price"], dir_t, strict_today=False)
+        
+        if best_opt_ldr:
+            exp_date = best_opt_ldr["expiration"]
+            strike_ldr = f"${best_opt_ldr['strike']}"
+            prem_ldr = f"${best_opt_ldr['ask']:.2f}"
+        else:
+            exp_date = "غير متوفر"
+            strike_ldr = "N/A"
+            prem_ldr = "N/A"
         
         leaders_text += (
             f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
-            f"   └ التوقع: {dir_t} | Strike: {strike_ldr} | ينتهي في: <code>{exp_date}</code>\n"
+            f"   └ التوقع: <b>{dir_t}</b> | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: <code>{exp_date}</code>\n"
         )
 
     direction_ar = "صعود 🚀 (CALL)" if pred['signal'] == "CALL" else "هبوط 📉 (PUT)"
-    synth_spx = market_data["synthetic_spx"]
     synth_chg = market_data["weighted_change"]
+    market_prediction = market_data["market_prediction"]
 
     message = (
         f"🎯 <b>{NAME} | التقرير الشامل وعقود السوق</b>\n"
         f"<i>تصميم أبو سحاب</i>\n"
         f"🆔 <code>{sid}</code>\n\n"
-        f"📊 <b>مؤشر SPY الأساسي:</b> ${pred['current_price']:.2f}\n"
-        f"📈 <b>مؤشر SPX الاصطناعي (عالي الدقة):</b> ${synth_spx:.2f} ({synth_chg:+.2f}%)\n"
-        f" الاتجاه المتوقع: <b>{direction_ar}</b>\n"
+        f"📊 <b>مؤشر SPY الأساسي (0DTE):</b> ${pred['current_price']:.2f}\n"
+        f"📈 <b>مؤشر SPX الاصطناعي:</b> ${synth_spx:.2f} ({synth_chg:+.2f}%)\n"
+        f" <b>توقع حركة المؤشر أثناء السوق:</b> {market_prediction}\n\n"
+        f"🎯 <b>توقعات خيارات مؤشر SPX (كول & بت):</b>\n"
+        f"🟢 <b>SPX CALL (صعود):</b> مستهدف اختراق قرب <code>{spx_call_target:.2f}</code>\n"
+        f"🔴 <b>SPX PUT (هبوط):</b> مستهدف كسر قرب <code>{spx_put_target:.2f}</code>\n\n"
+        f" اتجاه نموذج البوت الذكي: <b>{direction_ar}</b>\n"
         f" النطاق المتوقع للحركة: <b>±{expected_points:.2f} نقطة</b>\n"
-        f" سرعة الزخم المتوقعة: <b>{speed_text}</b>\n"
-        f" نسبة الثقة: <b>{pred['probability']:.1f}%</b>\n\n"
-        f"🎯 <b>عقد SPY الموصى به (0DTE):</b>\n"
+        f" سرعة الزخم: <b>{speed_text}</b> (الثقة: {pred['probability']:.1f}%)\n\n"
+        f"🎯 <b>عقد SPY الموصى به (0DTE - سعر مفتوح):</b>\n"
         f"▫️ الرمز: <code>{opt_spy['symbol']}</code>\n"
         f"▫️ Strike: ${opt_spy['strike']:.2f} | ينتهي في: <code>{opt_spy['expiration']}</code>\n"
         f"▫️ التكلفة التقديرية لعقد: <b>${cost:.2f}</b>\n\n"
-        f"⭐ <b>تحليل وعقود الشركات القيادية (Top 11 Leaders):</b>\n"
+        f"⭐ <b>تحليل وعقود الشركات القيادية (عقود مرنة ومربحة):</b>\n"
         f"{leaders_text}\n"
         f"⚠️ تنبيه افتراضي تحليلي - تصميم أبو سحاب."
     )
     
     sent = telegram(message)
     if sent:
-        log.info("Points & Speed comprehensive alert sent successfully: %s", sid)
+        log.info("Comprehensive alert sent successfully: %s", sid)
 
 # -------------------- MAIN SCAN LOOP --------------------
 def run_scan():
@@ -571,17 +637,31 @@ def run_scan():
     if bars.empty:
         return
     
+    current_price = float(bars["close"].iloc[-1])
+    prev_price = float(bars["close"].iloc[-2]) if len(bars) > 1 else current_price
+    price_diff = current_price - prev_price
+
+    market_data = get_precision_synthetic_spx()
+
+    # فحص حركة الـ 5 نقاط أو أكثر لإرسال تنبيه فوراً
+    state = read_state()
+    last_spike_check_time = state.get("last_spike_time", "")
+    current_time_str = now_ny().strftime("%Y-%m-%d %H:%M")
+    
+    if abs(price_diff) >= SPIKE_THRESHOLD_POINTS and last_spike_check_time != current_time_str:
+        send_spike_alert(price_diff, current_price, market_data["synthetic_spx"])
+        state["last_spike_time"] = current_time_str
+        save_state(state)
+
     pred = train_predict(bars)
     if not pred.get("ok"):
         return
 
-    state = read_state()
     signal_key = f'{pred["bar_time"]}:{pred["signal"]}'
     if state.get("last_signal_key") == signal_key:
         return
 
-    market_data = get_precision_synthetic_spx()
-    opt_spy = best_option(SPY, pred["current_price"], pred["signal"], vol_ratio=pred["vol_ratio"])
+    opt_spy = best_option(SPY, pred["current_price"], pred["signal"], vol_ratio=pred["vol_ratio"], strict_today=True)
     if not opt_spy:
         return
 
@@ -591,7 +671,7 @@ def run_scan():
     save_state(state)
 
 def main():
-    log.info("%s v%s | SPY, Points & Speed Enabled", NAME, VERSION)
+    log.info("%s v%s | NY Session, 5-Point Spike & SPX Calls/Puts Enabled", NAME, VERSION)
     if not KEY or not SECRET:
         raise SystemExit("ضع مفاتيح ألقا في متغيرات البيئة.")
     while True:
