@@ -1,6 +1,6 @@
 # ============================================================
-# صَفاء التحليل v25.3-Points-Speed-MegaCaps | SPY & Synthetic SPX
-# Dynamic Points Projection • 5-Point Spike Alert • Open Premiums
+# صَفاء التحليل v25.4-Points-Speed-MegaCaps | Pre-Market & NY Session
+# Pre-Market Reports • SPX Calls/Puts • 5-Point Spike • Open Premiums
 # تصميم أبو سحاب
 # NO AUTOMATIC ORDERS — simulated tracking, not actual P&L
 # ============================================================
@@ -24,12 +24,11 @@ from sklearn.metrics import roc_auc_score, brier_score_loss
 import yfinance as yf
 
 # -------------------- CONFIG --------------------
-NAME, VERSION = "صَفاء التحليل", "25.3-Points-Speed-MegaCaps"
+NAME, VERSION = "صَفاء التحليل", "25.4-Points-Speed-MegaCaps"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
 SPY, TF = "SPY", "5Min"
 BAR_MINUTES = 5
 
-# --- قائمة العمالقة الموسعة (أكبر 11 شركة لتغطية أكثر من 50% من مؤشر S&P 500) ---
 TOP_LEADERS = {
     "AAPL": 0.070,  # Apple
     "MSFT": 0.065,  # Microsoft
@@ -44,29 +43,16 @@ TOP_LEADERS = {
     "JPM": 0.015    # JPMorgan Chase
 }
 
-DATA_URL = os.getenv(
-    "ALPACA_DATA_URL", "https://data.alpaca.markets"
-).rstrip("/")
-TRADING_URL = os.getenv(
-    "ALPACA_TRADING_URL", "https://paper-api.alpaca.markets"
-).rstrip("/")
-KEY = (
-    os.getenv("APCA_API_KEY_ID")
-    or os.getenv("ALPACA_API_KEY")
-    or ""
-).strip()
-SECRET = (
-    os.getenv("APCA_API_SECRET_KEY")
-    or os.getenv("ALPACA_SECRET_KEY")
-    or ""
-).strip()
+DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+KEY = (os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or "").strip()
+SECRET = (os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or "").strip()
 STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_ENABLED = bool(TG_TOKEN and TG_CHAT)
 
-# --- تعديلات مرونة القفزات والزخم واقتناص الانقلابات ---
 HISTORY_DAYS = 120         
 MIN_ROWS = 300
 HORIZON = 6
@@ -77,12 +63,11 @@ MIN_SIGNAL_ACCURACY = 0.48
 MIN_VALIDATION_SIGNALS = 4 
 MAX_BRIER = 0.32           
 MOVE_POINTS = 3.0          
-SPIKE_THRESHOLD_POINTS = 5.0 # تفعيل تنبيه عند تحرك المؤشر 5 نقاط أو أكثر
+SPIKE_THRESHOLD_POINTS = 5.0 
 
 MAX_STRIKE_DISTANCE = 10.0  
 MAX_SPREAD_PCT = 0.35      
 COOLDOWN_MINUTES = 7       
-# -----------------------------------------------
 
 MAX_QUOTE_AGE_SECONDS = 90
 MAX_BAR_AGE_MINUTES = 10
@@ -94,8 +79,8 @@ MAX_DAILY_SIGNALS = 10
 
 ROOT = Path(os.getenv("DATA_DIR", "."))
 ROOT.mkdir(parents=True, exist_ok=True)
-JOURNAL = ROOT / "safa_signals_v253.csv"
-STATE_FILE = ROOT / "safa_state_v253.json"
+JOURNAL = ROOT / "safa_signals_v254.csv"
+STATE_FILE = ROOT / "safa_state_v254.json"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -146,9 +131,7 @@ def parse_ts(value):
 
 def alpaca_get(url, params=None):
     if not KEY or not SECRET:
-        raise RuntimeError(
-            "APCA_API_KEY_ID / APCA_API_SECRET_KEY غير مضبوطين"
-        )
+        raise RuntimeError("APCA_API_KEY_ID / APCA_API_SECRET_KEY غير مضبوطين")
     last = None
     for attempt in range(3):
         try:
@@ -162,10 +145,7 @@ def alpaca_get(url, params=None):
                 timeout=15,
             )
             if r.status_code in (401, 403):
-                raise RuntimeError(
-                    f"Alpaca authentication/permission error: "
-                    f"{r.status_code}"
-                )
+                raise RuntimeError(f"Alpaca authentication/permission error: {r.status_code}")
             r.raise_for_status()
             result = r.json()
             if not isinstance(result, dict):
@@ -192,11 +172,7 @@ def telegram(message):
             timeout=12,
         )
         if r.status_code != 200:
-            log.error(
-                "Telegram error %s: %s",
-                r.status_code,
-                r.text[:300],
-            )
+            log.error("Telegram error %s: %s", r.status_code, r.text[:300])
             return False
         result = r.json()
         if not result.get("ok", False):
@@ -216,12 +192,20 @@ def market_open():
     )
 
 def in_signal_window():
-    """العمل حصرياً ضمن أوقات التداول الرسمية بتوقيت نيويورك من 9:40 صباحاً إلى 3:30 عصراً"""
     n = now_ny()
     return (
         n.weekday() < 5
         and (n.hour, n.minute) >= (9, 40)
         and (n.hour, n.minute) < (15, 30)
+    )
+
+def is_pre_market_time():
+    """تحديد وقت ما قبل السوق بساعة (مثلاً بين 8:30 و 8:35 صباحاً بتوقيت نيويورك)"""
+    n = now_ny()
+    return (
+        n.weekday() < 5
+        and n.hour == 8
+        and 30 <= n.minute <= 35
     )
 
 # -------------------- STOCK & PRECISION SYNTHETIC SPX DATA --------------------
@@ -249,9 +233,7 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
         if not token:
             break
     if not all_bars:
-        return pd.DataFrame(
-            columns=["open", "high", "low", "close", "volume"]
-        )
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     df = pd.DataFrame(all_bars).rename(
         columns={
             "t": "timestamp",
@@ -262,28 +244,18 @@ def fetch_bars(symbol=SPY, days=HISTORY_DAYS):
             "v": "volume",
         }
     )
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"], utc=True, errors="coerce"
-    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = (
-        df.dropna(
-            subset=["timestamp", "open", "high", "low", "close"]
-        )
+        df.dropna(subset=["timestamp", "open", "high", "low", "close"])
         .drop_duplicates("timestamp", keep="last")
         .sort_values("timestamp")
         .set_index("timestamp")
     )
     now_utc = pd.Timestamp.now(tz="UTC")
-    current_bucket_minute = (
-        now_utc.minute // BAR_MINUTES
-    ) * BAR_MINUTES
-    current_bucket = now_utc.replace(
-        minute=current_bucket_minute,
-        second=0,
-        microsecond=0,
-    )
+    current_bucket_minute = (now_utc.minute // BAR_MINUTES) * BAR_MINUTES
+    current_bucket = now_utc.replace(minute=current_bucket_minute, second=0, microsecond=0)
     df = df.loc[df.index < current_bucket]
     return df
 
@@ -388,7 +360,6 @@ def features_for(bars):
     f["volume_ratio"] = f["volume"] / vmean.replace(0, np.nan)
     return f.replace([np.inf, -np.inf], np.nan)
 
-# -------------------- MODEL VALIDATION --------------------
 def build_model():
     return make_pipeline(
         SimpleImputer(strategy="median"),
@@ -525,31 +496,7 @@ def best_option(symbol, price, direction, vol_ratio=1.0, strict_today=True):
     return None
 
 # -------------------- JOURNAL & TELEGRAM ALERTS --------------------
-FIELDS = [
-    "id", "signal_time", "signal", "spy_price", "probability",
-    "option_symbol", "strike", "entry_bid", "entry_ask",
-    "cost_per_contract", "status", "model_auc", "alert_status",
-]
-
-def load_journal():
-    if not JOURNAL.exists():
-        return []
-    try:
-        with JOURNAL.open("r", newline="", encoding="utf-8-sig") as f:
-            return list(csv.DictReader(f))
-    except Exception:
-        return []
-
-def save_journal(rows):
-    tmp = JOURNAL.with_suffix(".tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    tmp.replace(JOURNAL)
-
 def send_spike_alert(price_diff, current_price, synthetic_spx):
-    """إرسال تنبيه فوري عند تحرك المؤشر بمقدار 5 نقاط أو أكثر"""
     direction = "صعوداً 🚀" if price_diff > 0 else "هبوطاً 📉"
     message = (
         f"⚡ <b>تنبيه حركة قوية (SPIKE ALERT)</b>\n"
@@ -560,7 +507,60 @@ def send_spike_alert(price_diff, current_price, synthetic_spx):
         f"⏳ يرجى مراقبة السوق لاقتناص الفرصة اللحظية."
     )
     telegram(message)
-    log.info("Spike alert sent for movement of %.2f points", price_diff)
+
+def send_pre_market_report():
+    """إرسال التقرير التحضيري قبل السوق بساعة (يشمل توقعات SPX وعقود الأوبشن للشركات والـ SPY)"""
+    market_data = get_precision_synthetic_spx()
+    synth_spx = market_data["synthetic_spx"]
+    market_prediction = market_data["market_prediction"]
+    
+    spy_bars = fetch_bars(SPY, days=2)
+    spy_price = float(spy_bars["close"].iloc[-1]) if not spy_bars.empty else 500.0
+
+    # توقعات خيارات SPX قبل السوق
+    spx_call_target = synth_spx + 15.0
+    spx_put_target = synth_spx - 15.0
+
+    # عقد SPY تقريبي قبل السوق
+    spy_call_opt = best_option(SPY, spy_price, "CALL", strict_today=True)
+    spy_put_opt = best_option(SPY, spy_price, "PUT", strict_today=True)
+
+    leaders_text = ""
+    for ticker, info in market_data["leaders"].items():
+        dir_t = "CALL" if info["change_pct"] >= 0 else "PUT"
+        best_opt_ldr = best_option(ticker, info["price"], dir_t, strict_today=False)
+        strike_ldr = f"${best_opt_ldr['strike']}" if best_opt_ldr else "N/A"
+        prem_ldr = f"${best_opt_ldr['ask']:.2f}" if best_opt_ldr else "N/A"
+        exp_date = best_opt_ldr["expiration"] if best_opt_ldr else "غير متوفر"
+        
+        leaders_text += (
+            f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
+            f"   └ توقع العقد: <b>{dir_t}</b> | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: <code>{exp_date}</code>\n"
+        )
+
+    spy_c_sym = spy_call_opt['symbol'] if spy_call_opt else "N/A"
+    spy_p_sym = spy_put_opt['symbol'] if spy_put_opt else "N/A"
+
+    message = (
+        f"⏰ <b>{NAME} | تقرير ما قبل السوق (تحضيري)</b>\n"
+        f"<i>تصميم أبو سحاب</i>\n\n"
+        f"📊 <b>مؤشر SPY:</b> ${spy_price:.2f}\n"
+        f"📈 <b>مؤشر SPX الاصطناعي:</b> ${synth_spx:.2f} ({market_data['weighted_change']:+.2f}%)\n"
+        f" <b>توقع اتجاه المؤشر:</b> {market_prediction}\n\n"
+        f"🎯 <b>توقعات خيارات مؤشر SPX (كول & بت) قبل الافتتاح:</b>\n"
+        f"🟢 <b>SPX CALL (صعود):</b> مستهدف اختراق قرب <code>{spx_call_target:.2f}</code>\n"
+        f"🔴 <b>SPX PUT (هبوط):</b> مستهدف كسر قرب <code>{spx_put_target:.2f}</code>\n\n"
+        f"🎯 <b>توقعات عقود SPY (0DTE):</b>\n"
+        f"▫️ كول مقترح: <code>{spy_c_sym}</code>\n"
+        f"▫️ بت مقترح: <code>{spy_p_sym}</code>\n\n"
+        f"⭐ <b>عقود الشركات القيادية المقترحة:</b>\n"
+        f"{leaders_text}\n"
+        f"⚠️ تقرير استباقي قبل الافتتاح - تصميم أبو سحاب."
+    )
+    
+    sent = telegram(message)
+    if sent:
+        log.info("Pre-market report sent successfully.")
 
 def append_and_send_alert(pred, opt_spy, market_data):
     sid = f"SF-{now_ny():%Y%m%d-%H%M%S}"
@@ -631,8 +631,22 @@ def append_and_send_alert(pred, opt_spy, market_data):
 
 # -------------------- MAIN SCAN LOOP --------------------
 def run_scan():
+    state = read_state()
+    current_time_str = now_ny().strftime("%Y-%m-%d %H:%M")
+
+    # 1. إرسال تقرير ما قبل السوق (مرة واحدة يومياً في وقته)
+    if is_pre_market_time():
+        last_pre_market = state.get("last_pre_market_date", "")
+        today_date_str = now_ny().strftime("%Y-%m-%d")
+        if last_pre_market != today_date_str:
+            send_pre_market_report()
+            state["last_pre_market_date"] = today_date_str
+            save_state(state)
+
+    # 2. العمل أثناء الجلسة الرسمية
     if not in_signal_window():
         return
+
     bars = fetch_bars()
     if bars.empty:
         return
@@ -643,11 +657,7 @@ def run_scan():
 
     market_data = get_precision_synthetic_spx()
 
-    # فحص حركة الـ 5 نقاط أو أكثر لإرسال تنبيه فوراً
-    state = read_state()
     last_spike_check_time = state.get("last_spike_time", "")
-    current_time_str = now_ny().strftime("%Y-%m-%d %H:%M")
-    
     if abs(price_diff) >= SPIKE_THRESHOLD_POINTS and last_spike_check_time != current_time_str:
         send_spike_alert(price_diff, current_price, market_data["synthetic_spx"])
         state["last_spike_time"] = current_time_str
@@ -671,12 +681,12 @@ def run_scan():
     save_state(state)
 
 def main():
-    log.info("%s v%s | NY Session, 5-Point Spike & SPX Calls/Puts Enabled", NAME, VERSION)
+    log.info("%s v%s | Pre-Market Reports, NY Session, 5-Point Spike & SPX Calls/Puts", NAME, VERSION)
     if not KEY or not SECRET:
         raise SystemExit("ضع مفاتيح ألقا في متغيرات البيئة.")
     while True:
         try:
-            if market_open():
+            if market_open() or is_pre_market_time():
                 run_scan()
         except KeyboardInterrupt:
             log.info("Stopped by user.")
