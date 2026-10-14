@@ -923,20 +923,31 @@ def run_spx_forecast_scan():
     log.info("SPX Forecast scan executed successfully. Synthetic SPX: %.2f", synth_spx)
 
 # -------------------- MAIN APP EXECUTION --------------------
+# -------------------- MAIN APP EXECUTION --------------------
 if __name__ == "__main__":
     log.info(f"Starting {NAME} v{VERSION} - تصميم أبو سحاب")
-    telegram(f"🚀 تم تشغيل نظام {NAME} بنجاح!\nتصميم أبو سحاب")
+    
+    try:
+        telegram(f"🚀 تم تشغيل نظام {NAME} بنجاح!\nتصميم أبو سحاب")
+    except Exception as e:
+        log.error(f"Telegram startup message failed: {e}")
     
     while True:
         try:
+            log.info("🔄 البوت يعمل في وضع الاستماع ومراقبة السوق...")
+            
             if market_open():
                 run_scan()
                 run_leaders_scan()
                 run_spx_forecast_scan()
+            else:
+                log.info("⏳ السوق مغلق حالياً.. البوت في وضع الاستعداد.")
+                
             time.sleep(POLL_SECONDS)
+            
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             break
-        except Exception:
-            log.exception("Error in main execution loop")
-            time.sleep(15)
+        except Exception as e:
+            log.exception(f"⚠️ خطأ مفاجئ في حلقة التشغيل الرئيسية: {e}")
+            time.sleep(30)
