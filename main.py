@@ -36,11 +36,12 @@ TOP_LEADERS = {
     "GOOGL": 0.035, # Alphabet
     "META": 0.030,  # Meta
     "TSLA": 0.020,  # Tesla
-    "BRK.B": 0.020, # Berkshire Hathaway
+    "BRK-B": 0.020, # Berkshire Hathaway (تم تعديل الرمز هنا ليقبله yfinance)
     "AVGO": 0.020,  # Broadcom
     "LLY": 0.020,   # Eli Lilly
     "JPM": 0.015    # JPMorgan Chase
 }
+
 
 DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
