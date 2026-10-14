@@ -499,11 +499,11 @@ def best_option(symbol, price, direction, vol_ratio=1.0, strict_today=True):
 def send_spike_alert(price_diff, current_price, synthetic_spx):
     direction = "صعوداً 🚀" if price_diff > 0 else "هبوطاً 📉"
     message = (
-        f"⚡ <b>تنبيه حركة قوية (SPIKE ALERT)</b>\n"
-        f"<i>تصميم أبو سحاب</i>\n\n"
-        f"⚠️ تحرك مفاجئ في المؤشر بمقدار <b>{abs(price_diff):.2f} نقطة</b> {direction}!\n"
-        f"📊 سعر SPY الحالي: <b>${current_price:.2f}</b>\n"
-        f"📈 مؤشر SPX الاصطناعي: <b>${synthetic_spx:.2f}</b>\n\n"
+        f"⚡ تنبيه حركة قوية (SPIKE ALERT)\n"
+        f"تصميم أبو سحاب\n\n"
+        f"⚠️ تحرك مفاجئ في المؤشر بمقدار {abs(price_diff):.2f} نقطة {direction}!\n"
+        f"📊 سعر SPY الحالي: ${current_price:.2f}\n"
+        f"📈 مؤشر SPX الاصطناعي: ${synthetic_spx:.2f}\n\n"
         f"⏳ يرجى مراقبة السوق لاقتناص الفرصة اللحظية."
     )
     telegram(message)
@@ -534,26 +534,26 @@ def send_pre_market_report():
         exp_date = best_opt_ldr["expiration"] if best_opt_ldr else "غير متوفر"
         
         leaders_text += (
-            f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
-            f"   └ توقع العقد: <b>{dir_t}</b> | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: <code>{exp_date}</code>\n"
+            f"🔹 {ticker}: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
+            f"   └ توقع العقد: {dir_t} | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: {exp_date}\n"
         )
 
     spy_c_sym = spy_call_opt['symbol'] if spy_call_opt else "N/A"
     spy_p_sym = spy_put_opt['symbol'] if spy_put_opt else "N/A"
 
     message = (
-        f"⏰ <b>{NAME} | تقرير ما قبل السوق (تحضيري)</b>\n"
-        f"<i>تصميم أبو سحاب</i>\n\n"
-        f"📊 <b>مؤشر SPY:</b> ${spy_price:.2f}\n"
-        f"📈 <b>مؤشر SPX الاصطناعي:</b> ${synth_spx:.2f} ({market_data['weighted_change']:+.2f}%)\n"
-        f" <b>توقع اتجاه المؤشر:</b> {market_prediction}\n\n"
-        f"🎯 <b>توقعات خيارات مؤشر SPX (كول & بت) قبل الافتتاح:</b>\n"
-        f"🟢 <b>SPX CALL (صعود):</b> مستهدف اختراق قرب <code>{spx_call_target:.2f}</code>\n"
-        f"🔴 <b>SPX PUT (هبوط):</b> مستهدف كسر قرب <code>{spx_put_target:.2f}</code>\n\n"
-        f"🎯 <b>توقعات عقود SPY (0DTE):</b>\n"
-        f"▫️ كول مقترح: <code>{spy_c_sym}</code>\n"
-        f"▫️ بت مقترح: <code>{spy_p_sym}</code>\n\n"
-        f"⭐ <b>عقود الشركات القيادية المقترحة:</b>\n"
+        f"⏰ {NAME} | تقرير ما قبل السوق (تحضيري)\n"
+        f"تصميم أبو سحاب\n\n"
+        f"📊 مؤشر SPY: ${spy_price:.2f}\n"
+        f"📈 مؤشر SPX الاصطناعي: ${synth_spx:.2f} ({market_data['weighted_change']:+.2f}%)\n"
+        f" توقع اتجاه المؤشر: {market_prediction}\n\n"
+        f"🎯 توقعات خيارات مؤشر SPX (كول & بت) قبل الافتتاح:\n"
+        f"🟢 SPX CALL (صعود): مستهدف اختراق قرب {spx_call_target:.2f}\n"
+        f"🔴 SPX PUT (هبوط): مستهدف كسر قرب {spx_put_target:.2f}\n\n"
+        f"🎯 توقعات عقود SPY (0DTE):\n"
+        f"▫️ كول مقترح: {spy_c_sym}\n"
+        f"▫️ بت مقترح: {spy_p_sym}\n\n"
+        f"⭐ عقود الشركات القيادية المقترحة:\n"
         f"{leaders_text}\n"
         f"⚠️ تقرير استباقي قبل الافتتاح - تصميم أبو سحاب."
     )
@@ -595,8 +595,8 @@ def append_and_send_alert(pred, opt_spy, market_data):
             prem_ldr = "N/A"
         
         leaders_text += (
-            f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
-            f"   └ التوقع: <b>{dir_t}</b> | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: <code>{exp_date}</code>\n"
+            f"🔹 {ticker}: ${info['price']:.2f} ({info['change_pct']:+.2f}%)\n"
+            f"   └ التوقع: {dir_t} | Strike: {strike_ldr} | السعر: {prem_ldr} | ينتهي: {exp_date}\n"
         )
 
     direction_ar = "صعود 🚀 (CALL)" if pred['signal'] == "CALL" else "هبوط 📉 (PUT)"
@@ -604,23 +604,23 @@ def append_and_send_alert(pred, opt_spy, market_data):
     market_prediction = market_data["market_prediction"]
 
     message = (
-        f"🎯 <b>{NAME} | التقرير الشامل وعقود السوق</b>\n"
-        f"<i>تصميم أبو سحاب</i>\n"
-        f"🆔 <code>{sid}</code>\n\n"
-        f"📊 <b>مؤشر SPY الأساسي (0DTE):</b> ${pred['current_price']:.2f}\n"
-        f"📈 <b>مؤشر SPX الاصطناعي:</b> ${synth_spx:.2f} ({synth_chg:+.2f}%)\n"
-        f" <b>توقع حركة المؤشر أثناء السوق:</b> {market_prediction}\n\n"
-        f"🎯 <b>توقعات خيارات مؤشر SPX (كول & بت):</b>\n"
-        f"🟢 <b>SPX CALL (صعود):</b> مستهدف اختراق قرب <code>{spx_call_target:.2f}</code>\n"
-        f"🔴 <b>SPX PUT (هبوط):</b> مستهدف كسر قرب <code>{spx_put_target:.2f}</code>\n\n"
-        f" اتجاه نموذج البوت الذكي: <b>{direction_ar}</b>\n"
-        f" النطاق المتوقع للحركة: <b>±{expected_points:.2f} نقطة</b>\n"
-        f" سرعة الزخم: <b>{speed_text}</b> (الثقة: {pred['probability']:.1f}%)\n\n"
-        f"🎯 <b>عقد SPY الموصى به (0DTE - سعر مفتوح):</b>\n"
-        f"▫️ الرمز: <code>{opt_spy['symbol']}</code>\n"
-        f"▫️ Strike: ${opt_spy['strike']:.2f} | ينتهي في: <code>{opt_spy['expiration']}</code>\n"
-        f"▫️ التكلفة التقديرية لعقد: <b>${cost:.2f}</b>\n\n"
-        f"⭐ <b>تحليل وعقود الشركات القيادية (عقود مرنة ومربحة):</b>\n"
+        f"🎯 {NAME} | التقرير الشامل وعقود السوق\n"
+        f"تصميم أبو سحاب\n"
+        f"🆔 {sid}\n\n"
+        f"📊 مؤشر SPY الأساسي (0DTE): ${pred['current_price']:.2f}\n"
+        f"📈 مؤشر SPX الاصطناعي: ${synth_spx:.2f} ({synth_chg:+.2f}%)\n"
+        f" توقع حركة المؤشر أثناء السوق: {market_prediction}\n\n"
+        f"🎯 توقعات خيارات مؤشر SPX (كول & بت):\n"
+        f"🟢 SPX CALL (صعود): مستهدف اختراق قرب {spx_call_target:.2f}\n"
+        f"🔴 SPX PUT (هبوط): مستهدف كسر قرب {spx_put_target:.2f}\n\n"
+        f" اتجاه نموذج البوت الذكي: {direction_ar}\n"
+        f" النطاق المتوقع للحركة: ±{expected_points:.2f} نقطة\n"
+        f" سرعة الزخم: {speed_text} (الثقة: {pred['probability']:.1f}%)\n\n"
+        f"🎯 عقد SPY الموصى به (0DTE - سعر مفتوح):\n"
+        f"▫️ الرمز: {opt_spy['symbol']}\n"
+        f"▫️ Strike: ${opt_spy['strike']:.2f} | ينتهي في: {opt_spy['expiration']}\n"
+        f"▫️ التكلفة التقديرية لعقد: ${cost:.2f}\n\n"
+        f"⭐ تحليل وعقود الشركات القيادية (عقود مرنة ومربحة):\n"
         f"{leaders_text}\n"
         f"⚠️ تنبيه افتراضي تحليلي - تصميم أبو سحاب."
     )
@@ -785,10 +785,10 @@ def _ldr_block(ticker, info, opt, spy_pct):
         conflict = " ⚠️ يعاكس SPY"
     kind = "0DTE" if opt["exp"] == now_ny().date() else "أسبوعي"
     return (
-        f"🔹 <b>{ticker}</b>: ${info['price']:.2f} ({info['pct']:+.2f}% عن الافتتاح){conflict}\n"
-        f"   ▫️ <code>{opt['symbol']}</code>\n"
+        f"🔹 {ticker}: ${info['price']:.2f} ({info['pct']:+.2f}% عن الافتتاح){conflict}\n"
+        f"   ▫️ {opt['symbol']}\n"
         f"   ▫️ Strike: ${opt['strike']:.2f} | ينتهي: {opt['exp'].strftime('%m/%d')} ({kind})\n"
-        f"   ▫️ السعر: ${ask:.2f} | التكلفة: <b>${ask * 100:.2f}</b>\n"
+        f"   ▫️ السعر: ${ask:.2f} | التكلفة: ${ask * 100:.2f}\n"
         f"   ▫️ السبريد: {opt['spread']:.1f}% ✅\n"
         f"   ▫️ 🎯 هدف +{LDR_TP * 100:.0f}%: ${ask * (1 + LDR_TP):.2f} | "
         f"🛑 وقف −{LDR_SL * 100:.0f}%: ${ask * (1 - LDR_SL):.2f}\n\n"
@@ -865,18 +865,18 @@ def run_leaders_scan():
     n = now_ny()
     riyadh = n.astimezone(ZoneInfo("Asia/Riyadh"))
     msg = (
-        f"⭐ <b>{NAME} | عقود الشركات الكبرى</b>\n"
-        f"<i>تصميم أبو سحاب</i>\n"
+        f"⭐ {NAME} | عقود الشركات الكبرى\n"
+        f"تصميم أبو سحاب\n"
         f"🕐 {n:%I:%M %p} نيويورك ({riyadh:%I:%M %p} الرياض)\n\n"
     )
     if spy:
-        msg += f"📈 <b>SPY:</b> ${spy['price']:.2f} ({spy['pct']:+.2f}% اليوم)\n\n"
+        msg += f"📈 SPY: ${spy['price']:.2f} ({spy['pct']:+.2f}% اليوم)\n\n"
     if calls:
-        msg += "🟢 <b>فرص CALL:</b>\n" + calls
+        msg += "🟢 فرص CALL:\n" + calls
     if puts:
-        msg += "🔴 <b>فرص PUT:</b>\n" + puts
+        msg += "🔴 فرص PUT:\n" + puts
     if neutral:
-        msg += f"⚪ <b>بدون إشارة واضحة:</b>\n{', '.join(neutral)}\n\n"
+        msg += f"⚪ بدون إشارة واضحة:\n{', '.join(neutral)}\n\n"
     msg += (
         f"⏰ الخروج الإجباري: {PAPER_EXIT_TIME} نيويورك\n\n"
         f"⚠️ تنبيه تحليلي افتراضي، وليس أمر تنفيذ."
@@ -885,22 +885,38 @@ def run_leaders_scan():
         log.info("Leaders contracts message sent.")
 
 
-def main():
-    log.info("%s v%s | Pre-Market Reports, NY Session, 5-Point Spike & SPX Calls/Puts", NAME, VERSION)
-    if not KEY or not SECRET:
-        raise SystemExit("ضع مفاتيح ألقا في متغيرات البيئة.")
-    while True:
-        try:
-            if market_open() or is_pre_market_time():
-                run_scan()
-            if in_signal_window():
-                run_leaders_scan()
-        except KeyboardInterrupt:
-            log.info("Stopped by user.")
-            break
-        except Exception:
-            log.exception("Main loop error")
-        time.sleep(max(5, POLL_SECONDS))
+# ============================================================
+# إضافة: توقع SPX اللحظي (3 مصادر + تصنيف ثقة) | تصميم أبو سحاب
+# ============================================================
+SPX_STATE_FILE = ROOT / "safa_spx_forecast_state_v254.json"
+SPX_UPDATE_SEC = 300          # تحديث كل 5 دقائق
+SPX_SPIKE_PCT = 0.5           # تغيّر مفاجئ (%) يرسل فوراً خارج الجدول
+SPX_VOL_RATIO_MIN = 1.3       # حجم تداول أعلى من المعتاد لاعتباره "داعم"
+SPX_MOVE_MIN_PCT = 0.3        # أقل حركة شركة لتُحتسب ضمن الزخم
+SPX_ATR_LOOKBACK_DAYS = 30    # أيام التذبذب التاريخي لحساب مدى اليوم
+SPX_TICKER = "^GSPC"
 
-if __name__ == "__main__":
-    main()
+
+def _spx_read():
+    try:
+        return json.loads(SPX_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _spx_save(state):
+    tmp = SPX_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(SPX_STATE_FILE)
+
+
+def _spx_real_price():
+    """سعر SPX الحقيقي (قد يتأخر دقائق) من yfinance، لا يُستخدم إلا للعرض."""
+    try:
+        data = yf.download(SPX_TICKER, period="5d", interval="5m", progress=False)
+        if data.empty:
+            raise RuntimeError("no data")
+        close = data["Close"].dropna()
+        last_price = float(close.iloc[-1].iloc[0]) if hasattr(close.iloc[-1], "iloc") else float(close.iloc[-1])
+        prev_close = float(close.iloc[0].iloc[0]) if hasattr(close.iloc[0], "iloc") else float(close.iloc[0])
+        pct = (last_price / prev_close -
