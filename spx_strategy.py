@@ -623,33 +623,32 @@ def main():
 if __name__ == "__main__":
     main()
 # ============================================================
-# spx_strategy.py (ملف الاستراتيجية المستقل)
+# دالة جلب إشارة SPX الحقيقية المتوافقة مع تحليلاتك في نفس الملف
 # ============================================================
-
-# 1. هنا تحط المكتبات التي تحتاجه استراتيجيتك (مثل pandas, numpy, sklearn وغيرها)
-import pandas as pd
-import numpy as np
-# ... باقي المكتبات والتحليلات الخاصة بك ...
-
-# 2. هنا تحط كود استراتيجيتك بالكامل (جلب البيانات، حساب المؤشرات، والذكاء الاصطناعي)
-# ... كودك هنا ...
-
-
-# 3. في "آخر سطر" من الملف، تضع الدالة الرئيسية التي ستُرجع التوصية بهذا الشكل:
 def get_spx_signal():
-    """
-    هذه الدالة تقوم بتشغيل حساباتك وتُرجع النتيجة لملف التنفيذ الرئيسي
-    """
-    
-    # (هنا يمكنك استدعاء المتغيرات الناتجة من استراتيجيتك)
-    # فرضا أنك حسبت الاتجاه والسعر، تضعها في هذا القاموس (Dictionary):
-    
-    signal_result = {
-        "ok": True,
-        "signal": "صعود 🚀",       # أو "نزول 📉" حسب استراتيجيتك
-        "probability": 68.5,     # نسبة الثقة
-        "current_price": 5120.50,# السعر الحالي لـ SPX أو SPY
-        "timestamp": "2026-10-15 08:55"
-    }
-    
-    return signal_result  # <--- هذا هو السطر الأخير الذي يُرجع النتيجة
+    try:
+        hist = fetch_spx_history()
+        if hist.empty:
+            return {"ok": False, "reason": "NO_HIST_DATA"}
+            
+        model, metrics = train_and_validate_spx(hist)
+        snapshot = latest_spx_snapshot(hist, model, metrics)
+        
+        if not snapshot.get("ok") or not snapshot.get("price"):
+            return {"ok": False, "reason": snapshot.get("reason", "INVALID_SNAPSHOT")}
+            
+        prob_up = snapshot.get("prob_up", 0.5)
+        signal_dir = "صعود 🚀" if prob_up >= 0.5 else "نزول 📉"
+        probability = round(max(prob_up, 1 - prob_up) * 100, 1)
+        
+        return {
+            "ok": True,
+            "signal": signal_dir,
+            "probability": probability,
+            "current_price": round(snapshot["price"], 2),
+            "timestamp": snapshot.get("timestamp", datetime.now(UTC).isoformat())
+        }
+    except Exception as e:
+        log.exception(f"Error in get_spx_signal: {e}")
+        return {"ok": False, "reason": str(e)}
+
