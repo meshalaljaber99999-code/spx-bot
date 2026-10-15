@@ -4,3 +4,4 @@ requests
 scikit-learn
 yfinance
 python-dotenv
+Pillow
