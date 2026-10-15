@@ -21,9 +21,9 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
 import yfinance as yf
-
 from spx_strategy import get_spx_signal
-
+print("SAFAA_STDOUT_TEST", flush=True)
+print("SAFAA_STDERR_TEST", file=sys.stderr, flush=True)
 # -------------------- CONFIG --------------------
 NAME, VERSION = "صَفاء التحليل", "25.4-Points-Speed-MegaCaps"
 NY, UTC = ZoneInfo("America/New_York"), timezone.utc
