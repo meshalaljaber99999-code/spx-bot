@@ -1,4 +1,4 @@
-# ============================================================
+## ============================================================
 # صَفاء التحليل v25.4-Points-Speed-MegaCaps | Pre-Market & NY Session
 # Pre-Market Reports • SPX Calls/Puts • 5-Point Spike • Open Premiums
 # NO AUTOMATIC ORDERS — simulated tracking, not actual P&L
@@ -163,16 +163,15 @@ def telegram(message):
     if not TG_ENABLED:
         log.warning("Telegram غير مضبوط؛ لم يتم إرسال الرسالة.")
         return False
-    try:
         r = HTTP.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={
-                "chat_id": TG_CHAT,
-                "text": message,
-                "parse_mode": "HTML",
-            },
-            timeout=12,
-        )
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        json={
+            "chat_id": TELEGRAM_CHAT,
+            "text": message,
+            "parse_mode": "HTML",
+        },
+    )
+
         if r.status_code != 200:
             log.error("Telegram error %s: %s", r.status_code, r.text[:300])
             return False
