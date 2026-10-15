@@ -21,7 +21,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score, brier_score_loss
 import yfinance as yf
-# في أعلى ملف "صَفاء التحليل" الرئيسي (مع باقي المكتبات مثل pandas و requests وغيرها)
+
 from spx_strategy import get_spx_signal
 
 # -------------------- CONFIG --------------------
@@ -779,21 +779,14 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"Telegram startup message failed: {e}")
     
-    while True:
-        try:
-            log.info("🔄 البوت يعمل في وضع الاستماع ومراقبة السوق...")
-                while True:
+        while True:
         try:
             log.info("🔄 البوت يعمل في وضع الاستماع ومراقبة السوق...")
             
-            # 📌 ضع استدعاء التوصية هنا:
+            # استدعاء التوصية من الملف المستقل
             spx_rec = get_spx_signal()
             if spx_rec and spx_rec.get("ok"):
                 log.info(f"📥 وصلت التوصية: {spx_rec.get('signal')} | السعر: {spx_rec.get('current_price')}")
-
-            if market_open():
-                run_scan()
-                run_leaders_scan()
 
             if market_open():
                 run_scan()
