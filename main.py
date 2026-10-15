@@ -53,7 +53,8 @@ STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TG_ENABLED = bool(TG_TOKEN and TG_CHAT)
+TG_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
 
 HISTORY_DAYS = 120         
 MIN_ROWS = 300
