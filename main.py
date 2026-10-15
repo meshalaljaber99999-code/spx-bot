@@ -51,8 +51,8 @@ KEY = (os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or "").strip(
 SECRET = (os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or "").strip()
 STOCK_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 OPTION_FEED = os.getenv("OPTIONS_FEED", "indicative").lower()
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TG_ENABLED = bool(TG_TOKEN and TG_CHAT)
 
 HISTORY_DAYS = 120         
