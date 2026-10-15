@@ -779,7 +779,7 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"Telegram startup message failed: {e}")
     
-            while True:
+while True:
         try:
             log.info("🔄 البوت يعمل في وضع الاستماع ومراقبة السوق...")
             
