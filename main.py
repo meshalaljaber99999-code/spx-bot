@@ -14,8 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 
-APP_NAME = "صَفاء التحليل"
-VERSION = "v27"
+APP_NAME = "صَفاء التحليل (النسخة المؤسساتية)"
+VERSION = "v29"
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -31,17 +31,17 @@ STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip().lower()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v27.db")
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v29.db")
 POLL_SECONDS = max(60, int(os.getenv("POLL_SECONDS", "120")))
 
 MAX_STOCK_ALERTS_PER_CYCLE = int(os.getenv("MAX_STOCK_ALERTS_PER_CYCLE", "6"))
-STOCK_MIN_SCORE = float(os.getenv("STOCK_MIN_SCORE", "0.45"))     # قوة زخم السهم المطلوبة
-SPX_MIN_SCORE = float(os.getenv("SPX_MIN_SCORE", "0.15"))         # أقل قوة لإشارة SPXW
+STOCK_MIN_SCORE = float(os.getenv("STOCK_MIN_SCORE", "0.70"))     # قوة زخم السهم المطلوبة (70% للشركات الكبرى)
+SPX_MIN_SCORE = float(os.getenv("SPX_MIN_SCORE", "0.20"))         # أقل قوة لإشارة SPXW
 STOCK_COOLDOWN_MIN = int(os.getenv("STOCK_COOLDOWN_MIN", "45"))
 SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "30"))
-FLIP_MIN_MINUTES = int(os.getenv("FLIP_MIN_MINUTES", "15"))       # أقل مدة قبل عكس الاتجاه
+FLIP_MIN_MINUTES = int(os.getenv("FLIP_MIN_MINUTES", "15"))       
 MAX_DTE = int(os.getenv("MAX_DTE", "7"))
-HORIZON = 6                                                        # 6 شموع × 5د = 30د
+HORIZON = 6                                                        
 MODEL_RETRAIN_MIN = 60
 
 TOP_LEADERS_MAP = {
@@ -53,13 +53,12 @@ TOP_LEADERS_MAP = {
     "KO": 0.02, "ORCL": 0.02, "UNH": 0.02, "NFLX": 0.02, "GS": 0.02,
 }
 
-# رمز الخيارات يختلف عن رمز السهم لبعض الشركات
 OPTION_UNDERLYING = {"BRK-B": "BRKB"}
 
 SESSION_OPEN = dtime(9, 30)
 SESSION_CLOSE = dtime(16, 0)
-ALERT_START_DELAY_MIN = 15      # لا تنبيهات أول 15 دقيقة
-ALERT_END_BEFORE_CLOSE_MIN = 30 # ولا تنبيهات آخر 30 دقيقة
+ALERT_START_DELAY_MIN = 15      
+ALERT_END_BEFORE_CLOSE_MIN = 30 
 
 http = requests.Session()
 http.headers.update({"APCA-API-KEY-ID": ALPACA_KEY,
@@ -68,7 +67,7 @@ http.headers.update({"APCA-API-KEY-ID": ALPACA_KEY,
 
 FOOTER = "\n\n⚠️ تنبيه تحليلي وليس توصية استثمارية"
 
-# ---------------- HELPERS ----------------
+# ---------------- HELPERS & INSTITUTIONAL FILTERS ----------------
 def now_et() -> datetime:
     return datetime.now(ET)
 
@@ -109,6 +108,41 @@ def mark_alert(key: str, direction: str):
     db_exec("INSERT OR REPLACE INTO alert_state(key,direction,sent_at) VALUES(?,?,?)",
             (key, direction, datetime.now(UTC).isoformat()))
 
+def calculate_poc(df: pd.DataFrame) -> float:
+    """حساب نقطة السيطرة (POC): السعر الذي تمركزت فيه أكبر سيولة بالأمس"""
+    try:
+        if df is None or df.empty: return None
+        idx = df.index.tz_convert(ET)
+        last_day = df[idx.date == idx[-1].date()].copy()
+        if last_day.empty: return None
+        
+        last_day['typical_price'] = (last_day['high'] + last_day['low'] + last_day['close']) / 3
+        bins = np.arange(last_day['low'].min(), last_day['high'].max() + 2, 2)
+        last_day['price_bin'] = pd.cut(last_day['typical_price'], bins=bins)
+        
+        if last_day['price_bin'].isna().all(): return None
+        
+        volume_profile = last_day.groupby('price_bin', observed=False)['volume'].sum()
+        poc_bin = volume_profile.idxmax()
+        return float(poc_bin.mid)
+    except Exception as e:
+        log.warning(f"Error calculating POC: {e}")
+        return None
+
+def check_vix_structure() -> str:
+    """هيكل الخوف: مقارنة VIX اللحظي بـ VIX 3 أشهر لكشف الانهيارات المخفية"""
+    try:
+        vix = yf.Ticker("^VIX").history(period="1d")
+        vix3m = yf.Ticker("^VIX3M").history(period="1d")
+        if vix.empty or vix3m.empty: return "NEUTRAL"
+        
+        ratio = float(vix["Close"].iloc[-1]) / float(vix3m["Close"].iloc[-1])
+        if ratio > 1.05: return "PANIC" # رعب، ممنوع الشراء
+        elif ratio < 0.90: return "SAFE" # آمن جداً
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
 # ---------------- ALPACA ----------------
 def alpaca_get(path, params=None, timeout=20, retries=3):
     if not ALPACA_KEY or not ALPACA_SECRET:
@@ -124,7 +158,6 @@ def alpaca_get(path, params=None, timeout=20, retries=3):
     raise RuntimeError("Alpaca rate limit (429) after retries")
 
 def drop_incomplete(df: pd.DataFrame, minutes=5) -> pd.DataFrame:
-    """يحذف الشمعة الأخيرة فقط إذا لم تكتمل بعد (بدل حذف شمعتين)."""
     if df is None or df.empty:
         return df
     if df.index[-1] + timedelta(minutes=minutes) > datetime.now(UTC):
@@ -154,7 +187,6 @@ def alpaca_bars(symbols, timeframe, start, feed=None) -> dict:
     return out
 
 def get_option_quotes(symbols) -> dict:
-    """يرجع فقط العروض الصالحة (bid/ask حقيقيين وسبريد معقول)."""
     out = {}
     try:
         payload = alpaca_get("/v1beta1/options/quotes/latest",
@@ -173,7 +205,6 @@ def get_option_quotes(symbols) -> dict:
 _cal_cache = {}
 
 def get_session(d):
-    """(open, close) لليوم أو None إذا عطلة. يدعم الإغلاق المبكر."""
     if d in _cal_cache:
         return _cal_cache[d]
     try:
@@ -191,7 +222,6 @@ def get_session(d):
 # ---------------- TELEGRAM ----------------
 def tg_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.info("Telegram skipped: %s", text[:100])
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -247,7 +277,6 @@ def yf_batch(symbols) -> dict:
 
 # ---------------- MOMENTUM / MODEL ----------------
 def momentum_score(df, max_age_min=40):
-    """زخم مُطبّع بالتذبذب في نطاق [-1, 1]. يعتمد على شموع اليوم فقط."""
     try:
         if df is None or len(df) < 30:
             return None
@@ -315,7 +344,6 @@ def fetch_spy_df() -> pd.DataFrame:
     return yf_bars("SPY", period="30d", interval="5m")
 
 def model_component(spy_df):
-    """يرجع (score في [-1,1], accuracy). الوزن يقل تلقائياً إذا الدقة ضعيفة."""
     try:
         if spy_df is None or len(spy_df) < 400:
             return None, None
@@ -339,13 +367,11 @@ def model_component(spy_df):
             final.fit(X, y)
             _MODEL.update(model=final, trained_at=datetime.now(UTC),
                           acc=float(np.mean(accs)) if accs else 0.5)
-            log.info("Model retrained | walk-forward acc=%.3f", _MODEL["acc"])
-
+            
         prob_up = float(_MODEL["model"].predict_proba(x[FEATURES].iloc[[-1]])[0, 1])
         quality = float(np.clip((_MODEL["acc"] - 0.5) / 0.05, 0, 1))
         return (prob_up - 0.5) * 2 * quality, _MODEL["acc"]
     except Exception as e:
-        log.warning("model failed: %s", e)
         return None, None
 
 # ---------------- LEADERS ----------------
@@ -386,7 +412,6 @@ def combine_signal(leaders, model, index, vix):
     return float(sum(v * w for v, w in avail.values()) / tw)
 
 def get_spxw_contract(spot: float, direction: str):
-    """سلسلة خيارات SPX من ياهو (متأخرة ~15 دقيقة). لا نختلق أي سعر."""
     try:
         t = yf.Ticker("^SPX")
         today = now_et().date().isoformat()
@@ -412,7 +437,6 @@ def get_spxw_contract(spot: float, direction: str):
         return {"expiry": exp, "strike": float(row["strike"]),
                 "bid": float(row["bid"]), "ask": float(row["ask"])}
     except Exception as e:
-        log.warning("SPXW chain failed: %s", e)
         return None
 
 def option_label(underlying: str, exp: str, opt_type: str, strike: float) -> str:
@@ -426,21 +450,18 @@ def run_spx_alert(leaders_score):
     gspc = yf_bars("^GSPC", "5d", "5m")
     index_score = momentum_score(gspc)
     vix_s = momentum_score(yf_bars("^VIX", "5d", "5m"))
-    vix_score = -vix_s if vix_s is not None else None  # ارتفاع VIX = ضغط هبوطي
+    vix_score = -vix_s if vix_s is not None else None  
 
     total = combine_signal(leaders_score, model_score, index_score, vix_score)
     if total is None:
-        log.info("SPXW: insufficient data")
         return
     if abs(total) < SPX_MIN_SCORE:
-        log.info("SPXW neutral (score=%.2f)", total)
         return
 
     direction = "CALL" if total > 0 else "PUT"
     if not should_alert("spxw", direction, SPX_COOLDOWN_MIN):
         return
 
-    # سعر المؤشر: من ياهو مباشرة، وإلا تقدير من SPY (يُوسم تقديري)
     estimated = False
     if not gspc.empty:
         spot = float(gspc["close"].iloc[-1])
@@ -451,12 +472,42 @@ def run_spx_alert(leaders_score):
 
     c = get_spxw_contract(spot, direction)
     up = direction == "CALL"
+    
+    # فلتر الصمت التكتيكي (500% ROI) أثناء التداول
+    estimated_roi = 0
+    if c:
+        entry = c["ask"]
+        strike = c["strike"]
+        
+        # القيمة الجوهرية المطلوبة ليحقق العقد 500% (سعر العقد * 6)
+        required_intrinsic = entry * 6
+        
+        # حساب أقصى حركة متوقعة لليوم من الـ VIX
+        try:
+            current_vix = float(yf.Ticker("^VIX").history(period="1d")["Close"].iloc[-1])
+            expected_move_points = spot * (current_vix / 100) * math.sqrt(1 / 252)
+        except:
+            expected_move_points = spot * 0.007 # قيمة احتياطية
+
+        if up:
+            projected_high = spot + expected_move_points
+            if projected_high < (strike + required_intrinsic):
+                log.info(f"SPXW Intraday Silence: Move to {projected_high:.0f} won't hit 500% ROI for Call. Skipping.")
+                return # صمت تكتيكي (لن يرسل رسالة)
+            estimated_roi = (((projected_high - strike) / entry) - 1) * 100
+        else:
+            projected_low = spot - expected_move_points
+            if projected_low > (strike - required_intrinsic):
+                log.info(f"SPXW Intraday Silence: Move to {projected_low:.0f} won't hit 500% ROI for Put. Skipping.")
+                return # صمت تكتيكي (لن يرسل رسالة)
+            estimated_roi = (((strike - projected_low) / entry) - 1) * 100
+
     fmt = lambda v: "—" if v is None else f"{v:+.2f}"
     lines = [
-        "📊 <b>SPXW — توقع لحظي</b>\n",
+        "📊 <b>SPXW — إشارة صيد لحظية (Lotto)</b>\n",
         f"▫️ <b>الاتجاه:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
         f"▫️ <b>قوة الإشارة:</b> {min(99, int(abs(total) * 100))}%",
-        f"▫️ <b>سعر المؤشر:</b> ${spot:,.2f}{' (تقديري)' if estimated else ''}",
+        f"▫️ <b>سعر المؤشر اللحظي:</b> ${spot:,.2f}{' (تقديري)' if estimated else ''}",
     ]
     if c:
         entry = c["ask"]
@@ -464,6 +515,7 @@ def run_spx_alert(leaders_score):
             f"▫️ <b>رقم العقد:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>",
             f"▫️ <b>Strike:</b> ${c['strike']:,.0f}",
             f"▫️ <b>الدخول (Ask):</b> ${entry:.2f}",
+            f"▫️ <b>الربح المتوقع للحركة:</b> +{estimated_roi:,.0f}% 🔥",
             f"▫️ <b>خروج قريب (+50%):</b> ${entry * 1.5:.2f}",
             f"▫️ <b>خروج بعيد (+200%):</b> ${entry * 3.0:.2f}",
         ]
@@ -473,12 +525,8 @@ def run_spx_alert(leaders_score):
         "",
         f"🧭 زخم الشركات الكبرى {fmt(leaders_score)} | النموذج {fmt(model_score)} | "
         f"حركة المؤشر {fmt(index_score)} | التذبذب {fmt(vix_score)}",
-        "🎯 القريب: " + ("صعود تدريجي وتجاوز المقاومة" if up else "ضغط هبوطي واختبار الدعم"),
     ]
-    if c:
-        lines.append("⏱ أسعار العقد متأخرة ~15 دقيقة")
-    if acc is not None and acc < 0.52:
-        lines.append("ℹ️ دقة النموذج التاريخية ضعيفة، اعتمدت الإشارة على الزخم والمؤشر")
+    
     if tg_send("\n".join(lines) + FOOTER):
         mark_alert("spxw", direction)
 
@@ -504,9 +552,10 @@ def find_stock_contract(ticker: str, price: float, opt_type: str):
             if q:
                 return {"symbol": c["symbol"], "expiry": exp,
                         "strike": float(c["strike_price"]), "ask": q["ask"]}
-    return None  # لا نختلق سعر — نتخطى السهم
+    return None  
 
 def run_stock_alerts(bars: dict, scores: dict):
+    # لا يرسل تنبيهات للشركات إلا إذا تخطت 70% قوة زخم (STOCK_MIN_SCORE)
     cands = sorted([(t, s) for t, s in scores.items() if abs(s) >= STOCK_MIN_SCORE],
                    key=lambda x: -abs(x[1]))
     today = now_et().date()
@@ -521,10 +570,8 @@ def run_stock_alerts(bars: dict, scores: dict):
             price = float(bars[t]["close"].iloc[-1])
             c = find_stock_contract(t, price, "call" if s > 0 else "put")
         except Exception as e:
-            log.warning("contract lookup %s failed: %s", t, e)
             continue
         if not c:
-            log.info("%s: no valid priced contract, skipped", t)
             continue
         entry = c["ask"]
         dte = (datetime.strptime(c["expiry"], "%Y-%m-%d").date() - today).days
@@ -542,10 +589,9 @@ def run_stock_alerts(bars: dict, scores: dict):
         blocks.append({"t": t, "dir": direction, "text": text})
         time.sleep(0.3)
 
-    # كل شركتين في رسالة واحدة
     for i in range(0, len(blocks), 2):
         pair = blocks[i:i + 2]
-        msg = "🔔 <b>عقود الشركات الكبرى</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER
+        msg = "🔔 <b>عقود الشركات الكبرى (الثقة عالية)</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER
         if tg_send(msg):
             for b in pair:
                 mark_alert(f"stk:{b['t']}", b["dir"])
@@ -553,49 +599,85 @@ def run_stock_alerts(bars: dict, scores: dict):
 
 # ---------------- PRE-MARKET REPORT ----------------
 def build_premarket_message(day_str: str):
-    # العقود المستقبلية ES=F تعطي حركة ما قبل السوق الحقيقية
     fut = yf_bars("ES=F", "5d", "15m", prepost=True)
-    if fut.empty:
-        return None
+    if fut.empty: return None
+    
     fe = fut.index.tz_convert(ET)
     today = now_et().date()
     prior_mask = np.array([(d < today) and (t <= dtime(16, 0)) for d, t in zip(fe.date, fe.time)])
-    if not prior_mask.any():
-        return None
-    prior_close = float(fut["close"][prior_mask].iloc[-1])
-    fut_chg = float(fut["close"].iloc[-1]) / prior_close - 1
+    if not prior_mask.any(): return None
+        
+    prior_close_fut = float(fut["close"][prior_mask].iloc[-1])
+    fut_chg = float(fut["close"].iloc[-1]) / prior_close_fut - 1
+    
+    current_vol = float(fut["volume"].iloc[-1])
+    avg_vol = float(fut["volume"].tail(10).mean())
+    vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+
+    spx_data = yf.Ticker("^GSPC").history(period="5d", interval="1d")
+    vix_data = yf.Ticker("^VIX").history(period="5d", interval="1d")
+    if spx_data.empty or vix_data.empty: return None
+    
+    last_spx_close = float(spx_data["Close"].iloc[-1])
+    current_vix = float(vix_data["Close"].iloc[-1])
+
+    expected_open = last_spx_close * (1 + fut_chg)
+    daily_expected_move_pct = (current_vix / 100) * math.sqrt(1 / 252)
+    daily_expected_move_points = expected_open * daily_expected_move_pct
+    
+    expected_high = expected_open + daily_expected_move_points
+    expected_low = expected_open - daily_expected_move_points
+
+    poc_price = calculate_poc(fut)
+    vix_state = check_vix_structure()
+    
     fut_score = math.tanh(fut_chg / 0.005)
+    total = fut_score
 
-    vix_score = None
-    try:
-        v = yf.Ticker("^VIX").history(period="5d", interval="1d")
-        if len(v) >= 2:
-            vix_score = -math.tanh((float(v["Close"].iloc[-1]) / float(v["Close"].iloc[-2]) - 1) / 0.05)
-    except Exception:
-        pass
-    total = fut_score if vix_score is None else 0.7 * fut_score + 0.3 * vix_score
+    if vix_state == "PANIC": total -= 0.5
+    elif vix_state == "SAFE": total += 0.2
+    if vol_ratio < 0.70: total *= 0.5
+    total = max(-1.0, min(1.0, total))
 
-    d = yf.Ticker("^GSPC").history(period="20d", interval="1d")
-    if d.empty:
-        return None
-    avg_range = float((d["High"] - d["Low"]).tail(10).mean())
-    center = float(d["Close"].iloc[-1]) * (1 + fut_chg)
-    high, low = center + avg_range * 0.5, center - avg_range * 0.5
-
-    if abs(total) < SPX_MIN_SCORE:
-        view, short_t, long_t = "محايد ⚪", "تذبذب بدون اتجاه واضح بعد الافتتاح", "انتظار محفز واضح"
-    elif total > 0:
-        view, short_t, long_t = "صعود 🟢", "فتح إيجابي ومحاولة تجاوز المقاومة القريبة", "اتجاه إيجابي ما دام الزخم محافظاً على قوته"
+    if total > 0:
+        strike_price = round(expected_high / 5) * 5
     else:
-        view, short_t, long_t = "هبوط 🔴", "ضغط هبوطي واختبار الدعم القريب", "حذر من استمرار الزخم السلبي"
+        strike_price = round(expected_low / 5) * 5
+
+    guarantee_phrase = ""
+    if abs(total) >= 0.70 and vol_ratio >= 1.0 and vix_state != "PANIC":
+        guarantee_phrase = "\n\n🔥 <b>(فرصة قوية اليوم)</b> - إشارة مؤكدة مدعومة بسيولة وهيكل سوق آمن."
+
+    if abs(total) < SPX_MIN_SCORE or vol_ratio < 0.60:
+        view = "محايد / حذر ⚪"
+        direction_desc = "تذبذب عرضي دون مسار واضح، يفضل مراقبة مستوى الافتتاح لتحديد الوجهة."
+        action = "لا توجد إشارة دخول آمنة قبل الافتتاح."
+        expected_close_txt = f"الإغلاق المتوقع: قريب من الافتتاح (${expected_open:,.0f})"
+    elif total > 0:
+        view = f"صعود إيجابي 🟢 ({min(99, int(abs(total)*100))}%)"
+        direction_desc = f"مسار صاعد. الدعم الأقوى اليوم عند منطقة ${expected_low:,.0f}، والمستهدف ${expected_high:,.0f}."
+        action = f"راقب عقد كول (CALL) سترايك <b>{strike_price:g}</b>."
+        expected_close_txt = f"الإغلاق المتوقع: أعلى من ${expected_open:,.0f}"
+    else:
+        view = f"هبوط سلبي 🔴 ({min(99, int(abs(total)*100))}%)"
+        direction_desc = f"مسار هابط وموجة بيعية. المقاومة عند ${expected_high:,.0f}، والمستهدف ${expected_low:,.0f}."
+        action = f"راقب عقد بوت (PUT) سترايك <b>{strike_price:g}</b>."
+        expected_close_txt = f"الإغلاق المتوقع: أقل من ${expected_open:,.0f}"
+
+    poc_text = f"📍 <b>نقطة الارتكاز المخفية (POC):</b> ${poc_price:,.0f} (أكبر تمركز للسيولة)" if poc_price else ""
 
     return (
-        f"🌅 <b>تقرير ما قبل السوق — SPXW</b>\n📅 {day_str}\n\n"
-        f"📊 <b>التوقع العام:</b> {view} (العقود المستقبلية {fut_chg * 100:+.2f}%)\n"
-        f"📈 <b>أعلى قمة متوقعة:</b> ${high:,.2f}\n"
-        f"📉 <b>أقل قاع متوقع:</b> ${low:,.2f}\n"
-        f"🎯 <b>المدى القريب:</b> {short_t}\n"
-        f"🌐 <b>المدى البعيد:</b> {long_t}" + FOOTER
+        f"🌅 <b>التقرير المؤسساتي لـ SPXW قبل الافتتاح</b>\n"
+        f"📅 {day_str}\n\n"
+        f"📊 <b>التوقع العام:</b> {view}\n"
+        f"⏳ <b>الافتتاح المتوقع للمؤشر:</b> ${expected_open:,.2f} ({fut_chg * 100:+.2f}%)\n"
+        f"🎯 <b>نطاق الحركة (من / إلى):</b> سيتحرك المؤشر اليوم غالباً بين ${expected_low:,.0f} و ${expected_high:,.0f}\n"
+        f"📉 <b>{expected_close_txt}</b>\n\n"
+        f"{poc_text}\n"
+        f"📈 <b>كيف سيتصرف المؤشر؟</b> {direction_desc}\n\n"
+        f"💡 <b>التوصية:</b> {action}"
+        f"{guarantee_phrase}"
+        f"{FOOTER}"
     )
 
 def check_premarket_report(sess):
@@ -608,7 +690,7 @@ def check_premarket_report(sess):
     if db_one("SELECT 1 FROM daily_reports WHERE report_date=? AND report_type='premarket'", (day,)):
         return
     msg = build_premarket_message(day)
-    if msg and tg_send(msg):  # نسجل بعد نجاح الإرسال فقط
+    if msg and tg_send(msg):  
         db_exec("INSERT OR REPLACE INTO daily_reports(report_date,report_type,sent_at) VALUES(?,?,?)",
                 (day, "premarket", datetime.now(UTC).isoformat()))
 
