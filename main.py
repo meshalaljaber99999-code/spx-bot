@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-‎
 import os, time, math, sqlite3, logging, html
 from contextlib import closing
 from datetime import datetime, timedelta, time as dtime
