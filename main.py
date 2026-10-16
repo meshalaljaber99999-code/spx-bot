@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""صَفاء التحليل v26.4 — Unified Bot (Clean Readable Option Symbols)"""
+"""صَفاء التحليل v26.5 — Unified Bot (30 MegaCaps + Dynamic Option Pricing)"""
 import os, time, json, math, sqlite3, logging, traceback, re
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo
@@ -12,7 +12,7 @@ import pandas as pd
 import yfinance as yf
 
 APP_NAME = "صَفاء التحليل"
-VERSION = "v26.4-Readable-Symbols"
+VERSION = "v26.5-30-MegaCaps"
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -31,10 +31,38 @@ DB_PATH = os.getenv("DB_PATH", "./data/safaa_v26.db")
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "./data/artifacts"))
 POLL_SECONDS = max(60, int(os.getenv("POLL_SECONDS", "120")))
 
+# القائمة المحدثة للـ 30 شركة الكبرى
 TOP_LEADERS_MAP = {
-    "AAPL": 0.070, "MSFT": 0.065, "NVDA": 0.060, "AMZN": 0.040,
-    "GOOGL": 0.035, "META": 0.030, "TSLA": 0.020, "BRK-B": 0.020,
-    "AVGO": 0.020, "LLY": 0.020, "JPM": 0.015, "NFLX": 0.015
+    "NVDA": 0.07,  # إنفيديا
+    "AAPL": 0.07,  # آبل
+    "GOOGL": 0.05, # جوجل
+    "MSFT": 0.06,  # مايكروسوفت
+    "AMZN": 0.05,  # أمازون
+    "TSM": 0.03,   # تايوان لأشباه الموصلات
+    "META": 0.04,  # ميتا
+    "AVGO": 0.03,  # برودكوم
+    "TSLA": 0.04,  # تسلا
+    "LLY": 0.03,   # إيلي ليلي
+    "BRK-B": 0.03, # بيركشاير
+    "MU": 0.02,    # ميكرون
+    "AMD": 0.03,   # إيه إم دي
+    "WMT": 0.02,   # وول مارت
+    "JPM": 0.02,   # جي بي مورغان
+    "V": 0.02,     # فيزا
+    "XOM": 0.02,   # إكسون موبيل
+    "JNJ": 0.02,   # جونسون آند جونسون
+    "MA": 0.02,    # ماستركارد
+    "ABBV": 0.02,  # أبفي
+    "PLTR": 0.02,  # بالانتير
+    "INTC": 0.02,  # إنتل
+    "CVX": 0.02,   # شيفرون
+    "COST": 0.02,  # كوستكو
+    "CSCO": 0.02,  # سيسكو
+    "KO": 0.02,    # كوكاكولا
+    "ORCL": 0.02,  # أوراكل
+    "UNH": 0.02,   # يونايتد هيلث
+    "NFLX": 0.02,  # نتفلكس
+    "GS": 0.02     # غولدمان ساكس
 }
 
 SESSION_OPEN = dtime(9, 30)
@@ -75,16 +103,25 @@ def tg_text(text: str):
         res.raise_for_status()
     return True
 
-# تحويل رمز العقد التقني إلى الشكل الواضح المطلوب (مثال: AAPL 161026 C 230)
 def format_readable_option(raw_symbol: str, underlying: str, exp_date: str, opt_type: str, strike: float) -> str:
     try:
-        # تحويل التاريخ من YYYY-MM-DD إلى DDMMYY
         dt_obj = datetime.strptime(exp_date, "%Y-%m-%d")
         date_str = dt_obj.strftime("%d%m%y")
         cp_char = "C" if opt_type.lower() in ["c", "call", "صعود 🚀"] else "P"
         return f"{underlying} {date_str} {cp_char} {int(strike) if strike.is_integer() else strike}"
     except Exception:
         return raw_symbol
+
+def get_option_quote(symbol):
+    try:
+        payload = alpaca_get("/v1beta1/options/quotes/latest", {"symbols": symbol, "feed": OPTIONS_FEED})
+        q = (payload.get("quotes") or {}).get(symbol, {})
+        bid, ask = float(q.get("bp", 0)), float(q.get("ap", 0))
+        if bid > 0 and ask >= bid:
+            return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
+    except Exception:
+        pass
+    return None
 
 # -------------------- SPY-DRIVEN ENGINE FOR SPXW --------------------
 def fetch_spy_bars():
@@ -171,6 +208,7 @@ def get_spx_contract_signal_via_spy():
         strike_price = round(spx_estimated_price / 5) * 5
         readable_symbol = format_readable_option("SPXW", "SPXW", today_str, opt_type, strike_price)
         
+        entry_ask = 3.50  # قيمة افتراضية في حال تعذر جلب السعر الحي للمؤشر
         try:
             payload = alpaca_get("/v2/options/contracts", {
                 "underlying_symbols": "SPX", "status": "active",
@@ -182,6 +220,9 @@ def get_spx_contract_signal_via_spy():
                 best_contract = contracts[0]
                 strike_price = float(best_contract.get("strike_price", strike_price))
                 readable_symbol = format_readable_option(best_contract.get("symbol", ""), "SPXW", today_str, opt_type, strike_price)
+                q = get_option_quote(best_contract.get("symbol"))
+                if q:
+                    entry_ask = q["ask"]
         except Exception:
             pass
 
@@ -192,8 +233,10 @@ def get_spx_contract_signal_via_spy():
         return {
             "ok": True, "signal": signal_dir, "prob_up": prob_up,
             "current_price": spx_estimated_price, "contract_symbol": readable_symbol,
-            "strike": strike_price, "entry_price": 3.50, "exit_short_term": 6.50,
-            "exit_long_term": 15.50, "high_day": high_spx, "low_day": low_spx,
+            "strike": strike_price, "entry_price": entry_ask,
+            "exit_short_term": round(entry_ask * 1.5, 2),  # هدف المدى القريب +50% ديناميكياً
+            "exit_long_term": round(entry_ask * 3.0, 2),   # هدف المدى البعيد +200% ديناميكياً
+            "high_day": high_spx, "low_day": low_spx,
             "short_term_text": "صعود تدريجي وتجاوز المقاومة القريبة" if prob_up >= 0.5 else "ضغط هبوطي واختبار الدعم القريب",
             "long_term_text": "اتجاه إيجابي قوي ومستهدفات عليا للمدى البعيد" if prob_up >= 0.5 else "استمرار الزخم السلبي وتعميق الهبوط للمدى البعيد"
         }
@@ -226,7 +269,7 @@ def check_premarket_report():
             )
             tg_text(msg)
 
-# -------------------- MEGA CAPS CONTRACTS --------------------
+# -------------------- MEGA CAPS CONTRACTS (DYNAMIC PRICING) --------------------
 def scan_mega_caps_contracts():
     now = now_et()
     if now.weekday() >= 5 or not (SESSION_OPEN <= now.time() <= SESSION_CLOSE):
@@ -260,9 +303,18 @@ def scan_mega_caps_contracts():
                 
                 contracts.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - price))
                 best_c = contracts[0]
+                contract_symbol = best_c.get("symbol")
                 strike = float(best_c.get("strike_price", 0))
-                readable_sym = format_readable_option(best_c.get("symbol", ""), ticker, exp_str, opt_type, strike)
+                readable_sym = format_readable_option(contract_symbol, ticker, exp_str, opt_type, strike)
                 
+                # جلب السعر الحي الحقيقي (Ask) للعقد ديناميكياً
+                q = get_option_quote(contract_symbol)
+                entry_ask = q["ask"] if q else 1.00 # قيمة احتياطية إذا لم يتوفر تسعير مباشر
+                
+                # حساب مستهدفات الخروج ديناميكياً بناءً على سعر الـ Ask الفعلي
+                exit_short = round(entry_ask * 1.5, 2)  # هدف المدى القريب (+50%)
+                exit_long = round(entry_ask * 3.0, 2)   # هدف المدى البعيد (+200%)
+
                 exp_label = "عقد اليوم الواحد (0DTE)" if exp == today else f"عقد ينتهي بعد 3 أيام ({exp_str})"
                 
                 msg = (
@@ -272,9 +324,9 @@ def scan_mega_caps_contracts():
                     f"▫️ <b>تاريخ الانتهاء:</b> {exp_str} ({exp_label})\n"
                     f"▫️ <b>التوقع والاتجاه:</b> {direction}\n"
                     f"▫️ <b>سعر الـ Strike:</b> ${strike:.2f}\n"
-                    f"▫️ <b>سعر الدخول الافتراضي:</b> $3.50\n"
-                    f"▫️ <b>الخروج للمدى القريب:</b> $6.50\n"
-                    f"▫️ <b>الخروج للمدى البعيد:</b> $15.50\n\n"
+                    f"▫️ <b>سعر الدخول الفعلي (Ask):</b> ${entry_ask:.2f}\n"
+                    f"▫️ <b>الخروج (المدى القريب):</b> ${exit_short:.2f}\n"
+                    f"▫️ <b>الخروج (المدى البعيد):</b> ${exit_long:.2f}\n\n"
                     f"⚠️ تنبيه تحليلي افتراضي"
                 )
                 tg_text(msg)
@@ -299,7 +351,7 @@ def run_spx_telegram_alert():
         f"▫️ <b>رقم العقد:</b> <code>{spx['contract_symbol']}</code>\n"
         f"▫️ <b>سعر الـ Strike:</b> ${spx['strike']:,.2f}\n"
         f"▫️ <b>سعر المؤشر الحالي:</b> ${spx['current_price']:,.2f}\n"
-        f"▫️ <b>سعر الدخول:</b> ${spx['entry_price']:.2f}\n"
+        f"▫️ <b>سعر الدخول الفعلي:</b> ${spx['entry_price']:.2f}\n"
         f"▫️ <b>الخروج (المدى القريب):</b> ${spx['exit_short_term']:.2f} — ({spx['short_term_text']})\n"
         f"▫️ <b>الخروج (المدى البعيد):</b> ${spx['exit_long_term']:.2f} — ({spx['long_term_text']})\n\n"
         f"⚠️ تنبيه تحليلي افتراضي"
@@ -311,7 +363,7 @@ def main():
     init_db()
     log.info(f"Starting {APP_NAME} {VERSION}...")
     try:
-        tg_text(f"🚀 تم تشغيل نظام {APP_NAME} ({VERSION}) بنجاح مع تنسيق أرقام العقود الواضح مثل الصورة!")
+        tg_text(f"🚀 تم تشغيل نظام {APP_NAME} ({VERSION}) بنجاح مع إضافة الـ 30 شركة وتفعيل الأسعار الديناميكية المباشرة للعقود!")
     except Exception:
         pass
 
