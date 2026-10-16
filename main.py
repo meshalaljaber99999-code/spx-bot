@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-‎"""صَفاء التحليل v27 — Unified Bot (30 MegaCaps + SPXW multi-source engine)"""
+‎"""Safaa v27 - Unified Bot (30 MegaCaps + SPXW multi-source engine)"""
 import os, time, math, sqlite3, logging, html
 from contextlib import closing
 from datetime import datetime, timedelta, time as dtime
