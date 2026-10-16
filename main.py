@@ -52,7 +52,8 @@ TOP_LEADERS_MAP = {
     "PLTR": 0.02, "INTC": 0.02, "CVX": 0.02, "COST": 0.02, "CSCO": 0.02,
     "KO": 0.02, "ORCL": 0.02, "UNH": 0.02, "NFLX": 0.02, "GS": 0.02,
 }
-‎# رمز الخيارات يختلف عن رمز السهم لبعض الشركات
+
+# رمز الخيارات يختلف عن رمز السهم لبعض الشركات
 OPTION_UNDERLYING = {"BRK-B": "BRKB"}
 
 SESSION_OPEN = dtime(9, 30)
@@ -123,7 +124,7 @@ def alpaca_get(path, params=None, timeout=20, retries=3):
     raise RuntimeError("Alpaca rate limit (429) after retries")
 
 def drop_incomplete(df: pd.DataFrame, minutes=5) -> pd.DataFrame:
-‎    """يحذف الشمعة الأخيرة فقط إذا لم تكتمل بعد (بدل حذف شمعتين)."""
+    """يحذف الشمعة الأخيرة فقط إذا لم تكتمل بعد (بدل حذف شمعتين)."""
     if df is None or df.empty:
         return df
     if df.index[-1] + timedelta(minutes=minutes) > datetime.now(UTC):
@@ -153,7 +154,7 @@ def alpaca_bars(symbols, timeframe, start, feed=None) -> dict:
     return out
 
 def get_option_quotes(symbols) -> dict:
-‎    """يرجع فقط العروض الصالحة (bid/ask حقيقيين وسبريد معقول)."""
+    """يرجع فقط العروض الصالحة (bid/ask حقيقيين وسبريد معقول)."""
     out = {}
     try:
         payload = alpaca_get("/v1beta1/options/quotes/latest",
@@ -246,7 +247,7 @@ def yf_batch(symbols) -> dict:
 
 # ---------------- MOMENTUM / MODEL ----------------
 def momentum_score(df, max_age_min=40):
-‎    """زخم مُطبّع بالتذبذب في نطاق [-1, 1]. يعتمد على شموع اليوم فقط."""
+    """زخم مُطبّع بالتذبذب في نطاق [-1, 1]. يعتمد على شموع اليوم فقط."""
     try:
         if df is None or len(df) < 30:
             return None
@@ -314,7 +315,7 @@ def fetch_spy_df() -> pd.DataFrame:
     return yf_bars("SPY", period="30d", interval="5m")
 
 def model_component(spy_df):
-‎    """يرجع (score في [-1,1], accuracy). الوزن يقل تلقائياً إذا الدقة ضعيفة."""
+    """يرجع (score في [-1,1], accuracy). الوزن يقل تلقائياً إذا الدقة ضعيفة."""
     try:
         if spy_df is None or len(spy_df) < 400:
             return None, None
@@ -385,7 +386,7 @@ def combine_signal(leaders, model, index, vix):
     return float(sum(v * w for v, w in avail.values()) / tw)
 
 def get_spxw_contract(spot: float, direction: str):
-‎    """سلسلة خيارات SPX من ياهو (متأخرة ~15 دقيقة). لا نختلق أي سعر."""
+    """سلسلة خيارات SPX من ياهو (متأخرة ~15 دقيقة). لا نختلق أي سعر."""
     try:
         t = yf.Ticker("^SPX")
         today = now_et().date().isoformat()
@@ -439,7 +440,7 @@ def run_spx_alert(leaders_score):
     if not should_alert("spxw", direction, SPX_COOLDOWN_MIN):
         return
 
-‎    # سعر المؤشر: من ياهو مباشرة، وإلا تقدير من SPY (يُوسم تقديري)
+    # سعر المؤشر: من ياهو مباشرة، وإلا تقدير من SPY (يُوسم تقديري)
     estimated = False
     if not gspc.empty:
         spot = float(gspc["close"].iloc[-1])
@@ -472,7 +473,7 @@ def run_spx_alert(leaders_score):
         "",
         f"🧭 زخم الشركات الكبرى {fmt(leaders_score)} | النموذج {fmt(model_score)} | "
         f"حركة المؤشر {fmt(index_score)} | التذبذب {fmt(vix_score)}",
-‎        "🎯 القريب: " + ("صعود تدريجي وتجاوز المقاومة" if up else "ضغط هبوطي واختبار الدعم"),
+        "🎯 القريب: " + ("صعود تدريجي وتجاوز المقاومة" if up else "ضغط هبوطي واختبار الدعم"),
     ]
     if c:
         lines.append("⏱ أسعار العقد متأخرة ~15 دقيقة")
@@ -541,7 +542,7 @@ def run_stock_alerts(bars: dict, scores: dict):
         blocks.append({"t": t, "dir": direction, "text": text})
         time.sleep(0.3)
 
-‎    # كل شركتين في رسالة واحدة
+    # كل شركتين في رسالة واحدة
     for i in range(0, len(blocks), 2):
         pair = blocks[i:i + 2]
         msg = "🔔 <b>عقود الشركات الكبرى</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER
@@ -552,7 +553,7 @@ def run_stock_alerts(bars: dict, scores: dict):
 
 # ---------------- PRE-MARKET REPORT ----------------
 def build_premarket_message(day_str: str):
-‎    # العقود المستقبلية ES=F تعطي حركة ما قبل السوق الحقيقية
+    # العقود المستقبلية ES=F تعطي حركة ما قبل السوق الحقيقية
     fut = yf_bars("ES=F", "5d", "15m", prepost=True)
     if fut.empty:
         return None
@@ -643,5 +644,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-sed -i 's/\xe2\x80\x8e//g; s/\xe2\x80\x8f//g; s/\xef\xbb\xbf//g' main.py
-
