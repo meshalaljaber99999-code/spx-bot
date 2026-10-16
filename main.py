@@ -644,4 +644,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+sed -i 's/\xe2\x80\x8e//g; s/\xe2\x80\x8f//g; s/\xef\xbb\xbf//g' main.py
 
