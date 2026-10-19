@@ -14,8 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 
-APP_NAME = "صَفاء التحليل (النسخة 35 - التنبؤ السعري 10 دقائق)"
-VERSION = "v35"
+APP_NAME = "صَفاء التحليل (النسخة 36 - العقود البعيدة والتنبؤ المتقدم)"
+VERSION = "v36"
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -31,18 +31,18 @@ STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip().lower()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v35.db")
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v36.db")
 
 POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "15")))
 
 MAX_STOCK_ALERTS_PER_CYCLE = int(os.getenv("MAX_STOCK_ALERTS_PER_CYCLE", "6"))
-STOCK_MIN_SCORE = float(os.getenv("STOCK_MIN_SCORE", "0.70"))     
-SPX_MIN_SCORE = float(os.getenv("SPX_MIN_SCORE", "0.20"))         
+STOCK_MIN_SCORE = float(os.getenv("STOCK_MIN_SCORE", "0.75"))     
+SPX_MIN_SCORE = float(os.getenv("SPX_MIN_SCORE", "0.30"))         
 STOCK_COOLDOWN_MIN = int(os.getenv("STOCK_COOLDOWN_MIN", "30")) 
-SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "5"))     
+SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "10"))     
 FLIP_MIN_MINUTES = int(os.getenv("FLIP_MIN_MINUTES", "5"))       
-MAX_DTE = int(os.getenv("MAX_DTE", "7"))
-HORIZON = 2  # تعديل الأفق الزمني لدعم التنبؤ القصير (10 دقائق على فريم الدقيقة)
+MAX_DTE = int(os.getenv("MAX_DTE", "5"))                         
+HORIZON = 2                                                        
 MODEL_RETRAIN_MIN = 60
 
 TOP_LEADERS_MAP = {
@@ -62,7 +62,7 @@ http.headers.update({"APCA-API-KEY-ID": ALPACA_KEY,
                      "APCA-API-SECRET-KEY": ALPACA_SECRET,
                      "accept": "application/json"})
 
-FOOTER = "\n\n⚠️ تنبيه تحليلي (النسخة 35 - توقعات 10 دقائق)"
+FOOTER = "\n\n⚠️ تنبيه تحليلي (النسخة 36 - العقود البعيدة الاحترافية)"
 
 # ---------------- HELPERS ----------------
 def now_et() -> datetime: return datetime.now(ET)
@@ -94,21 +94,6 @@ def should_alert(key: str, direction: str, cooldown_min: int) -> bool:
 def mark_alert(key: str, direction: str):
     db_exec("INSERT OR REPLACE INTO alert_state(key,direction,sent_at) VALUES(?,?,?)",
             (key, direction, datetime.now(UTC).isoformat()))
-
-def calculate_poc(df: pd.DataFrame) -> float:
-    try:
-        if df is None or df.empty: return None
-        idx = df.index.tz_convert(ET)
-        last_day = df[idx.date == idx[-1].date()].copy()
-        if last_day.empty: return None
-        last_day['typical_price'] = (last_day['high'] + last_day['low'] + last_day['close']) / 3
-        bins = np.arange(last_day['low'].min(), last_day['high'].max() + 2, 2)
-        last_day['price_bin'] = pd.cut(last_day['typical_price'], bins=bins)
-        if last_day['price_bin'].isna().all(): return None
-        return float(last_day.groupby('price_bin', observed=False)['volume'].sum().idxmax().mid)
-    except Exception as e:
-        log.error(f"Error calculating POC: {e}")
-        return None
 
 # ---------------- ALPACA & YFINANCE ----------------
 def alpaca_get(path, params=None, timeout=15, retries=2):
@@ -157,9 +142,9 @@ def get_option_quotes(symbols) -> dict:
         payload = alpaca_get("/v1beta1/options/quotes/latest", {"symbols": ",".join(symbols), "feed": OPTIONS_FEED})
         for sym, q in (payload.get("quotes") or {}).items():
             bid, ask = float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
-            if bid > 0 and ask >= bid and ask >= 0.05:
+            if bid > 0 and ask >= bid and ask >= 0.03:
                 mid = (bid + ask) / 2
-                if (ask - bid) / mid <= 0.50: out[sym] = {"bid": bid, "ask": ask, "mid": mid}
+                if (ask - bid) / mid <= 0.60: out[sym] = {"bid": bid, "ask": ask, "mid": mid}
     except Exception as e:
         log.error(f"Error getting option quotes: {e}")
     return out
@@ -291,7 +276,7 @@ def combine_signal(leaders, model, index, vix):
     if len(avail) < 2 or ("leaders" not in avail and "index" not in avail): return None
     return float(sum(v * w for v, w in avail.values()) / sum(w for _, w in avail.values()))
 
-def get_spxw_contract(spot: float, direction: str):
+def get_deep_otm_spxw_contract(spot: float, direction: str):
     try:
         t = yf.Ticker("^SPX")
         exps = [e for e in (t.options or []) if e >= now_et().date().isoformat()]
@@ -304,13 +289,19 @@ def get_spxw_contract(spot: float, direction: str):
             w = df[df["contractSymbol"].astype(str).str.startswith("SPXW")]
             if not w.empty: df = w
         if df.empty: return None
-        df["spread"] = (df["ask"] - df["bid"]) / ((df["ask"] + df["bid"]) / 2)
-        df = df[df["spread"] <= 0.50]
-        if df.empty: return None
-        row = df.assign(dist=(df["strike"] - spot).abs()).sort_values("dist").iloc[0]
+        
+        if direction == "CALL":
+            df = df[df["strike"] > spot * 1.005]
+            if df.empty: return None
+            row = df.sort_values("strike", ascending=True).iloc[0]
+        else:
+            df = df[df["strike"] < spot * 0.995]
+            if df.empty: return None
+            row = df.sort_values("strike", ascending=False).iloc[0]
+
         return {"expiry": exp, "strike": float(row["strike"]), "bid": float(row["bid"]), "ask": float(row["ask"])}
     except Exception as e:
-        log.error(f"SPXW contract error: {e}")
+        log.error(f"Deep OTM SPXW contract error: {e}")
         return None
 
 def option_label(underlying: str, exp: str, opt_type: str, strike: float) -> str:
@@ -332,37 +323,46 @@ def run_spx_alert(leaders_score):
     elif spy_df is not None and not spy_df.empty: spot, estimated = float(spy_df["close"].iloc[-1]) * 10.0, True
     else: return
 
-    # حساب التنبؤ السعري المتوقع خلال 10 دقائق القادمة بناءً على الاتجاه والتقلبات اللحظية
     volatility_factor = gspc["close"].pct_change().std() * spot if not gspc.empty else spot * 0.001
-    expected_change = total * volatility_factor * 1.5
+    expected_change = total * volatility_factor * 1.8
     target_price_10m = spot + expected_change
 
-    c = get_spxw_contract(spot, direction)
+    c = get_deep_otm_spxw_contract(spot, direction)
     up = direction == "CALL"
     
     lines = [
-        "📊 <b>SPXW — إشارة صيد لحظية (Lotto) السريعة ⚡</b>\n",
-        f"▫️ <b>الاتجاه:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
+        "🎯 <b>SPXW — صيد العقود البعيدة الفاخرة (Deep OTM Lotto) 🚀</b>\n",
+        f"▫️ <b>الاتجاه المؤكد:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
         f"▫️ <b>سعر المؤشر الحالي:</b> ${spot:,.2f}{' (تقديري)' if estimated else ''}",
-        f"⏱️ <b>التنبؤ خلال 10 دقائق القادمة:</b> متوقع أن يصل إلى <b>${target_price_10m:,.2f}</b> ({'صعود 📈' if expected_change > 0 else 'هبوط 📉'})",
-        f"💡 <b>التوجيه:</b> يُنصح بالمبادرة بالسريعة واقتناص العقد بناءً على الزخم الحالي.",
+        f"⏱️ <b>التنبؤ المتقدم (خلال 10 دقائق):</b> مستهدف الوصول إلى <b>${target_price_10m:,.2f}</b> ({'صعود قوي 📈' if expected_change > 0 else 'هبوط حاد 📉'})",
+        f"💎 <b>الهدف الاستراتيجي:</b> استهداف عقد Strike بعيد لتحقيق مكاسب مضاعفة باحترافية عالية ونسبة خطأ محكومة.",
     ]
-    if c: lines += [f"▫️ <b>رقم العقد:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>", f"▫️ <b>Strike:</b> ${c['strike']:,.0f} | <b>الدخول:</b> ${c['ask']:.2f}"]
+    if c: lines += [f"▫️ <b>رقم العقد البعيد:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>", f"▫️ <b>Strike البعيد:</b> ${c['strike']:,.0f} | <b>سعر الدخول (Ask):</b> ${c['ask']:.2f}"]
     
     if tg_send("\n".join(lines) + FOOTER): mark_alert("spxw", direction)
 
-def find_stock_contract(ticker: str, price: float, opt_type: str):
+def find_deep_otm_stock_contract(ticker: str, price: float, opt_type: str):
     try:
         und = OPTION_UNDERLYING.get(ticker, ticker)
         today = now_et().date()
-        contracts = alpaca_get("/v2/options/contracts", {"underlying_symbols": und, "status": "active", "type": opt_type, "expiration_date_gte": today.isoformat(), "expiration_date_lte": (today + timedelta(days=MAX_DTE)).isoformat(), "strike_price_gte": round(price * 0.97, 2), "strike_price_lte": round(price * 1.03, 2), "limit": 200}).get("option_contracts", [])
-        by_exp = {}
-        for c in contracts: by_exp.setdefault(c["expiration_date"], []).append(c)
-        for exp in sorted(by_exp)[:2]:
-            cs = sorted(by_exp[exp], key=lambda c: abs(float(c["strike_price"]) - price))[:3]
-            quotes = get_option_quotes([c["symbol"] for c in cs])
-            for c in cs:
-                if (q := quotes.get(c["symbol"])): return {"symbol": c["symbol"], "expiry": exp, "strike": float(c["strike_price"]), "ask": q["ask"]}
+        s_min = round(price * 1.01, 2) if opt_type == "call" else round(price * 0.96, 2)
+        s_max = round(price * 1.03, 2) if opt_type == "call" else round(price * 0.99, 2)
+        
+        contracts = alpaca_get("/v2/options/contracts", {
+            "underlying_symbols": und, "status": "active", "type": opt_type, 
+            "expiration_date_gte": today.isoformat(), "expiration_date_lte": (today + timedelta(days=MAX_DTE)).isoformat(), 
+            "strike_price_gte": min(s_min, s_max), "strike_price_lte": max(s_min, s_max), "limit": 100
+        }).get("option_contracts", [])
+        
+        if not contracts: return None
+        quotes = get_option_quotes([c["symbol"] for c in contracts])
+        valid_cands = []
+        for c in contracts:
+            if (q := quotes.get(c["symbol"])):
+                valid_cands.append({"symbol": c["symbol"], "expiry": c["expiration_date"], "strike": float(c["strike_price"]), "ask": q["ask"]})
+        
+        if valid_cands:
+            return sorted(valid_cands, key=lambda x: abs(x['strike'] - (price * 1.015 if opt_type == 'call' else price * 0.985)))[0]
     except Exception as e:
         log.error(f"Find stock contract error for {ticker}: {e}")
     return None  
@@ -376,15 +376,27 @@ def run_stock_alerts(bars: dict, scores: dict):
         if not should_alert(f"stk:{t}", direction, STOCK_COOLDOWN_MIN): continue
         try:
             price = float(bars[t]["close"].iloc[-1])
-            if (c := find_stock_contract(t, price, "call" if s > 0 else "put")):
-                blocks.append({"t": t, "dir": direction, "text": f"⚡ <b>{esc(t)}</b> — {'صعود 🚀' if s > 0 else 'نزول 📉'}\n▫️ العقد: <code>{esc(option_label(OPTION_UNDERLYING.get(t, t), c['expiry'], 'call' if s > 0 else 'put', c['strike']))}</code>\n▫️ الدخول: ${c['ask']:.2f}"})
+            opt_type = "call" if s > 0 else "put"
+            if (c := find_deep_otm_stock_contract(t, price, opt_type)):
+                stock_vol = bars[t]["close"].pct_change().std() * price if len(bars[t]) > 5 else price * 0.005
+                exp_change = s * stock_vol * 1.5
+                target_price = price + exp_change
+                
+                blocks.append({
+                    "t": t, "dir": direction, 
+                    "text": (f"🎯 <b>{esc(t)}</b> — {'صعود صاروخي 🚀' if s > 0 else 'نزول عميق 📉'}\n"
+                             f"▫️ <b>سعر السهم الحالي:</b> ${price:,.2f}\n"
+                             f"⏱️ <b>المستهدف (خلال 10د):</b> ${target_price:,.2f}\n"
+                             f"▫️ <b>عقد بعيد (OTM):</b> <code>{esc(option_label(OPTION_UNDERLYING.get(t, t), c['expiry'], opt_type, c['strike']))}</code>\n"
+                             f"▫️ <b>Strike:</b> ${c['strike']:,.2f} | <b>الدخول:</b> ${c['ask']:.2f}")
+                })
         except Exception as e:
             log.error(f"Stock alert loop error for {t}: {e}")
             continue
 
     for i in range(0, len(blocks), 2):
         pair = blocks[i:i + 2]
-        if tg_send("🔔 <b>عقود سريعة للشركات الكبرى</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER):
+        if tg_send("🔔 <b>عقود الأسهم الكبرى البعيدة (High Leverage)</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER):
             for b in pair: mark_alert(f"stk:{b['t']}", b["dir"])
 
 # ---------------- PRE-MARKET REPORT ----------------
@@ -427,15 +439,15 @@ def build_premarket_message(day_str: str):
                     m3_low, m3_high = sorted([stock_low, stock_high])
 
                 mega_text += f"🔹 <b>سهم {ticker}</b> (الافتتاح المتوقع: ${expected_open:.2f})\n"
-                mega_text += f"   ⏱️ من الساعة 9:30 إلى 11:30 صباحاً: راح يكون بين ${m1_low:.2f} و ${m1_high:.2f}\n"
-                mega_text += f"   ⏱️ من الساعة 11:30 إلى 14:00 ظهراً: راح يكون بين ${m2_low:.2f} و ${m2_high:.2f}\n"
-                mega_text += f"   ⏱️ من الساعة 14:00 إلى 16:00 مساءً: راح يكون بين ${m3_low:.2f} و ${m3_high:.2f}\n\n"
+                mega_text += f"   ⏱️ من الساعة 9:30 إلى 11:30 صباحاً: بين ${m1_low:.2f} و ${m1_high:.2f}\n"
+                mega_text += f"   ⏱️ من الساعة 11:30 إلى 14:00 ظهراً: بين ${m2_low:.2f} و ${m2_high:.2f}\n"
+                mega_text += f"   ⏱️ من الساعة 14:00 إلى 16:00 مساءً: بين ${m3_low:.2f} و ${m3_high:.2f}\n\n"
             except Exception as e:
                 log.error(f"Error building mega cap {ticker}: {e}")
                 continue
                 
         msg_body = (
-            f"🌅 <b>التقرير المؤسساتي لـ SPXW قبل الافتتاح</b>\n"
+            f"🌅 <b>التقرير المؤسساتي للعقود البعيدة قبل الافتتاح</b>\n"
             f"📅 {day_str}\n\n"
         )
         return msg_body + mega_text + FOOTER
@@ -472,7 +484,7 @@ def cycle():
 def main():
     init_db()
     log.info("Starting %s %s", APP_NAME, VERSION)
-    tg_send(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)}) بتحديث التنبؤ اللحظي (10 دقائق) ⏱️")
+    tg_send(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)}) بنظام استهداف العقود البعيدة والتنبؤ المتقدم 🎯")
     while True:
         try: cycle()
         except Exception: log.exception("Main loop critical crash")
