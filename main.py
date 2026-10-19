@@ -14,8 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 
-APP_NAME = "صَفاء التحليل (النسخة 36 - العقود البعيدة والتنبؤ المتقدم)"
-VERSION = "v36"
+APP_NAME = "صَفاء التحليل (النسخة 37 - الدقة الفائقة والعقود الذكية)"
+VERSION = "v37"
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -31,15 +31,15 @@ STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip().lower()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v36.db")
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v37.db")
 
 POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "15")))
 
 MAX_STOCK_ALERTS_PER_CYCLE = int(os.getenv("MAX_STOCK_ALERTS_PER_CYCLE", "6"))
 STOCK_MIN_SCORE = float(os.getenv("STOCK_MIN_SCORE", "0.75"))     
 SPX_MIN_SCORE = float(os.getenv("SPX_MIN_SCORE", "0.30"))         
-STOCK_COOLDOWN_MIN = int(os.getenv("STOCK_COOLDOWN_MIN", "30")) 
-SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "10"))     
+STOCK_COOLDOWN_MIN = int(os.getenv("STOCK_COOLDOWN_MIN", "20")) 
+SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "8"))     
 FLIP_MIN_MINUTES = int(os.getenv("FLIP_MIN_MINUTES", "5"))       
 MAX_DTE = int(os.getenv("MAX_DTE", "5"))                         
 HORIZON = 2                                                        
@@ -62,7 +62,7 @@ http.headers.update({"APCA-API-KEY-ID": ALPACA_KEY,
                      "APCA-API-SECRET-KEY": ALPACA_SECRET,
                      "accept": "application/json"})
 
-FOOTER = "\n\n⚠️ تنبيه تحليلي (النسخة 36 - العقود البعيدة الاحترافية)"
+FOOTER = "\n\n⚠️ تنبيه تحليلي (النسخة 37 - دقة عالية)"
 
 # ---------------- HELPERS ----------------
 def now_et() -> datetime: return datetime.now(ET)
@@ -142,9 +142,9 @@ def get_option_quotes(symbols) -> dict:
         payload = alpaca_get("/v1beta1/options/quotes/latest", {"symbols": ",".join(symbols), "feed": OPTIONS_FEED})
         for sym, q in (payload.get("quotes") or {}).items():
             bid, ask = float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
-            if bid > 0 and ask >= bid and ask >= 0.03:
+            if bid > 0 and ask >= bid and ask >= 0.05:
                 mid = (bid + ask) / 2
-                if (ask - bid) / mid <= 0.60: out[sym] = {"bid": bid, "ask": ask, "mid": mid}
+                if (ask - bid) / mid <= 0.50: out[sym] = {"bid": bid, "ask": ask, "mid": mid}
     except Exception as e:
         log.error(f"Error getting option quotes: {e}")
     return out
@@ -276,7 +276,10 @@ def combine_signal(leaders, model, index, vix):
     if len(avail) < 2 or ("leaders" not in avail and "index" not in avail): return None
     return float(sum(v * w for v, w in avail.values()) / sum(w for _, w in avail.values()))
 
-def get_deep_otm_spxw_contract(spot: float, direction: str):
+def get_smart_spxw_contract(spot: float, direction: str):
+    """
+    اختيار عقود SPXW ذكية وواقعية (قريبة من السعر الحالي بمسافة آمنة ومدروسة لتحقيق العائد دون مخاطر مبالغ فيها)
+    """
     try:
         t = yf.Ticker("^SPX")
         exps = [e for e in (t.options or []) if e >= now_et().date().isoformat()]
@@ -290,18 +293,19 @@ def get_deep_otm_spxw_contract(spot: float, direction: str):
             if not w.empty: df = w
         if df.empty: return None
         
+        # اختيار Strike قريب جداً ومنطقي (Near-The-Money / Smart OTM بمسافة صغيرة آمنة)
         if direction == "CALL":
-            df = df[df["strike"] > spot * 1.005]
+            df = df[df["strike"] >= spot]  # يبدأ من السعر الحالي فصاعداً
             if df.empty: return None
-            row = df.sort_values("strike", ascending=True).iloc[0]
+            row = df.sort_values("strike", ascending=True).iloc[0] # أقرب ستريك (أعلى السعر مباشرة) لضمان الدقة والسيولة
         else:
-            df = df[df["strike"] < spot * 0.995]
+            df = df[df["strike"] <= spot]  # يبدأ من السعر الحالي نازلاً
             if df.empty: return None
-            row = df.sort_values("strike", ascending=False).iloc[0]
+            row = df.sort_values("strike", ascending=False).iloc[0] # أقرب ستريك هبوطي
 
         return {"expiry": exp, "strike": float(row["strike"]), "bid": float(row["bid"]), "ask": float(row["ask"])}
     except Exception as e:
-        log.error(f"Deep OTM SPXW contract error: {e}")
+        log.error(f"Smart SPXW contract error: {e}")
         return None
 
 def option_label(underlying: str, exp: str, opt_type: str, strike: float) -> str:
@@ -324,34 +328,35 @@ def run_spx_alert(leaders_score):
     else: return
 
     volatility_factor = gspc["close"].pct_change().std() * spot if not gspc.empty else spot * 0.001
-    expected_change = total * volatility_factor * 1.8
+    expected_change = total * volatility_factor * 1.5
     target_price_10m = spot + expected_change
 
-    c = get_deep_otm_spxw_contract(spot, direction)
+    c = get_smart_spxw_contract(spot, direction)
     up = direction == "CALL"
     
     lines = [
-        "🎯 <b>SPXW — صيد العقود البعيدة الفاخرة (Deep OTM Lotto) 🚀</b>\n",
+        "📊 <b>SPXW — إشارة صيد ذكية عالية الدقة ⚡</b>\n",
         f"▫️ <b>الاتجاه المؤكد:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
         f"▫️ <b>سعر المؤشر الحالي:</b> ${spot:,.2f}{' (تقديري)' if estimated else ''}",
         f"⏱️ <b>التنبؤ المتقدم (خلال 10 دقائق):</b> مستهدف الوصول إلى <b>${target_price_10m:,.2f}</b> ({'صعود قوي 📈' if expected_change > 0 else 'هبوط حاد 📉'})",
-        f"💎 <b>الهدف الاستراتيجي:</b> استهداف عقد Strike بعيد لتحقيق مكاسب مضاعفة باحترافية عالية ونسبة خطأ محكومة.",
+        f"💎 <b>الهدف الاستراتيجي:</b> استهداف عقد دقيق وقريب لضمان نسبة نجاح عالية ومكاسب ممتازة.",
     ]
-    if c: lines += [f"▫️ <b>رقم العقد البعيد:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>", f"▫️ <b>Strike البعيد:</b> ${c['strike']:,.0f} | <b>سعر الدخول (Ask):</b> ${c['ask']:.2f}"]
+    if c: lines += [f"▫️ <b>رقم العقد الذكي:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>", f"▫️ <b>Strike المختار:</b> ${c['strike']:,.0f} | <b>سعر الدخول (Ask):</b> ${c['ask']:.2f}"]
     
     if tg_send("\n".join(lines) + FOOTER): mark_alert("spxw", direction)
 
-def find_deep_otm_stock_contract(ticker: str, price: float, opt_type: str):
+def find_smart_stock_contract(ticker: str, price: float, opt_type: str):
     try:
         und = OPTION_UNDERLYING.get(ticker, ticker)
         today = now_et().date()
-        s_min = round(price * 1.01, 2) if opt_type == "call" else round(price * 0.96, 2)
-        s_max = round(price * 1.03, 2) if opt_type == "call" else round(price * 0.99, 2)
+        # نطاق ذكي وقريب جداً من سعر السهم الحالي (منعاً للبعد المبالغ فيه الذي يسبب الخسارة)
+        s_min = round(price * 0.99, 2) if opt_type == "put" else price
+        s_max = round(price * 1.01, 2) if opt_type == "call" else price
         
         contracts = alpaca_get("/v2/options/contracts", {
             "underlying_symbols": und, "status": "active", "type": opt_type, 
             "expiration_date_gte": today.isoformat(), "expiration_date_lte": (today + timedelta(days=MAX_DTE)).isoformat(), 
-            "strike_price_gte": min(s_min, s_max), "strike_price_lte": max(s_min, s_max), "limit": 100
+            "strike_price_gte": min(s_min, s_max) * 0.99, "strike_price_lte": max(s_min, s_max) * 1.01, "limit": 100
         }).get("option_contracts", [])
         
         if not contracts: return None
@@ -362,9 +367,10 @@ def find_deep_otm_stock_contract(ticker: str, price: float, opt_type: str):
                 valid_cands.append({"symbol": c["symbol"], "expiry": c["expiration_date"], "strike": float(c["strike_price"]), "ask": q["ask"]})
         
         if valid_cands:
-            return sorted(valid_cands, key=lambda x: abs(x['strike'] - (price * 1.015 if opt_type == 'call' else price * 0.985)))[0]
+            # اختيار العقد الأقرب للسعر الحالي (ATM / Near-ATM) لضمان تفاعل حقيقي وسريع مع حركة السهم
+            return sorted(valid_cands, key=lambda x: abs(x['strike'] - price))[0]
     except Exception as e:
-        log.error(f"Find stock contract error for {ticker}: {e}")
+        log.error(f"Find smart stock contract error for {ticker}: {e}")
     return None  
 
 def run_stock_alerts(bars: dict, scores: dict):
@@ -377,17 +383,17 @@ def run_stock_alerts(bars: dict, scores: dict):
         try:
             price = float(bars[t]["close"].iloc[-1])
             opt_type = "call" if s > 0 else "put"
-            if (c := find_deep_otm_stock_contract(t, price, opt_type)):
+            if (c := find_smart_stock_contract(t, price, opt_type)):
                 stock_vol = bars[t]["close"].pct_change().std() * price if len(bars[t]) > 5 else price * 0.005
                 exp_change = s * stock_vol * 1.5
                 target_price = price + exp_change
                 
                 blocks.append({
                     "t": t, "dir": direction, 
-                    "text": (f"🎯 <b>{esc(t)}</b> — {'صعود صاروخي 🚀' if s > 0 else 'نزول عميق 📉'}\n"
+                    "text": (f"🎯 <b>{esc(t)}</b> — {'صعود قوي 🚀' if s > 0 else 'هبوط قوي 📉'}\n"
                              f"▫️ <b>سعر السهم الحالي:</b> ${price:,.2f}\n"
                              f"⏱️ <b>المستهدف (خلال 10د):</b> ${target_price:,.2f}\n"
-                             f"▫️ <b>عقد بعيد (OTM):</b> <code>{esc(option_label(OPTION_UNDERLYING.get(t, t), c['expiry'], opt_type, c['strike']))}</code>\n"
+                             f"▫️ <b>عقد ذكي (Smart OTM):</b> <code>{esc(option_label(OPTION_UNDERLYING.get(t, t), c['expiry'], opt_type, c['strike']))}</code>\n"
                              f"▫️ <b>Strike:</b> ${c['strike']:,.2f} | <b>الدخول:</b> ${c['ask']:.2f}")
                 })
         except Exception as e:
@@ -396,7 +402,7 @@ def run_stock_alerts(bars: dict, scores: dict):
 
     for i in range(0, len(blocks), 2):
         pair = blocks[i:i + 2]
-        if tg_send("🔔 <b>عقود الأسهم الكبرى البعيدة (High Leverage)</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER):
+        if tg_send("🔔 <b>عقود الأسهم الكبرى الذكية (عالية الدقة)</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER):
             for b in pair: mark_alert(f"stk:{b['t']}", b["dir"])
 
 # ---------------- PRE-MARKET REPORT ----------------
@@ -447,7 +453,7 @@ def build_premarket_message(day_str: str):
                 continue
                 
         msg_body = (
-            f"🌅 <b>التقرير المؤسساتي للعقود البعيدة قبل الافتتاح</b>\n"
+            f"🌅 <b>التقرير المؤسساتي للاتجاة الدقيق قبل الافتتاح</b>\n"
             f"📅 {day_str}\n\n"
         )
         return msg_body + mega_text + FOOTER
@@ -484,7 +490,7 @@ def cycle():
 def main():
     init_db()
     log.info("Starting %s %s", APP_NAME, VERSION)
-    tg_send(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)}) بنظام استهداف العقود البعيدة والتنبؤ المتقدم 🎯")
+    tg_send(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)}) بنظام الستريكات الذكية عالية الدقة 🎯")
     while True:
         try: cycle()
         except Exception: log.exception("Main loop critical crash")
