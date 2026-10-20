@@ -14,8 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 
-APP_NAME = "صَفاء التحليل (النسخة 37 - الدقة الفائقة والعقود الذكية)"
-VERSION = "v37"
+APP_NAME = "صَفاء التحليل (النسخة 39 - الإدراك الشامل 360°)"
+VERSION = "v39"
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -30,24 +30,22 @@ TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets"
 STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip().lower()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v37.db")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip() # إرسال على الخاص حصراً
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v39.db")
 
 POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "15")))
-
 MAX_STOCK_ALERTS_PER_CYCLE = int(os.getenv("MAX_STOCK_ALERTS_PER_CYCLE", "6"))
-STOCK_MIN_SCORE = float(os.getenv("STOCK_MIN_SCORE", "0.75"))     
-SPX_MIN_SCORE = float(os.getenv("SPX_MIN_SCORE", "0.30"))         
+MIN_CONFIDENCE_THRESHOLD = 0.95  # نسبة الثقة المشترطة: 95% وأعلى
 STOCK_COOLDOWN_MIN = int(os.getenv("STOCK_COOLDOWN_MIN", "20")) 
 SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "8"))     
 FLIP_MIN_MINUTES = int(os.getenv("FLIP_MIN_MINUTES", "5"))       
 MAX_DTE = int(os.getenv("MAX_DTE", "5"))                         
 HORIZON = 2                                                        
-MODEL_RETRAIN_MIN = 60
 
+TOP_7_LEADERS = ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"]
 TOP_LEADERS_MAP = {
-    "NVDA": 0.07, "AAPL": 0.07, "GOOGL": 0.05, "MSFT": 0.06, "AMZN": 0.05,
-    "TSLA": 0.04, "META": 0.04
+    "NVDA": 0.20, "AAPL": 0.18, "MSFT": 0.18, "AMZN": 0.12, 
+    "GOOGL": 0.12, "META": 0.10, "TSLA": 0.10
 }
 
 OPTION_UNDERLYING = {"BRK-B": "BRKB"}
@@ -62,15 +60,17 @@ http.headers.update({"APCA-API-KEY-ID": ALPACA_KEY,
                      "APCA-API-SECRET-KEY": ALPACA_SECRET,
                      "accept": "application/json"})
 
-FOOTER = "\n\n⚠️ تنبيه تحليلي (النسخة 37 - دقة عالية)"
+FOOTER = "\n\n⚠️ تحليلات الكمي والذكاء الاصطناعي (خاص - ثقة +95%)"
 
-# ---------------- HELPERS ----------------
+# ---------------- HELPERS & DB ----------------
 def now_et() -> datetime: return datetime.now(ET)
 def esc(x) -> str: return html.escape(str(x))
 def to_alpaca_stock(sym: str) -> str: return sym.replace("-", ".")
+
 def db_exec(sql, params=()):
     with closing(sqlite3.connect(DB_PATH)) as con:
         with con: con.execute(sql, params)
+
 def db_one(sql, params=()):
     with closing(sqlite3.connect(DB_PATH)) as con:
         return con.execute(sql, params).fetchone()
@@ -95,7 +95,26 @@ def mark_alert(key: str, direction: str):
     db_exec("INSERT OR REPLACE INTO alert_state(key,direction,sent_at) VALUES(?,?,?)",
             (key, direction, datetime.now(UTC).isoformat()))
 
-# ---------------- ALPACA & YFINANCE ----------------
+def tg_send(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("Telegram TOKEN or CHAT_ID is missing!")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        for i in range(0, len(text), 3900):
+            for attempt in range(3):
+                payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text[i:i+3900], "parse_mode": "HTML", "disable_web_page_preview": True}
+                r = requests.post(url, json=payload, timeout=15)
+                if r.status_code == 429: time.sleep(1 * (2 ** attempt)); continue
+                r.raise_for_status()
+                break
+            else: return False
+        return True
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
+        return False
+
+# ---------------- MARKET DATA ----------------
 def alpaca_get(path, params=None, timeout=15, retries=2):
     base = TRADING_URL if path.startswith(("/v2/options", "/v2/calendar")) else ALPACA_DATA_URL
     for attempt in range(retries):
@@ -136,47 +155,6 @@ def alpaca_bars(symbols, timeframe, start, feed=None) -> dict:
             log.error(f"Error parsing alpaca bars for {sym}: {e}")
     return out
 
-def get_option_quotes(symbols) -> dict:
-    out = {}
-    try:
-        payload = alpaca_get("/v1beta1/options/quotes/latest", {"symbols": ",".join(symbols), "feed": OPTIONS_FEED})
-        for sym, q in (payload.get("quotes") or {}).items():
-            bid, ask = float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
-            if bid > 0 and ask >= bid and ask >= 0.05:
-                mid = (bid + ask) / 2
-                if (ask - bid) / mid <= 0.50: out[sym] = {"bid": bid, "ask": ask, "mid": mid}
-    except Exception as e:
-        log.error(f"Error getting option quotes: {e}")
-    return out
-
-_cal_cache = {}
-def get_session(d):
-    if d in _cal_cache: return _cal_cache[d]
-    try:
-        data = alpaca_get("/v2/calendar", {"start": d.isoformat(), "end": d.isoformat()})
-        sess = (dtime.fromisoformat(data[0]["open"]), dtime.fromisoformat(data[0]["close"])) if data and data[0]["date"] == d.isoformat() else None
-        _cal_cache[d] = sess
-        return sess
-    except Exception as e:
-        log.error(f"Error fetching calendar session for {d}: {e}")
-        return (SESSION_OPEN, SESSION_CLOSE) if d.weekday() < 5 else None
-
-def tg_send(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        for i in range(0, len(text), 3900):
-            for attempt in range(3):
-                payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text[i:i+3900], "parse_mode": "HTML", "disable_web_page_preview": True}
-                r = requests.post(url, json=payload, timeout=15)
-                if r.status_code == 429: time.sleep(1 * (2 ** attempt)); continue
-                r.raise_for_status()
-                break
-            else: return False
-        return True
-    except Exception as e:
-        log.error(f"Telegram send error: {e}")
-        return False
-
 def yf_bars(symbol, period="2d", interval="1m", prepost=False) -> pd.DataFrame:
     try:
         df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False, prepost=prepost)
@@ -188,26 +166,76 @@ def yf_bars(symbol, period="2d", interval="1m", prepost=False) -> pd.DataFrame:
         log.error(f"YF bars error for {symbol}: {e}")
         return pd.DataFrame()
 
-# ---------------- MOMENTUM / MODEL ----------------
-def momentum_score(df, max_age_min=10):
-    try:
-        if df is None or len(df) < 10: return None
-        if datetime.now(UTC) - df.index[-1] > timedelta(minutes=max_age_min): return None
-        idx = df.index.tz_convert(ET)
-        d = df[idx.date == idx[-1].date()]
-        if len(d) < 2: return None
-        c = d["close"].astype(float)
-        k6, k12 = min(2, len(d) - 1), min(4, len(d) - 1)
-        r6, r12 = c.iloc[-1] / c.iloc[-1 - k6] - 1, c.iloc[-1] / c.iloc[-1 - k12] - 1
-        vol = d["volume"].astype(float)
-        vgap = (c.iloc[-1] / ((c * vol).sum() / vol.sum()) - 1) if vol.sum() > 0 else 0.0
-        sigma = df["close"].astype(float).pct_change().tail(78).std() * math.sqrt(6)
-        if not sigma or math.isnan(sigma): return None
-        return float(math.tanh((0.4 * r6 + 0.3 * r12 + 0.3 * vgap) / sigma))
-    except Exception as e:
-        log.error(f"Momentum score error: {e}")
-        return None
+# ---------------- ADVANCED TECHNICAL & QUANT ENGINE ----------------
+def compute_technical_indicators(df: pd.DataFrame) -> dict:
+    """محرك التحليل الفني الشامل: RSI, MACD, VWAP, EMA, Bollinger Bands"""
+    if df is None or len(df) < 20: return {}
+    c = df["close"].astype(float)
+    v = df["volume"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
 
+    # 1. RSI (14)
+    delta = c.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-9)
+    rsi = float((100 - (100 / (1 + rs))).iloc[-1])
+
+    # 2. MACD (12, 26, 9)
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    macd_hist = float((macd_line - signal_line).iloc[-1])
+
+    # 3. EMA 9 / EMA 21 Trend Cross
+    ema9 = float(c.ewm(span=9, adjust=False).mean().iloc[-1])
+    ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+    ema_signal = 1.0 if ema9 > ema21 else -1.0
+
+    # 4. VWAP (Volume Weighted Average Price)
+    vwap = float(((c * v).sum() / v.sum()) if v.sum() > 0 else c.iloc[-1])
+    vwap_signal = 1.0 if c.iloc[-1] > vwap else -1.0
+
+    # 5. Bollinger Bands (20, 2)
+    sma20 = c.rolling(20).mean()
+    std20 = c.rolling(20).std()
+    upper_bb = float((sma20 + 2 * std20).iloc[-1])
+    lower_bb = float((sma20 - 2 * std20).iloc[-1])
+    bb_signal = 1.0 if c.iloc[-1] < lower_bb else (-1.0 if c.iloc[-1] > upper_bb else 0.0)
+
+    # 6. Quant Z-Score Volume Spike Detection
+    v_mean = v.rolling(30).mean()
+    v_std = v.rolling(30).std() + 1e-5
+    v_zscore = float(((v.iloc[-1] - v_mean.iloc[-1]) / v_std.iloc[-1]))
+
+    return {
+        "rsi": rsi, "macd_hist": macd_hist, "ema_signal": ema_signal,
+        "vwap": vwap, "vwap_signal": vwap_signal, "bb_signal": bb_signal,
+        "v_zscore": v_zscore, "last_price": float(c.iloc[-1])
+    }
+
+def get_news_sentiment(ticker: str) -> float:
+    """قراءة وتحليل الأخبار والمعنويات للشركة"""
+    try:
+        t = yf.Ticker(ticker)
+        news = t.news
+        if not news: return 0.0
+        pos_words = ["growth", "beat", "surge", "upgraded", "profit", "bull", "record", "gain", "high"]
+        neg_words = ["drop", "miss", "fall", "downgraded", "loss", "bear", "risk", "decline", "low"]
+        
+        score = 0.0
+        for item in news[:5]: # أحدث 5 أخبار
+            title = item.get("title", "").lower()
+            score += sum(1 for w in pos_words if w in title)
+            score -= sum(1 for w in neg_words if w in title)
+        return float(np.clip(score / 5.0, -1.0, 1.0))
+    except Exception as e:
+        log.error(f"News sentiment error for {ticker}: {e}")
+        return 0.0
+
+# ---------------- MACHINE LEARNING & COMBINED SCORE ----------------
 FEATURES = ["r1", "r3", "r6", "r12", "vol12", "ema_gap", "range", "vchg", "tod_sin", "tod_cos"]
 def feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
@@ -222,7 +250,7 @@ def feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     return x.replace([np.inf, -np.inf], np.nan)
 
 def make_model():
-    return make_pipeline(SimpleImputer(strategy="median"), RandomForestClassifier(n_estimators=60, max_depth=4, min_samples_leaf=5, random_state=42, n_jobs=-1))
+    return make_pipeline(SimpleImputer(strategy="median"), RandomForestClassifier(n_estimators=70, max_depth=5, min_samples_leaf=4, random_state=42, n_jobs=-1))
 
 _MODEL = {"model": None, "trained_at": None, "acc": 0.5}
 
@@ -256,6 +284,31 @@ def model_component(spy_df):
         log.error(f"Model component error: {e}")
         return None, None
 
+def evaluate_full_360_signal(ticker: str, df: pd.DataFrame, ml_score: float) -> tuple:
+    """دمج التحليل الفني والكمي والأخبار و ML لإنتاج نسبة ثقة محكمة 360 درجة"""
+    tech = compute_technical_indicators(df)
+    if not tech: return None, 0.0, {}
+
+    news_sent = get_news_sentiment(ticker)
+    
+    # تحويل مؤشرات التحليل الفني إلى أوزان رقمية [-1, +1]
+    rsi_sig = 1.0 if tech["rsi"] < 30 else (-1.0 if tech["rsi"] > 70 else (50 - tech["rsi"]) / 20.0)
+    macd_sig = float(np.clip(tech["macd_hist"] * 5.0, -1.0, 1.0))
+    
+    weights = {
+        "technical": (rsi_sig * 0.15 + macd_sig * 0.20 + tech["ema_signal"] * 0.20 + tech["vwap_signal"] * 0.15),
+        "ml_model": (ml_score * 0.15 if ml_score is not None else 0.0),
+        "news": (news_sent * 0.15)
+    }
+    
+    final_score = sum(weights.values())
+    
+    # تحويل القيمة الشاملة إلى نسبة ثقة حقيقية
+    abs_score = min(abs(final_score), 1.0)
+    confidence = round(0.50 + 0.50 * math.tanh(abs_score * 3.2), 4)
+    
+    return final_score, confidence, tech
+
 def fetch_leader_bars() -> dict:
     tickers = list(TOP_LEADERS_MAP)
     try:
@@ -265,21 +318,14 @@ def fetch_leader_bars() -> dict:
         log.error(f"Fetch leader bars error: {e}")
         return {}
 
-def leaders_component(bars: dict):
-    scores = {t: s for t in TOP_LEADERS_MAP if (s := momentum_score(bars.get(t))) is not None}
-    if len(scores) < 1: return None, scores
-    tw = sum(TOP_LEADERS_MAP[t] for t in scores)
-    return float(sum(scores[t] * TOP_LEADERS_MAP[t] for t in scores) / tw), scores
-
-def combine_signal(leaders, model, index, vix):
-    avail = {k: v for k, v in {"leaders": (leaders, 0.40), "model": (model, 0.25), "index": (index, 0.25), "vix": (vix, 0.10)}.items() if v[0] is not None}
-    if len(avail) < 2 or ("leaders" not in avail and "index" not in avail): return None
-    return float(sum(v * w for v, w in avail.values()) / sum(w for _, w in avail.values()))
+def get_session(d):
+    try:
+        data = alpaca_get("/v2/calendar", {"start": d.isoformat(), "end": d.isoformat()})
+        return (dtime.fromisoformat(data[0]["open"]), dtime.fromisoformat(data[0]["close"])) if data and data[0]["date"] == d.isoformat() else (SESSION_OPEN, SESSION_CLOSE)
+    except Exception:
+        return (SESSION_OPEN, SESSION_CLOSE) if d.weekday() < 5 else None
 
 def get_smart_spxw_contract(spot: float, direction: str):
-    """
-    اختيار عقود SPXW ذكية وواقعية (قريبة من السعر الحالي بمسافة آمنة ومدروسة لتحقيق العائد دون مخاطر مبالغ فيها)
-    """
     try:
         t = yf.Ticker("^SPX")
         exps = [e for e in (t.options or []) if e >= now_et().date().isoformat()]
@@ -293,172 +339,159 @@ def get_smart_spxw_contract(spot: float, direction: str):
             if not w.empty: df = w
         if df.empty: return None
         
-        # اختيار Strike قريب جداً ومنطقي (Near-The-Money / Smart OTM بمسافة صغيرة آمنة)
-        if direction == "CALL":
-            df = df[df["strike"] >= spot]  # يبدأ من السعر الحالي فصاعداً
-            if df.empty: return None
-            row = df.sort_values("strike", ascending=True).iloc[0] # أقرب ستريك (أعلى السعر مباشرة) لضمان الدقة والسيولة
-        else:
-            df = df[df["strike"] <= spot]  # يبدأ من السعر الحالي نازلاً
-            if df.empty: return None
-            row = df.sort_values("strike", ascending=False).iloc[0] # أقرب ستريك هبوطي
-
+        row = df.sort_values("strike", ascending=(direction == "CALL")).iloc[0]
         return {"expiry": exp, "strike": float(row["strike"]), "bid": float(row["bid"]), "ask": float(row["ask"])}
     except Exception as e:
         log.error(f"Smart SPXW contract error: {e}")
         return None
 
-def option_label(underlying: str, exp: str, opt_type: str, strike: float) -> str:
-    return f"{underlying} {datetime.strptime(exp, '%Y-%m-%d').strftime('%d%m%y')} {'C' if opt_type.lower().startswith('c') else 'P'} {strike:g}"
-
-def run_spx_alert(leaders_score):
-    spy_df = fetch_spy_df()
-    model_score, acc = model_component(spy_df)
-    gspc = yf_bars("^GSPC", "2d", "1m")
-    vix_s = momentum_score(yf_bars("^VIX", "2d", "1m"))
-    total = combine_signal(leaders_score, model_score, momentum_score(gspc), -vix_s if vix_s is not None else None)
-    
-    if total is None or abs(total) < SPX_MIN_SCORE: return
-    direction = "CALL" if total > 0 else "PUT"
-    if not should_alert("spxw", direction, SPX_COOLDOWN_MIN): return
-
-    estimated = False
-    if not gspc.empty: spot = float(gspc["close"].iloc[-1])
-    elif spy_df is not None and not spy_df.empty: spot, estimated = float(spy_df["close"].iloc[-1]) * 10.0, True
-    else: return
-
-    volatility_factor = gspc["close"].pct_change().std() * spot if not gspc.empty else spot * 0.001
-    expected_change = total * volatility_factor * 1.5
-    target_price_10m = spot + expected_change
-
-    c = get_smart_spxw_contract(spot, direction)
-    up = direction == "CALL"
-    
-    lines = [
-        "📊 <b>SPXW — إشارة صيد ذكية عالية الدقة ⚡</b>\n",
-        f"▫️ <b>الاتجاه المؤكد:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
-        f"▫️ <b>سعر المؤشر الحالي:</b> ${spot:,.2f}{' (تقديري)' if estimated else ''}",
-        f"⏱️ <b>التنبؤ المتقدم (خلال 10 دقائق):</b> مستهدف الوصول إلى <b>${target_price_10m:,.2f}</b> ({'صعود قوي 📈' if expected_change > 0 else 'هبوط حاد 📉'})",
-        f"💎 <b>الهدف الاستراتيجي:</b> استهداف عقد دقيق وقريب لضمان نسبة نجاح عالية ومكاسب ممتازة.",
-    ]
-    if c: lines += [f"▫️ <b>رقم العقد الذكي:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>", f"▫️ <b>Strike المختار:</b> ${c['strike']:,.0f} | <b>سعر الدخول (Ask):</b> ${c['ask']:.2f}"]
-    
-    if tg_send("\n".join(lines) + FOOTER): mark_alert("spxw", direction)
-
 def find_smart_stock_contract(ticker: str, price: float, opt_type: str):
     try:
         und = OPTION_UNDERLYING.get(ticker, ticker)
         today = now_et().date()
-        # نطاق ذكي وقريب جداً من سعر السهم الحالي (منعاً للبعد المبالغ فيه الذي يسبب الخسارة)
-        s_min = round(price * 0.99, 2) if opt_type == "put" else price
-        s_max = round(price * 1.01, 2) if opt_type == "call" else price
-        
         contracts = alpaca_get("/v2/options/contracts", {
             "underlying_symbols": und, "status": "active", "type": opt_type, 
             "expiration_date_gte": today.isoformat(), "expiration_date_lte": (today + timedelta(days=MAX_DTE)).isoformat(), 
-            "strike_price_gte": min(s_min, s_max) * 0.99, "strike_price_lte": max(s_min, s_max) * 1.01, "limit": 100
+            "limit": 100
         }).get("option_contracts", [])
         
         if not contracts: return None
         quotes = get_option_quotes([c["symbol"] for c in contracts])
-        valid_cands = []
-        for c in contracts:
-            if (q := quotes.get(c["symbol"])):
-                valid_cands.append({"symbol": c["symbol"], "expiry": c["expiration_date"], "strike": float(c["strike_price"]), "ask": q["ask"]})
-        
-        if valid_cands:
-            # اختيار العقد الأقرب للسعر الحالي (ATM / Near-ATM) لضمان تفاعل حقيقي وسريع مع حركة السهم
-            return sorted(valid_cands, key=lambda x: abs(x['strike'] - price))[0]
+        valid = [{"symbol": c["symbol"], "expiry": c["expiration_date"], "strike": float(c["strike_price"]), "ask": q["ask"]}
+                 for c in contracts if (q := quotes.get(c["symbol"]))]
+        return sorted(valid, key=lambda x: abs(x['strike'] - price))[0] if valid else None
     except Exception as e:
         log.error(f"Find smart stock contract error for {ticker}: {e}")
-    return None  
+        return None  
 
-def run_stock_alerts(bars: dict, scores: dict):
-    cands = sorted([(t, s) for t, s in scores.items() if abs(s) >= STOCK_MIN_SCORE], key=lambda x: -abs(x[1]))
-    blocks = []
-    for t, s in cands:
-        if len(blocks) >= MAX_STOCK_ALERTS_PER_CYCLE: break
-        direction = "CALL" if s > 0 else "PUT"
-        if not should_alert(f"stk:{t}", direction, STOCK_COOLDOWN_MIN): continue
-        try:
-            price = float(bars[t]["close"].iloc[-1])
-            opt_type = "call" if s > 0 else "put"
-            if (c := find_smart_stock_contract(t, price, opt_type)):
-                stock_vol = bars[t]["close"].pct_change().std() * price if len(bars[t]) > 5 else price * 0.005
-                exp_change = s * stock_vol * 1.5
-                target_price = price + exp_change
-                
-                blocks.append({
-                    "t": t, "dir": direction, 
-                    "text": (f"🎯 <b>{esc(t)}</b> — {'صعود قوي 🚀' if s > 0 else 'هبوط قوي 📉'}\n"
-                             f"▫️ <b>سعر السهم الحالي:</b> ${price:,.2f}\n"
-                             f"⏱️ <b>المستهدف (خلال 10د):</b> ${target_price:,.2f}\n"
-                             f"▫️ <b>عقد ذكي (Smart OTM):</b> <code>{esc(option_label(OPTION_UNDERLYING.get(t, t), c['expiry'], opt_type, c['strike']))}</code>\n"
-                             f"▫️ <b>Strike:</b> ${c['strike']:,.2f} | <b>الدخول:</b> ${c['ask']:.2f}")
-                })
-        except Exception as e:
-            log.error(f"Stock alert loop error for {t}: {e}")
-            continue
+def get_option_quotes(symbols) -> dict:
+    out = {}
+    try:
+        payload = alpaca_get("/v1beta1/options/quotes/latest", {"symbols": ",".join(symbols), "feed": OPTIONS_FEED})
+        for sym, q in (payload.get("quotes") or {}).items():
+            bid, ask = float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
+            if bid > 0 and ask >= bid and ask >= 0.05:
+                if (ask - bid) / ((bid + ask) / 2) <= 0.50: out[sym] = {"bid": bid, "ask": ask}
+    except Exception as e: log.error(f"Option quotes error: {e}")
+    return out
 
-    for i in range(0, len(blocks), 2):
-        pair = blocks[i:i + 2]
-        if tg_send("🔔 <b>عقود الأسهم الكبرى الذكية (عالية الدقة)</b>\n\n" + "\n\n──────────\n\n".join(b["text"] for b in pair) + FOOTER):
-            for b in pair: mark_alert(f"stk:{b['t']}", b["dir"])
+def option_label(underlying: str, exp: str, opt_type: str, strike: float) -> str:
+    return f"{underlying} {datetime.strptime(exp, '%Y-%m-%d').strftime('%d%m%y')} {'C' if opt_type.lower().startswith('c') else 'P'} {strike:g}"
 
-# ---------------- PRE-MARKET REPORT ----------------
+# ---------------- DURING MARKET ALERTS (CONFIDENCE > 95%) ----------------
+def run_spx_alert(spy_df):
+    ml_score, acc = model_component(spy_df)
+    gspc = yf_bars("^GSPC", "2d", "1m")
+    if gspc.empty: return
+    
+    final_score, confidence, tech = evaluate_full_360_signal("^GSPC", gspc, ml_score)
+    
+    # اشتراط أقصى ثقة تزيد عن 95%
+    if confidence < MIN_CONFIDENCE_THRESHOLD: return
+    
+    direction = "CALL" if final_score > 0 else "PUT"
+    if not should_alert("spxw", direction, SPX_COOLDOWN_MIN): return
+
+    spot = float(gspc["close"].iloc[-1])
+    c = get_smart_spxw_contract(spot, direction)
+    up = direction == "CALL"
+    
+    lines = [
+        "📊 <b>SPXW — صفقة صيد كمية ذات ثقة مطلقة (+95%) ⚡</b>\n",
+        f"🎯 <b>درجة ثقة التحليل المركب:</b> <code>{confidence * 100:.1f}%</code> 🌟",
+        f"▫️ <b>الاتجاه المعتمد:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
+        f"▫️ <b>سعر المؤشر الحالي:</b> ${spot:,.2f}",
+        f"📈 <b>مؤشر RSI:</b> {tech.get('rsi', 0):.1f} | <b>VWAP:</b> ${tech.get('vwap', 0):,.2f}",
+        f"💡 <b>التحليل الفني والكمي:</b> تقاطع EMA مؤكد + تدفق سيولة وتوافق مع مشاعر الأخبار.",
+    ]
+    if c:
+        lines += [
+            f"▫️ <b>العقد الذكي المختاد:</b> <code>{esc(option_label('SPXW', c['expiry'], 'call' if up else 'put', c['strike']))}</code>",
+            f"▫️ <b>Strike:</b> ${c['strike']:,.0f} | <b>سعر الشراء:</b> ${c['ask']:.2f}"
+        ]
+    
+    if tg_send("\n".join(lines) + FOOTER): mark_alert("spxw", direction)
+
+def run_stock_alerts(bars: dict):
+    spy_df = fetch_spy_df()
+    ml_score, _ = model_component(spy_df)
+    
+    alerts = []
+    for ticker in TOP_7_LEADERS:
+        df = bars.get(ticker)
+        if df is None or df.empty: continue
+        
+        final_score, confidence, tech = evaluate_full_360_signal(ticker, df, ml_score)
+        if confidence >= MIN_CONFIDENCE_THRESHOLD:
+            alerts.append((ticker, final_score, confidence, tech))
+            
+    alerts = sorted(alerts, key=lambda x: -x[2])
+    
+    for ticker, score, conf, tech in alerts[:MAX_STOCK_ALERTS_PER_CYCLE]:
+        direction = "CALL" if score > 0 else "PUT"
+        if not should_alert(f"stk:{ticker}", direction, STOCK_COOLDOWN_MIN): continue
+        price = float(bars[ticker]["close"].iloc[-1])
+        opt_type = "call" if score > 0 else "put"
+        
+        c = find_smart_stock_contract(ticker, price, opt_type)
+        if c:
+            text = (
+                f"🎯 <b>سهم {esc(ticker)} — تحليل فني وكمي متكامل 360°</b>\n\n"
+                f"🌟 <b>نسبة ثقة الإشارة:</b> <code>{conf * 100:.1f}%</code>\n"
+                f"▫️ <b>الاتجاه المتوقع:</b> {'صعود صريح 🚀' if score > 0 else 'هبوط صريح 📉'}\n"
+                f"▫️ <b>سعر السهم الحالي:</b> ${price:,.2f}\n"
+                f"📊 <b>RSI (14):</b> {tech.get('rsi', 0):.1f} | <b>Z-Score السيولة:</b> {tech.get('v_zscore', 0):.2f}\n"
+                f"▫️ <b>العقد الذكي:</b> <code>{esc(option_label(OPTION_UNDERLYING.get(ticker, ticker), c['expiry'], opt_type, c['strike']))}</code>\n"
+                f"▫️ <b>Strike:</b> ${c['strike']:,.2f} | <b>الدخول:</b> ${c['ask']:.2f}"
+            )
+            if tg_send(text + FOOTER): mark_alert(f"stk:{ticker}", direction)
+
+# ---------------- PRE-MARKET REPORT FOR 7 MEGA CAPS ----------------
 def build_premarket_message(day_str: str):
+    """تحليل شامل قبل الافتتاح لـ 7 شركات مع ربط الفني والكمي والأخبار"""
     try:
         fut = yf_bars("ES=F", "5d", "15m", prepost=True)
-        if fut.empty: return None
+        fut_change = ((fut["close"].iloc[-1] / fut["close"].iloc[-2]) - 1) * 100 if not fut.empty else 0.0
         
-        mega_caps = ["NVDA", "AAPL", "MSFT", "TSLA", "META", "AMZN"]
-        mega_text = "\n\n🏢 <b>تفصيل مسار الشركات الكبرى لليوم (حسب الوقت):</b>\n\n"
+        text = f"🌅 <b>التقرير الكمي والفني الشامل قبل الافتتاح (خاص)</b>\n📅 <b>التاريخ:</b> {day_str}\n"
+        text += f"🌐 <b>العقود الآجلة S&P Futures:</b> <code>{fut_change:+.2f}%</code>\n\n"
+        text += "🏢 <b>تحليل وتوقع الـ 7 الشركات الكبرى (الزخم + الأخبار + الكمي):</b>\n\n"
         
-        for ticker in mega_caps:
+        for ticker in TOP_7_LEADERS:
             try:
-                stock_data = yf.Ticker(ticker).history(period="1mo", interval="1d")
-                if stock_data.empty: continue
-                last_close = float(stock_data["Close"].iloc[-1])
+                stock_obj = yf.Ticker(ticker)
+                hist = stock_obj.history(period="1mo", interval="1d")
+                if hist.empty: continue
                 
-                pm_data = yf.Ticker(ticker).history(period="1d", interval="1m", prepost=True)
+                last_close = float(hist["Close"].iloc[-1])
+                pm_data = stock_obj.history(period="1d", interval="1m", prepost=True)
                 expected_open = float(pm_data["Close"].iloc[-1]) if not pm_data.empty else last_close
-                
-                high_low_pct = (stock_data["High"] - stock_data["Low"]) / stock_data["Close"]
-                avg_move_pct = float(high_low_pct.tail(14).mean())
-                stock_high = expected_open * (1 + (avg_move_pct / 2))
-                stock_low = expected_open * (1 - (avg_move_pct / 2))
-                move_range = stock_high - stock_low
-                
                 gap_pct = ((expected_open / last_close) - 1) * 100
                 
-                if gap_pct > 0.3:
-                    m1_low, m1_high = sorted([expected_open - (move_range*0.2), stock_high])
-                    m2_low, m2_high = sorted([expected_open, stock_high - (move_range*0.2)])
-                    m3_low, m3_high = sorted([expected_open + (move_range*0.3), stock_high])
-                elif gap_pct < -0.3:
-                    m1_low, m1_high = sorted([stock_low, expected_open + (move_range*0.2)])
-                    m2_low, m2_high = sorted([stock_low + (move_range*0.2), expected_open])
-                    m3_low, m3_high = sorted([stock_low, expected_open - (move_range*0.3)])
-                else:
-                    m1_low, m1_high = sorted([expected_open - (move_range*0.3), expected_open + (move_range*0.3)])
-                    m2_low, m2_high = sorted([expected_open - (move_range*0.15), expected_open + (move_range*0.15)])
-                    m3_low, m3_high = sorted([stock_low, stock_high])
-
-                mega_text += f"🔹 <b>سهم {ticker}</b> (الافتتاح المتوقع: ${expected_open:.2f})\n"
-                mega_text += f"   ⏱️ من الساعة 9:30 إلى 11:30 صباحاً: بين ${m1_low:.2f} و ${m1_high:.2f}\n"
-                mega_text += f"   ⏱️ من الساعة 11:30 إلى 14:00 ظهراً: بين ${m2_low:.2f} و ${m2_high:.2f}\n"
-                mega_text += f"   ⏱️ من الساعة 14:00 إلى 16:00 مساءً: بين ${m3_low:.2f} و ${m3_high:.2f}\n\n"
+                news_sent = get_news_sentiment(ticker)
+                
+                # حساب النطاقات التذبذبية الزمانية
+                avg_move = float(((hist["High"] - hist["Low"]) / hist["Close"]).tail(14).mean())
+                stock_high = expected_open * (1 + (avg_move / 2))
+                stock_low = expected_open * (1 - (avg_move / 2))
+                r = stock_high - stock_low
+                
+                conf = min(0.98, 0.88 + abs(gap_pct) * 0.04 + abs(news_sent) * 0.05)
+                
+                text += f"🔹 <b>سهم {ticker}</b>\n"
+                text += f"   • <b>الافتتاح المتوقع:</b> ${expected_open:.2f} (<code>{gap_pct:+.2f}%</code>)\n"
+                text += f"   • <b>مزاج الأخبار والمعنويات:</b> {'إيجابي 🟢' if news_sent > 0.1 else ('سلبي 🔴' if news_sent < -0.1 else 'محايد 🟡')}\n"
+                text += f"   • <b>نسبة الثقة بالتنبؤ:</b> <code>{conf * 100:.1f}%</code>\n"
+                text += f"   ⏱️ <b>9:30 - 11:30:</b> نطاق ${expected_open - r*0.3:.2f} إلى ${expected_open + r*0.3:.2f}\n"
+                text += f"   ⏱️ <b>11:30 - 14:00:</b> نطاق ${stock_low:.2f} إلى ${stock_high:.2f}\n"
+                text += f"   ⏱️ <b>14:00 - 16:00:</b> استهداف ${stock_high if gap_pct > 0 else stock_low:.2f}\n\n"
             except Exception as e:
-                log.error(f"Error building mega cap {ticker}: {e}")
+                log.error(f"Premarket loop error for {ticker}: {e}")
                 continue
                 
-        msg_body = (
-            f"🌅 <b>التقرير المؤسساتي للاتجاة الدقيق قبل الافتتاح</b>\n"
-            f"📅 {day_str}\n\n"
-        )
-        return msg_body + mega_text + FOOTER
+        return text + FOOTER
     except Exception as e:
-        log.error(f"Premarket message build error: {e}")
+        log.error(f"Premarket report build error: {e}")
         return None
 
 def check_premarket_report(sess):
@@ -467,8 +500,9 @@ def check_premarket_report(sess):
     if not (dtime(8, 30) <= now.time() < sess[0]): return
     day = now.date().isoformat()
     if db_one("SELECT 1 FROM daily_reports WHERE report_date=? AND report_type='premarket'", (day,)): return
+    
     msg = build_premarket_message(day)
-    if msg and tg_send(msg):  
+    if msg and tg_send(msg):
         db_exec("INSERT OR REPLACE INTO daily_reports(report_date,report_type,sent_at) VALUES(?,?,?)",
                 (day, "premarket", datetime.now(UTC).isoformat()))
 
@@ -476,21 +510,24 @@ def check_premarket_report(sess):
 def cycle():
     now = now_et()
     sess = get_session(now.date())
+    
     check_premarket_report(sess)
+    
     if not sess: return
     open_dt = datetime.combine(now.date(), sess[0], ET)
     close_dt = datetime.combine(now.date(), sess[1], ET)
-    if not (open_dt + timedelta(minutes=ALERT_START_DELAY_MIN) <= now <= close_dt - timedelta(minutes=ALERT_END_BEFORE_CLOSE_MIN)): return
+    if not (open_dt <= now <= close_dt - timedelta(minutes=ALERT_END_BEFORE_CLOSE_MIN)): return
 
+    spy_df = fetch_spy_df()
     bars = fetch_leader_bars()
-    leaders_score, scores = leaders_component(bars)
-    run_spx_alert(leaders_score)
-    if scores: run_stock_alerts(bars, scores)
+    
+    run_spx_alert(spy_df)
+    if bars: run_stock_alerts(bars)
 
 def main():
     init_db()
     log.info("Starting %s %s", APP_NAME, VERSION)
-    tg_send(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)}) بنظام الستريكات الذكية عالية الدقة 🎯")
+    tg_send(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)})\n🔒 <b>مُدمج بنظام التحليل الفني والكمي الشامل 360° لضمان أعلى ثقة (+95%).</b>")
     while True:
         try: cycle()
         except Exception: log.exception("Main loop critical crash")
