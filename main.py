@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, math, sqlite3, logging, html
+import os, time, math, sqlite3, logging, html, threading
 from contextlib import closing
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -14,8 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 
-APP_NAME = "صَفاء التحليل (النسخة 44 - الخارقة المطلقة 🔒)"
-VERSION = "v44"
+APP_NAME = "صَفاء التحليل (النسخة 48 - الخارقة المنقاة 🔒)"
+VERSION = "v48"
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -31,17 +31,18 @@ STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip().lower()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip() # إرسال خاص لأبو سحاب حصراً
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v44.db")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v48.db")
 
 POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "15")))
 MAX_STOCK_ALERTS_PER_CYCLE = int(os.getenv("MAX_STOCK_ALERTS_PER_CYCLE", "6"))
-MIN_CONFIDENCE_THRESHOLD = 0.95  # فلتر خارق: لا تنبيهات تحت 95% ثقة
+MIN_CONFIDENCE_THRESHOLD = 0.95
 PORTFOLIO_CAPITAL = float(os.getenv("PORTFOLIO_CAPITAL", "10000.0"))
 MAX_RISK_PER_TRADE = 0.02 
 
 STOCK_COOLDOWN_MIN = int(os.getenv("STOCK_COOLDOWN_MIN", "20")) 
 SPX_COOLDOWN_MIN = int(os.getenv("SPX_COOLDOWN_MIN", "8"))     
+SHOCK_COOLDOWN_MIN = int(os.getenv("SHOCK_COOLDOWN_MIN", "3"))
 FLIP_MIN_MINUTES = int(os.getenv("FLIP_MIN_MINUTES", "5"))       
 MAX_DTE = int(os.getenv("MAX_DTE", "5"))                         
 HORIZON = 2                                                        
@@ -58,12 +59,35 @@ SESSION_OPEN = dtime(9, 30)
 SESSION_CLOSE = dtime(16, 0)
 ALERT_END_BEFORE_CLOSE_MIN = 5  
 
+# قفل حماية لاستدعاءات HTTP المتقاطعة
 http = requests.Session()
 http.headers.update({"APCA-API-KEY-ID": ALPACA_KEY,
                      "APCA-API-SECRET-KEY": ALPACA_SECRET,
                      "accept": "application/json"})
+_HTTP_LOCK = threading.Lock()
 
 FOOTER = "\n\n💎 خوارزمية التنبؤ الكمي الخارقة (خاص لأبو سحاب - ثقة +95%)"
+
+# ---------------- CACHING & THREAD LOCKS ----------------
+_CACHE_STORE = {}
+_CACHE_LOCK = threading.Lock()
+
+def get_cached(key: str, ttl_seconds: int, fetch_func):
+    now_ts = time.time()
+    with _CACHE_LOCK:
+        if key in _CACHE_STORE:
+            val, updated_at = _CACHE_STORE[key]
+            if now_ts - updated_at < ttl_seconds:
+                return val
+    try:
+        val = fetch_func()
+        with _CACHE_LOCK:
+            _CACHE_STORE[key] = (val, now_ts)
+        return val
+    except Exception as e:
+        log.warning(f"Cache fetch error for {key}: {e}")
+        with _CACHE_LOCK:
+            return _CACHE_STORE.get(key, (None, 0))[0]
 
 # ---------------- HELPERS & DB ----------------
 def now_et() -> datetime: return datetime.now(ET)
@@ -71,19 +95,21 @@ def esc(x) -> str: return html.escape(str(x))
 def to_alpaca_stock(sym: str) -> str: return sym.replace("-", ".")
 
 def db_exec(sql, params=()):
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as con:
         with con: con.execute(sql, params)
 
 def db_one(sql, params=()):
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as con:
         return con.execute(sql, params).fetchone()
 
 def db_all(sql, params=()):
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as con:
         return con.execute(sql, params).fetchall()
 
 def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    # تفعيل WAL mode لمنع القفل عند الكتابة المتزامنة
+    db_exec("PRAGMA journal_mode=WAL;")
     db_exec("""CREATE TABLE IF NOT EXISTS daily_reports (
         report_date TEXT NOT NULL, report_type TEXT NOT NULL, sent_at TEXT NOT NULL,
         PRIMARY KEY(report_date, report_type))""")
@@ -95,12 +121,13 @@ def init_db():
         target_price REAL NOT NULL, confidence REAL NOT NULL, sent_at TEXT NOT NULL,
         status TEXT DEFAULT 'PENDING', final_price REAL, win_status INT)""")
 
-def should_alert(key: str, direction: str, cooldown_min: int) -> bool:
+def should_alert(key: str, direction: str, cooldown_min: int, force_override: bool = False) -> bool:
     row = db_one("SELECT direction, sent_at FROM alert_state WHERE key=?", (key,))
     if not row: return True
     last_dir, sent_at = row
     elapsed = datetime.now(UTC) - datetime.fromisoformat(sent_at)
     if last_dir != direction: return elapsed >= timedelta(minutes=FLIP_MIN_MINUTES)
+    if force_override: return elapsed >= timedelta(minutes=SHOCK_COOLDOWN_MIN)
     return elapsed >= timedelta(minutes=cooldown_min)
 
 def mark_alert(key: str, direction: str):
@@ -139,42 +166,291 @@ def tg_send_private_only(text: str) -> bool:
         log.error(f"Telegram private send error: {e}")
         return False
 
+# ---------------- TELEGRAM INTERACTIVE COMMANDS (/status) ----------------
+_LAST_UPDATE_ID = 0
+
+def get_performance_summary() -> str:
+    try:
+        total = db_one("SELECT COUNT(*) FROM trade_performance WHERE status='COMPLETED'")[0]
+        if total == 0: return "📊 <b>سجل الأداء:</b> لا توجد صفقات مكتملة للتقييم بعد."
+        wins = db_one("SELECT COUNT(*) FROM trade_performance WHERE status='COMPLETED' AND win_status=1")[0]
+        return f"📈 <b>سجل أداء الإشارات الخارقة:</b> الصفقات: {total} | الناجحة: {wins} | <b>نسبة النجاح: {(wins/total)*100:.1f}%</b>"
+    except Exception: return ""
+
+def build_status_message() -> str:
+    shock = detect_market_crash_or_spike()
+    perf = get_performance_summary()
+    
+    with _MODEL_LOCK:
+        m_trained = _MODEL["trained_at"]
+        m_acc = _MODEL["acc"]
+    
+    trained_str = m_trained.astimezone(ET).strftime("%I:%M %p ET") if m_trained else "جاري التدريب..."
+    
+    try:
+        vix_df = yf.download(["^VIX9D", "^VIX"], period="1d", interval="1m", progress=False)["Close"].dropna()
+        vix9d_val = float(vix_df["^VIX9D"].iloc[-1]) if "^VIX9D" in vix_df else 0.0
+        vix_val = float(vix_df["^VIX"].iloc[-1]) if "^VIX" in vix_df else 0.0
+    except Exception:
+        vix9d_val, vix_val = 0.0, 0.0
+
+    status_flag = "🟢 طبيعي" if shock.get("status") == "NORMAL" else f"🚨 {shock.get('status')}"
+
+    msg = (
+        f"⚙️ <b>تقرير حالة النظام والقراءات المباشرة — (خاص لأبو سحاب 🔒)</b>\n\n"
+        f"📊 <b>مؤشرات الفولاتيليتي والإنذار المبكر:</b>\n"
+        f"   • <b>وضع المحرك:</b> {status_flag}\n"
+        f"   • <b>مؤشر VIX9D (9 أيام):</b> <code>{vix9d_val:.2f}</code>\n"
+        f"   • <b>مؤشر VIX (30 يوم):</b> <code>{vix_val:.2f}</code>\n"
+        f"   • <b>نسبة الانحراف (VIX9D/VIX):</b> <code>{shock.get('vix_ratio', 1.0):.3f}</code> "
+        f"{'⚠️ (خطر)' if shock.get('vix_ratio', 1.0) > 1.03 else '✅ (آمن)'}\n"
+        f"   • <b>تسارع زخم الدقيقة (Z-Score):</b> <code>{shock.get('z_score', 0.0):.2f}</code>\n\n"
+        f"🧠 <b>نموذج التنبؤ الآلي (RandomForest):</b>\n"
+        f"   • <b>آخر إعادة تدريب:</b> {trained_str}\n"
+        f"   • <b>دقة التنبؤ المتقاطع (Acc):</b> <code>{m_acc*100:.1f}%</code>\n\n"
+        f"{perf}"
+    )
+    return msg
+
+def handle_telegram_commands():
+    global _LAST_UPDATE_ID
+    if not TELEGRAM_TOKEN: return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"timeout": 1, "offset": _LAST_UPDATE_ID + 1}
+    
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        if r.status_code != 200: return
+        data = r.json()
+        if not data.get("ok"): return
+        
+        for update in data.get("result", []):
+            _LAST_UPDATE_ID = update["update_id"]
+            msg = update.get("message", {})
+            text = msg.get("text", "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            
+            if chat_id != TELEGRAM_CHAT_ID: continue
+            
+            if text == "/status" or text.startswith("/status@"):
+                status_text = build_status_message()
+                tg_send_private_only(status_text)
+    except Exception as e:
+        log.warning(f"Telegram listener error: {e}")
+
+def telegram_listener_task():
+    while True:
+        try:
+            handle_telegram_commands()
+        except Exception as e:
+            log.error(f"Error in telegram listener thread: {e}")
+        time.sleep(2)
+
+# ---------------- DUAL FUTURES (ES=F) + SPY SHOCK ENGINE ----------------
+def fetch_futures_and_spy_data() -> tuple:
+    try:
+        data = yf.download(["ES=F", "SPY"], period="1d", interval="1m", progress=False)["Close"].dropna()
+        if data.empty or "ES=F" not in data or "SPY" not in data:
+            return pd.DataFrame(), pd.DataFrame()
+        spy_df = yf.Ticker("SPY").history(period="1d", interval="1m")
+        es_df = yf.Ticker("ES=F").history(period="1d", interval="1m")
+        return spy_df, es_df
+    except Exception as e:
+        log.error(f"Error fetching Futures/SPY data: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+def detect_spy_and_futures_shock(spx_spot: float) -> dict:
+    def _fetch():
+        try:
+            spy_df, es_df = fetch_futures_and_spy_data()
+            if spy_df.empty or es_df.empty or len(spy_df) < 15 or len(es_df) < 15:
+                return {"triggered": False}
+
+            es_close = es_df["Close"].astype(float)
+            es_ret_3m = float((es_close.iloc[-1] / max(es_close.iloc[-4], 1e-9)) - 1.0)
+
+            spy_close = spy_df["Close"].astype(float)
+            spy_volume = spy_df["Volume"].astype(float)
+            spy_last = float(spy_close.iloc[-1])
+            spy_vwap = float((spy_close * spy_volume).sum() / max(spy_volume.sum(), 1e-9))
+
+            v_mean = spy_volume.tail(15).mean()
+            v_std = spy_volume.tail(15).std() + 1e-5
+            spy_v_zscore = float((spy_volume.iloc[-1] - v_mean) / v_std)
+
+            if es_ret_3m > 0.0012 and spy_last > spy_vwap and spy_v_zscore > 1.8:
+                target_move_spx = (es_ret_3m * spx_spot * 1.5)
+                target_spx = spx_spot + target_move_spx
+                stop_spx = spx_spot - (target_move_spx * 0.5)
+
+                return {
+                    "triggered": True,
+                    "direction": "CALL",
+                    "confidence": 0.98,
+                    "spot": spx_spot,
+                    "target": round(target_spx, 2),
+                    "stop_loss": round(stop_spx, 2),
+                    "es_change_3m": round(es_ret_3m * 100, 2),
+                    "spy_zscore": round(spy_v_zscore, 2),
+                    "reason": f"اندفاع حاد في الفيوتشرز ({es_ret_3m*100:+.2f}%) وتأكيد فوليوم SPY (Z-Score: {spy_v_zscore:.2f})"
+                }
+
+            elif es_ret_3m < -0.0012 and spy_last < spy_vwap and spy_v_zscore > 1.8:
+                target_move_spx = (abs(es_ret_3m) * spx_spot * 1.5)
+                target_spx = spx_spot - target_move_spx
+                stop_spx = spx_spot + (target_move_spx * 0.5)
+
+                return {
+                    "triggered": True,
+                    "direction": "PUT",
+                    "confidence": 0.98,
+                    "spot": spx_spot,
+                    "target": round(target_spx, 2),
+                    "stop_loss": round(stop_spx, 2),
+                    "es_change_3m": round(es_ret_3m * 100, 2),
+                    "spy_zscore": round(spy_v_zscore, 2),
+                    "reason": f"هبوط حاد في الفيوتشرز ({es_ret_3m*100:+.2f}%) وتأكيد فوليوم SPY (Z-Score: {spy_v_zscore:.2f})"
+                }
+
+            return {"triggered": False}
+        except Exception as e:
+            log.error(f"Error in spy_futures_shock: {e}")
+            return {"triggered": False}
+
+    return get_cached("futures_spy_shock", 15, _fetch) or {"triggered": False}
+
+# ---------------- EARLY WARNING & FAST PUT ENGINES ----------------
+def detect_market_crash_or_spike() -> dict:
+    def _fetch():
+        try:
+            vix_df = yf.download(["^VIX9D", "^VIX"], period="2d", interval="1m", progress=False)
+            if not vix_df.empty and "Close" in vix_df:
+                c_df = vix_df["Close"].dropna()
+                if "^VIX9D" in c_df and "^VIX" in c_df and len(c_df) >= 2:
+                    vix9d_last = float(c_df["^VIX9D"].iloc[-1])
+                    vix_last = float(c_df["^VIX"].iloc[-1])
+                    vix_ratio = vix9d_last / max(vix_last, 1e-9)
+                else: vix_ratio = 1.0
+            else: vix_ratio = 1.0
+
+            spy = yf.Ticker("SPY").history(period="1d", interval="1m")
+            if spy.empty or len(spy) < 20:
+                return {"status": "NORMAL", "vix_ratio": round(vix_ratio, 3), "z_score": 0.0}
+
+            close = spy["Close"]
+            returns = close.pct_change().dropna()
+            
+            mean_ret = float(returns.tail(15).mean())
+            std_ret = float(returns.tail(15).std()) + 1e-9
+            last_ret = float(returns.iloc[-1])
+            z_score = float((last_ret - mean_ret) / std_ret)
+
+            if vix_ratio > 1.03 and z_score < -2.2:
+                return {
+                    "status": "CRASH_WARNING 🚨",
+                    "direction": "PUT",
+                    "vix_ratio": round(vix_ratio, 3),
+                    "z_score": round(z_score, 2),
+                    "message": "🚨 <b>تنبيه طوارئ: رصد هبوط خاطف وشيك وإعادة تغطية كثيفة من صناع السوق!</b>"
+                }
+            elif z_score > 2.5:
+                return {
+                    "status": "SPIKE_WARNING 🚀",
+                    "direction": "CALL",
+                    "vix_ratio": round(vix_ratio, 3),
+                    "z_score": round(z_score, 2),
+                    "message": "🚀 <b>تنبيه طوارئ: رصد شورت كويرز (Short Squeeze) وصعود حاد خاطف!</b>"
+                }
+
+            return {"status": "NORMAL", "vix_ratio": round(vix_ratio, 3), "z_score": round(z_score, 2)}
+        except Exception as e:
+            return {"status": "NORMAL", "vix_ratio": 1.0, "z_score": 0.0, "error": str(e)}
+
+    return get_cached("crash_spike_engine", 20, _fetch) or {"status": "NORMAL", "vix_ratio": 1.0, "z_score": 0.0}
+
+def check_spx_fast_put_setup(gspc_df: pd.DataFrame) -> dict:
+    try:
+        if gspc_df is None or len(gspc_df) < 15:
+            return {"triggered": False}
+
+        close = gspc_df["close"].astype(float)
+        volume = gspc_df["volume"].astype(float)
+        high = gspc_df["high"].astype(float)
+
+        vwap = (close * volume).sum() / (volume.sum() + 1e-9)
+        last_price = float(close.iloc[-1])
+        prev_price = float(close.iloc[-2])
+        
+        vwap_break = (prev_price >= vwap) and (last_price < vwap)
+        recent_max = float(high.tail(5).max())
+        drop_pct = (last_price - recent_max) / max(recent_max, 1e-9)
+
+        v_mean = volume.tail(15).mean()
+        v_std = volume.tail(15).std() + 1e-5
+        v_zscore = float((volume.iloc[-1] - v_mean) / v_std)
+
+        shock = detect_market_crash_or_spike()
+        vix_ratio = shock.get("vix_ratio", 1.0)
+
+        if (vwap_break or drop_pct < -0.0015) and v_zscore > 1.8 and vix_ratio > 1.015:
+            target_drop = last_price - (last_price * 0.0040)
+            stop_loss = float(high.tail(3).max())
+            
+            return {
+                "triggered": True,
+                "direction": "PUT",
+                "spot": last_price,
+                "target": round(target_drop, 2),
+                "stop_loss": round(stop_loss, 2),
+                "vix_ratio": round(vix_ratio, 3),
+                "z_score": round(v_zscore, 2),
+                "confidence": 0.97
+            }
+
+        return {"triggered": False}
+    except Exception as e:
+        log.error(f"Error in fast put setup: {e}")
+        return {"triggered": False}
+
 # ---------------- ULTRA-QUANT & HEDGE FUND ENGINES ----------------
 def compute_gamma_exposure(ticker: str) -> dict:
-    """حساب تأثير جاما صانعي السوق (Gamma Exposure - GEX)"""
-    try:
-        t = yf.Ticker(ticker)
-        exps = t.options
-        if not exps: return {"gex_regime": "NEUTRAL", "gex_score": 0.0}
-        
-        chain = t.option_chain(exps[0])
-        calls, puts = chain.calls.copy(), chain.puts.copy()
-        
-        spot = t.history(period="1d")["Close"].iloc[-1]
-        
-        call_gex = sum(row['openInterest'] * (row['strike'] - spot) for _, row in calls.iterrows() if 'openInterest' in row and not pd.isna(row['openInterest']))
-        put_gex = sum(row['openInterest'] * (spot - row['strike']) for _, row in puts.iterrows() if 'openInterest' in row and not pd.isna(row['openInterest']))
-        
-        net_gex = call_gex - put_gex
-        gex_score = float(np.clip(net_gex / 100000.0, -1.0, 1.0))
-        
-        regime = "SHORT_GAMMA_VOLATILE ⚡" if gex_score < -0.2 else ("LONG_GAMMA_STABLE 🛡️" if gex_score > 0.2 else "NEUTRAL")
-        return {"gex_regime": regime, "gex_score": gex_score}
-    except Exception:
-        return {"gex_regime": "NEUTRAL", "gex_score": 0.0}
+    def _fetch():
+        try:
+            t = yf.Ticker(ticker)
+            exps = t.options
+            if not exps: return {"gex_regime": "NEUTRAL", "gex_score": 0.0}
+            
+            chain = t.option_chain(exps[0])
+            calls, puts = chain.calls.copy(), chain.puts.copy()
+            spot = float(t.history(period="1d")["Close"].iloc[-1])
+            
+            call_gex = sum(row['openInterest'] * (row['strike'] - spot) for _, row in calls.iterrows() if 'openInterest' in row and not pd.isna(row['openInterest']))
+            put_gex = sum(row['openInterest'] * (spot - row['strike']) for _, row in puts.iterrows() if 'openInterest' in row and not pd.isna(row['openInterest']))
+            
+            net_gex = call_gex - put_gex
+            gex_score = float(np.clip(net_gex / 100000.0, -1.0, 1.0))
+            
+            regime = "SHORT_GAMMA_VOLATILE ⚡" if gex_score < -0.2 else ("LONG_GAMMA_STABLE 🛡️" if gex_score > 0.2 else "NEUTRAL")
+            return {"gex_regime": regime, "gex_score": gex_score}
+        except Exception:
+            return {"gex_regime": "NEUTRAL", "gex_score": 0.0}
+
+    return get_cached(f"gex_{ticker}", 900, _fetch) or {"gex_regime": "NEUTRAL", "gex_score": 0.0}
 
 def get_sector_breadth() -> float:
-    """تحليل تدفق السيولة المتقاطع في قطاعات السوق القيادية"""
-    try:
-        sectors = ["XLK", "XLF", "XLC"]
-        data = yf.download(sectors, period="2d", interval="1m", progress=False)["Close"]
-        if data.empty: return 0.0
-        ret = (data.iloc[-1] / data.iloc[-10]) - 1.0
-        return float(np.clip(float(ret.mean() * 100.0), -1.0, 1.0))
-    except Exception: return 0.0
+    def _fetch():
+        try:
+            sectors = ["XLK", "XLF", "XLC"]
+            data = yf.download(sectors, period="2d", interval="1m", progress=False)["Close"]
+            if data.empty: return 0.0
+            ret = (data.iloc[-1] / data.iloc[-10]) - 1.0
+            return float(np.clip(float(ret.mean() * 100.0), -1.0, 1.0))
+        except Exception: return 0.0
+
+    return get_cached("sector_breadth", 300, _fetch) or 0.0
 
 def calculate_position_and_risk(contract_price: float, confidence: float, stock_price: float, atr: float) -> dict:
-    """إدارة المخاطر ومعادلة كيلي وحجم العقود ووقف الخسارة"""
     try:
         if contract_price <= 0: contract_price = 1.0
         max_risk_dollars = PORTFOLIO_CAPITAL * MAX_RISK_PER_TRADE
@@ -198,7 +474,6 @@ def calculate_position_and_risk(contract_price: float, confidence: float, stock_
         return {"contracts": 1, "risk_amount": contract_price * 100, "capital_pct": 1.0, "stop_loss": stock_price * 0.99, "take_profit": stock_price * 1.02}
 
 def check_unusual_option_activity(df_chain: pd.DataFrame, strike: float) -> bool:
-    """رصد السيولة الذكية الحجمية للمؤسسات"""
     try:
         if df_chain.empty: return False
         row = df_chain[df_chain["strike"] == strike]
@@ -209,7 +484,6 @@ def check_unusual_option_activity(df_chain: pd.DataFrame, strike: float) -> bool
     except Exception: return False
 
 def evaluate_past_trades():
-    """فحص وتقييم أداء الصفقات السابقة وتحديث Win-Rate"""
     try:
         pending_trades = db_all("SELECT id, symbol, direction, entry_price, target_price, sent_at FROM trade_performance WHERE status='PENDING'")
         for t_id, symbol, direction, entry_price, target_price, sent_at in pending_trades:
@@ -223,20 +497,17 @@ def evaluate_past_trades():
     except Exception as e:
         log.error(f"Evaluate past trades error: {e}")
 
-def get_performance_summary() -> str:
-    try:
-        total = db_one("SELECT COUNT(*) FROM trade_performance WHERE status='COMPLETED'")[0]
-        if total == 0: return "📊 <b>سجل الأداء:</b> لا توجد صفقات مكتملة للتقييم بعد."
-        wins = db_one("SELECT COUNT(*) FROM trade_performance WHERE status='COMPLETED' AND win_status=1")[0]
-        return f"📈 <b>سجل أداء الإشارات الخارقة:</b> الصفقات: {total} | الناجحة: {wins} | <b>نسبة النجاح: {(wins/total)*100:.1f}%</b>"
-    except Exception: return ""
-
 # ---------------- MARKET DATA & TECHNICAL ENGINE ----------------
 def alpaca_get(path, params=None, timeout=15, retries=2):
-    base = TRADING_URL if path.startswith(("/v2/options", "/v2/calendar")) else ALPACA_DATA_URL
+    if path.startswith(("/v2/calendar", "/v2/orders", "/v2/positions", "/v2/account")):
+        base = TRADING_URL
+    else:
+        base = ALPACA_DATA_URL
+        
     for attempt in range(retries):
         try:
-            r = http.get(base + path, params=params or {}, timeout=timeout)
+            with _HTTP_LOCK:
+                r = http.get(base + path, params=params or {}, timeout=timeout)
             if r.status_code == 429: time.sleep(1 * (2 ** attempt)); continue
             r.raise_for_status()
             return r.json()
@@ -329,21 +600,24 @@ def compute_technical_indicators(df: pd.DataFrame) -> dict:
     }
 
 def get_news_sentiment(ticker: str) -> float:
-    try:
-        t = yf.Ticker(ticker)
-        news = t.news
-        if not news: return 0.0
-        pos_words = ["growth", "beat", "surge", "upgraded", "profit", "bull", "record", "gain"]
-        neg_words = ["drop", "miss", "fall", "downgraded", "loss", "bear", "risk", "decline"]
-        score = 0.0
-        for item in news[:5]:
-            title = item.get("title", "").lower()
-            score += sum(1 for w in pos_words if w in title)
-            score -= sum(1 for w in neg_words if w in title)
-        return float(np.clip(score / 5.0, -1.0, 1.0))
-    except Exception: return 0.0
+    def _fetch():
+        try:
+            t = yf.Ticker(ticker)
+            news = t.news
+            if not news: return 0.0
+            pos_words = ["growth", "beat", "surge", "upgraded", "profit", "bull", "record", "gain"]
+            neg_words = ["drop", "miss", "fall", "downgraded", "loss", "bear", "risk", "decline"]
+            score = 0.0
+            for item in news[:5]:
+                title = item.get("title", "").lower()
+                score += sum(1 for w in pos_words if w in title)
+                score -= sum(1 for w in neg_words if w in title)
+            return float(np.clip(score / 5.0, -1.0, 1.0))
+        except Exception: return 0.0
 
-# ---------------- MACHINE LEARNING & EVALUATION ----------------
+    return get_cached(f"news_{ticker}", 1200, _fetch) or 0.0
+
+# ---------------- MACHINE LEARNING ENGINE (NON-BLOCKING THREAD) ----------------
 FEATURES = ["r1", "r3", "r6", "r12", "vol12", "ema_gap", "range", "vchg", "tod_sin", "tod_cos"]
 def feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
@@ -361,6 +635,7 @@ def make_model():
     return make_pipeline(SimpleImputer(strategy="median"), RandomForestClassifier(n_estimators=70, max_depth=5, min_samples_leaf=4, random_state=42, n_jobs=-1))
 
 _MODEL = {"model": None, "trained_at": None, "acc": 0.5}
+_MODEL_LOCK = threading.Lock()
 
 def fetch_spy_df() -> pd.DataFrame:
     try:
@@ -369,25 +644,45 @@ def fetch_spy_df() -> pd.DataFrame:
     except: pass
     return yf_bars("SPY", period="5d", interval="1m")
 
+def background_retrain_task():
+    while True:
+        try:
+            spy_df = fetch_spy_df()
+            if spy_df is not None and len(spy_df) >= 100:
+                x = feature_frame(spy_df)
+                fut = x["close"].shift(-HORIZON) / x["close"] - 1
+                x["target"] = np.where(fut.isna(), np.nan, (fut > 0).astype(float))
+                ds = x.dropna(subset=FEATURES + ["target"])
+                if len(ds) >= 100:
+                    X, y = ds[FEATURES], ds["target"].astype(int)
+                    accs = []
+                    for tr, te in TimeSeriesSplit(n_splits=3, gap=HORIZON).split(X):
+                        m = make_model()
+                        m.fit(X.iloc[tr], y.iloc[tr])
+                        accs.append(m.score(X.iloc[te], y.iloc[te]))
+                    final_m = make_model()
+                    final_m.fit(X, y)
+                    acc_val = float(np.mean(accs)) if accs else 0.5
+                    
+                    with _MODEL_LOCK:
+                        _MODEL["model"] = final_m
+                        _MODEL["trained_at"] = datetime.now(UTC)
+                        _MODEL["acc"] = acc_val
+                    log.info(f"Background ML retraining complete. Acc: {acc_val:.4f}")
+        except Exception as e:
+            log.error(f"Background ML retrain error: {e}")
+        time.sleep(1800)
+
 def model_component(spy_df):
     try:
-        if spy_df is None or len(spy_df) < 100: return None, None
-        x = feature_frame(spy_df)
-        fut = x["close"].shift(-HORIZON) / x["close"] - 1
-        x["target"] = np.where(fut.isna(), np.nan, (fut > 0).astype(float))
-        ds = x.dropna(subset=FEATURES + ["target"])
-        if len(ds) < 100: return None, None
-
-        if (_MODEL["model"] is None or _MODEL["trained_at"] is None or datetime.now(UTC) - _MODEL["trained_at"] > timedelta(minutes=60)):
-            X, y = ds[FEATURES], ds["target"].astype(int)
-            accs = []
-            for tr, te in TimeSeriesSplit(n_splits=3, gap=HORIZON).split(X):
-                m = make_model(); m.fit(X.iloc[tr], y.iloc[tr]); accs.append(m.score(X.iloc[te], y.iloc[te]))
-            final = make_model(); final.fit(X, y)
-            _MODEL.update(model=final, trained_at=datetime.now(UTC), acc=float(np.mean(accs)) if accs else 0.5)
+        with _MODEL_LOCK:
+            model = _MODEL["model"]
+            acc = _MODEL["acc"]
             
-        prob_up = float(_MODEL["model"].predict_proba(x[FEATURES].iloc[[-1]])[0, 1])
-        return (prob_up - 0.5) * 2 * float(np.clip((_MODEL["acc"] - 0.5) / 0.05, 0, 1)), _MODEL["acc"]
+        if spy_df is None or len(spy_df) < 100 or model is None: return None, None
+        x = feature_frame(spy_df)
+        prob_up = float(model.predict_proba(x[FEATURES].iloc[[-1]])[0, 1])
+        return (prob_up - 0.5) * 2 * float(np.clip((acc - 0.5) / 0.05, 0, 1)), acc
     except Exception: return None, None
 
 def evaluate_full_360_signal(ticker: str, df: pd.DataFrame, ml_score: float) -> tuple:
@@ -485,29 +780,99 @@ def find_smart_stock_contract(ticker: str, price: float, opt_type: str):
 def option_label(underlying: str, exp: str, opt_type: str, strike: float) -> str:
     return f"{underlying} {datetime.strptime(exp, '%Y-%m-%d').strftime('%d%m%y')} {'C' if opt_type.lower().startswith('c') else 'P'} {strike:g}"
 
-# ---------------- DURING MARKET ALERTS (CONFIDENCE > 95%) ----------------
+# ---------------- TRADING ALERTS & SHOCK INTELLIGENCE ----------------
 def run_spx_alert(spy_df):
-    ml_score, _ = model_component(spy_df)
     gspc = yf_bars("^GSPC", "2d", "1m")
     if gspc.empty: return
-    
-    score, confidence, tech = evaluate_full_360_signal("^GSPC", gspc, ml_score)
-    if confidence < MIN_CONFIDENCE_THRESHOLD: return
-    
-    direction = "CALL" if score > 0 else "PUT"
-    if not should_alert("spxw", direction, SPX_COOLDOWN_MIN): return
-
     spot = float(gspc["close"].iloc[-1])
+
+    # 1. فحص محرك الفيوتشرز و SPY المزدوج (Dual ES+SPY Shock) مع فحص Cooldown
+    shock_alert = detect_spy_and_futures_shock(spot)
+    if shock_alert.get("triggered"):
+        direction = shock_alert["direction"]
+        if should_alert("spxw_futures_shock", direction, SHOCK_COOLDOWN_MIN, force_override=True):
+            c = get_smart_spxw_contract(spot, direction)
+            risk_info = calculate_position_and_risk(c['ask'] if c else 1.0, 0.98, spot, 2.0)
+            
+            icon = "🚀" if direction == "CALL" else "🚨"
+            lines = [
+                f"{icon} <b>تنبيه انفجار خاطف: رصد حركة حادة في العقود الآجلة و SPY ({direction}) 🎯</b>\n",
+                f"🌟 <b>نسبة الثقة:</b> <code>98.0%</code>",
+                f"⚡ <b>السبب:</b> {shock_alert['reason']}",
+                f"▫️ <b>سعر المؤشر الحالي (SPX):</b> ${spot:,.2f}",
+                f"⏱️ <b>المستهدف (خلال 5د-10د):</b> <b>${shock_alert['target']:,.2f}</b>",
+                f"🛑 <b>وقف الخسارة (SL):</b> ${shock_alert['stop_loss']:,.2f} | <b>الهدف (TP):</b> ${risk_info['take_profit']:,.2f}",
+                f"🛡️ <b>العقود المقترحة:</b> <b>{risk_info['contracts']} عقود</b> (المخاطرة: ${risk_info['risk_amount']})",
+            ]
+            if c:
+                lines += [
+                    f"▫️ <b>العقد الذكي:</b> <code>{esc(option_label('SPXW', c['expiry'], direction.lower(), c['strike']))}</code>",
+                    f"▫️ <b>Strike:</b> ${c['strike']:,.0f} | <b>سعر الدخول (Ask):</b> ${c['ask']:.2f}"
+                ]
+                
+            if tg_send_private_only("\n".join(lines) + FOOTER):
+                mark_alert("spxw_futures_shock", direction)
+                record_trade("SPXW", direction, spot, shock_alert['target'], 0.98)
+            return
+
+    # 2. فحص محرك الهبوط السريع المخصص (Fast Put Setup) مع فحص Cooldown
+    fast_put = check_spx_fast_put_setup(gspc)
+    if fast_put.get("triggered"):
+        if should_alert("spxw_fast_put", "PUT", SHOCK_COOLDOWN_MIN, force_override=True):
+            spot = fast_put["spot"]
+            c = get_smart_spxw_contract(spot, "PUT")
+            risk_info = calculate_position_and_risk(c['ask'] if c else 1.0, 0.97, spot, 2.0)
+            
+            lines = [
+                f"⚡ <b>تنبيه صيد خاطف: رصد كسر وانحراف سلبي في SPX (FAST PUT) 🎯</b>\n",
+                f"🌟 <b>نسبة الثقة:</b> <code>97.0%</code>",
+                f"🔻 <b>السبب:</b> انحراف الفولاتيليتي (VIX Ratio: {fast_put['vix_ratio']}) وتسارع الفوليوم (Z-Score: {fast_put['z_score']})",
+                f"▫️ <b>سعر المؤشر الحالي:</b> ${spot:,.2f}",
+                f"⏱️ <b>المستهدف الهبوطي (خلال 5د-10د):</b> <b>${fast_put['target']:,.2f}</b>",
+                f"🛑 <b>وقف الخسارة (SL):</b> ${fast_put['stop_loss']:,.2f} | <b>الهدف (TP):</b> ${risk_info['take_profit']:,.2f}",
+                f"🛡️ <b>العقود المقترحة:</b> <b>{risk_info['contracts']} عقود</b> (المخاطرة: ${risk_info['risk_amount']})",
+            ]
+            if c:
+                lines += [
+                    f"▫️ <b>العقد الذكي:</b> <code>{esc(option_label('SPXW', c['expiry'], 'put', c['strike']))}</code>",
+                    f"▫️ <b>Strike:</b> ${c['strike']:,.0f} | <b>سعر الدخول (Ask):</b> ${c['ask']:.2f}"
+                ]
+            if tg_send_private_only("\n".join(lines) + FOOTER):
+                mark_alert("spxw_fast_put", "PUT")
+                record_trade("SPXW", "PUT", spot, fast_put['target'], 0.97)
+            return
+
+    # 3. فحص محرك الطوارئ العام (Crash/Spike Engine)
+    shock = detect_market_crash_or_spike()
+    is_shock = shock.get("status") in ["CRASH_WARNING 🚨", "SPIKE_WARNING 🚀"]
+    
+    ml_score, _ = model_component(spy_df)
+    score, confidence, tech = evaluate_full_360_signal("^GSPC", gspc, ml_score)
+    
+    if is_shock:
+        direction = shock["direction"]
+        confidence = max(confidence, 0.98)
+    else:
+        direction = "CALL" if score > 0 else "PUT"
+
+    if confidence < MIN_CONFIDENCE_THRESHOLD and not is_shock: return
+    if not should_alert("spxw", direction, SPX_COOLDOWN_MIN, force_override=is_shock): return
+
     vol_factor = gspc["close"].pct_change().std() * spot if not gspc.empty else spot * 0.001
-    target_price_10m = spot + (score * vol_factor * 1.5)
+    target_price_10m = spot + ((1 if direction == "CALL" else -1) * vol_factor * 1.5)
 
     c = get_smart_spxw_contract(spot, direction)
-    up = direction == "CALL"
-    
+    up = (direction == "CALL")
     risk_info = calculate_position_and_risk(c['ask'] if c else 1.0, confidence, spot, tech.get('atr', 2.0))
     
-    lines = [
-        "📊 <b>SPXW — إشارة صيد فائقة القوة (النسخة الخارقة) ⚡</b>\n",
+    lines = []
+    if is_shock:
+        lines.append(f"{shock.get('message')}\n")
+        lines.append(f"⚡ <b>انحراف VIX9D/VIX:</b> <code>{shock.get('vix_ratio')}</code> | <b>Z-Score:</b> <code>{shock.get('z_score')}</code>")
+    else:
+        lines.append("📊 <b>SPXW — إشارة صيد فائقة القوة (النسخة الخارقة) ⚡</b>\n")
+        
+    lines += [
         f"🎯 <b>درجة الثقة الكمية المطلقة:</b> <code>{confidence * 100:.1f}%</code> 🌟",
         f"▫️ <b>الاتجاه المعتمد:</b> {'كول (CALL) 🟢' if up else 'بوت (PUT) 🔴'}",
         f"▫️ <b>سعر المؤشر الحالي:</b> ${spot:,.2f}",
@@ -553,7 +918,6 @@ def run_stock_alerts(bars: dict):
         if c:
             stock_vol = bars[ticker]["close"].pct_change().std() * price if len(bars[ticker]) > 5 else price * 0.005
             target_price = price + (score * stock_vol * 1.5)
-            
             risk_info = calculate_position_and_risk(c['ask'], conf, price, tech.get('atr', price * 0.01))
             
             text = (
@@ -646,7 +1010,20 @@ def cycle():
 def main():
     init_db()
     log.info("Starting %s %s", APP_NAME, VERSION)
-    tg_send_private_only(f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)})\n🔒 <b>النظام يعمل بفلتر الثقة الخارق (+95%) وإعادة حساب تأثير الجاما وسيولة المؤسسات.</b>")
+    
+    # 1. تشغيل إعادة تدريب النموذج في Thread مستقل
+    ml_thread = threading.Thread(target=background_retrain_task, daemon=True)
+    ml_thread.start()
+    
+    # 2. تشغيل مستمع أوامر التلجرام (/status) في Thread مستقل
+    tg_cmd_thread = threading.Thread(target=telegram_listener_task, daemon=True)
+    tg_cmd_thread.start()
+    
+    tg_send_private_only(
+        f"🚀 تم تشغيل {esc(APP_NAME)} ({esc(VERSION)})\n"
+        f"🔒 <b>النظام يعمل بفلتر الثقة الخارق (+95%) ومحركات الطوارئ الخالية من السبام والتجهيز الكامل لقاعدة البيانات وسيرفرات Railway.</b>"
+    )
+    
     while True:
         try: cycle()
         except Exception: log.exception("Main loop critical crash")
