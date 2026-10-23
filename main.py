@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v58 — Full Precision Edition (Nasdaq VWAP + Dow Jones DIA)
+صَفاء التحليل v59 — Dual Intermarket Liquidity Filter Edition (Nasdaq VWAP Confirmation)
 توصيات تحليليّة وإشارات فقط — لا يوجد تنفيذ تلقائي للأوامر.
 """
 
@@ -21,7 +21,7 @@ import yfinance as yf
 # ================= ================= =================
 
 APP_NAME = "صَفاء التحليل"
-VERSION = "v58-PRECISION"
+VERSION = "v59-INTERMARKET"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -34,14 +34,14 @@ STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v58.db")
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v59.db")
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 MIN_MOVE_POINTS = float(os.getenv("MIN_MOVE_POINTS", "2.5"))
 MAX_ALERTS_PER_DAY = int(os.getenv("MAX_ALERTS_PER_DAY", "15"))
 
-# إضافة QQQ و DIA لقائمة المسح الرئيسية
+# قائمة المؤشرات والأسهم القيادية المفحوصة
 SCAN_STOCKS = [s.strip().upper() for s in os.getenv(
     "SCAN_STOCKS", "NVDA,AAPL,TSLA,META,AMZN,AMD,QQQ,SPY,DIA"
 ).split(",") if s.strip()]
@@ -165,8 +165,52 @@ def market_phase():
 
 
 # ================= ================= =================
-# الخوارزميات ورصد الانضغاط (مع VWAP المخصص لـ QQQ)
+# الخوارزميات، السيولة المزدوجة، والتحليل الفني
 # ================= ================= =================
+
+def get_stock_bars(symbol, timeframe="1Min"):
+    end = datetime.now(UTC)
+    start = end - timedelta(days=2)
+    url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": timeframe,
+        "start": start.isoformat().replace("+00:00", "Z"),
+        "end": end.isoformat().replace("+00:00", "Z"),
+        "limit": 300,
+        "feed": STOCK_FEED,
+    }
+    r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
+    if r.status_code != 200:
+        return pd.DataFrame()
+    rows = r.json().get("bars", {}).get(symbol, [])
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).rename(columns={"c":"close","h":"high","l":"low","v":"volume"})
+    return df
+
+
+def get_qqq_liquidity_bias():
+    """
+    قراءة اتجاه السيولة المؤسسية في ناسداك (QQQ)
+    لتأكيد اتجاه SPY و SPX وباقي الأسهم القيادية
+    """
+    df_qqq = get_stock_bars("QQQ", timeframe="1Min")
+    if df_qqq.empty or len(df_qqq) < 15:
+        return "NEUTRAL"
+
+    close = df_qqq["close"].astype(float)
+    volume = df_qqq["volume"].astype(float)
+
+    # حساب VWAP اللحظي لمؤشر ناسداك
+    vwap = (volume * close).cumsum() / volume.cumsum()
+
+    if close.iloc[-1] > vwap.iloc[-1]:
+        return "BULLISH"  # سيولة شرائية مؤسسية تدعم CALL
+    elif close.iloc[-1] < vwap.iloc[-1]:
+        return "BEARISH"  # سيولة بيعية تؤكد PUT
+
+    return "NEUTRAL"
+
 
 def detect_qqq_early_setup(df):
     """خوارزمية مخصصة لمؤشر ناسداك QQQ تعتمد على VWAP والانضغاط السعري"""
@@ -176,14 +220,11 @@ def detect_qqq_early_setup(df):
     close = df["close"].astype(float)
     volume = df["volume"].astype(float)
 
-    # حساب مؤشر VWAP اللحظي
     vwap = (volume * close).cumsum() / volume.cumsum()
 
-    # قياس الانضغاط السعري
     std_recent = close.tail(6).std()
     squeeze_ratio = (std_recent / close.iloc[-1]) * 100.0
 
-    # تراكم السيولة
     vol_surge = volume.tail(3).mean() / volume.iloc[-15:-3].mean() if volume.iloc[-15:-3].mean() > 0 else 1.0
 
     is_squeezing = squeeze_ratio <= 0.14
@@ -199,7 +240,7 @@ def detect_qqq_early_setup(df):
 
 
 def detect_strong_setup(df):
-    """خوارزمية الأسهم والمؤشرات الأخرى (SPY, DIA, الأسهم)"""
+    """خوارزمية الأسهم والمؤشرات الأخرى (SPY, DIA, NVDA, AAPL, إلخ)"""
     if df is None or len(df) < 20:
         return None, 0.0
 
@@ -225,27 +266,6 @@ def detect_strong_setup(df):
         return direction, confidence
 
     return None, 0.0
-
-
-def get_stock_bars(symbol, timeframe="1Min"):
-    end = datetime.now(UTC)
-    start = end - timedelta(days=2)
-    url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": timeframe,
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-        "limit": 300,
-        "feed": STOCK_FEED,
-    }
-    r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
-    if r.status_code != 200:
-        return pd.DataFrame()
-    rows = r.json().get("bars", {}).get(symbol, [])
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).rename(columns={"c":"close","h":"high","l":"low","v":"volume"})
-    return df
 
 
 def get_premarket_forecast_all():
@@ -458,7 +478,7 @@ def format_eod_report():
 
 
 # ================= ================= =================
-# تشغيل المسح وتوجيه QQQ
+# تشغيل المسح وتطبيق فلتر سيولة ناسداك المزدوج
 # ================= ================= =================
 
 def run_premarket():
@@ -478,6 +498,9 @@ def run_rth():
     if state["sent_count"] >= MAX_ALERTS_PER_DAY:
         return
 
+    # 🟢 قراءة اتجاه سيولة ناسداك اللحظي لتطبيق الفلترة المزدوجة
+    qqq_bias = get_qqq_liquidity_bias()
+
     for symbol in SCAN_STOCKS:
         if daily_state_get()["sent_count"] >= MAX_ALERTS_PER_DAY:
             break
@@ -486,7 +509,7 @@ def run_rth():
         if df.empty or len(df) < 15:
             continue
             
-        # توجيه خاص لمؤشر ناسداك QQQ للاستفادة من VWAP
+        # 1. توجيه خاص لمؤشر ناسداك QQQ
         if symbol == "QQQ":
             direction, confidence = detect_qqq_early_setup(df)
         else:
@@ -494,14 +517,23 @@ def run_rth():
             
         if not direction:
             continue
-            
+
+        # 2. 🛡️ تطبيق الفلترة المزدوجة بإنحياز سيولة ناسداك على باقي المؤشرات والأسهم
+        if symbol != "QQQ":
+            if direction == "CALL" and qqq_bias == "BEARISH":
+                log.info("تم إلغاء توصية CALL على %s بسبب سلبية سيولة ناسداك.", symbol)
+                continue  # استبعاد صفقة الشراء إذا كانت سيولة ناسداك بيعية
+            elif direction == "PUT" and qqq_bias == "BULLISH":
+                log.info("تم إلغاء توصية PUT على %s بسبب إيجابية سيولة ناسداك.", symbol)
+                continue  # استبعاد صفقة البيع إذا كانت سيولة ناسداك شرائية
+
         spot = float(df["close"].iloc[-1])
         opt = find_high_conviction_option(symbol, direction, spot)
         if opt:
             msg = format_conviction_alert(opt, confidence)
             if telegram_send(msg):
                 increment_alert_count()
-                log.info("تم إرسال توصية قوية: %s %s", symbol, direction)
+                log.info("تم إرسال توصية قوية (مؤكدة بسيولة ناسداك): %s %s", symbol, direction)
 
 
 def run_post_market():
@@ -517,6 +549,16 @@ def run_post_market():
 def main():
     ensure_db()
     log.info("تشغيل البوت %s %s...", APP_NAME, VERSION)
+
+    # إرسال إشعار بدء تشغيل النظام على التليجرام
+    startup_msg = (
+        f"🚀 *تم تشغيل نظام {APP_NAME} ({VERSION}) بنجاح*\n"
+        f"⏱️ *التوقيت:* `{now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')}`\n"
+        f"🛡️ *فلتر سيولة ناسداك المزدوج:* `مفعل 🟢`\n"
+        f"✅ *الحالة:* النظام يعمل وفي انتظار نافذة السوق."
+    )
+    telegram_send(startup_msg)
+
     while True:
         try:
             phase = market_phase()
