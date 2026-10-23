@@ -21,6 +21,7 @@ import yfinance as yf
 # ================= ================= =================
 
 APP_NAME = "صَفاء التحليل"
+APP_NAME_ASCII = "SafaaAnalysis"  # اسم متوافق مع ترويسات HTTP
 VERSION = "v59-INTERMARKET"
 
 NY = ZoneInfo("America/New_York")
@@ -47,7 +48,8 @@ SCAN_STOCKS = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 
 session = requests.Session()
-session.headers.update({"User-Agent": f"{APP_NAME}/{VERSION}"})
+# إصلاح خطأ latin-1: استخدام اسم باللغة الإنجليزية في User-Agent
+session.headers.update({"User-Agent": f"{APP_NAME_ASCII}/{VERSION}"})
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("safaa")
@@ -135,6 +137,7 @@ def mark_eod_sent():
 
 def telegram_send(message):
     if not TG_TOKEN or not TG_CHAT:
+        log.warning("بيانات التليجرام (TG_TOKEN أو TG_CHAT) غير مكتملة.")
         return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
@@ -144,9 +147,12 @@ def telegram_send(message):
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         }, timeout=15)
-        return r.status_code == 200
+        if r.status_code != 200:
+            log.error("خطأ تليجرام (%s): %s", r.status_code, r.text)
+            return False
+        return True
     except Exception as exc:
-        log.error("Telegram error: %s", exc)
+        log.error("استثناء تليجرام: %s", exc)
         return False
 
 
@@ -155,7 +161,8 @@ def market_phase():
     if now.weekday() >= 5:
         return "CLOSED"
     minute = now.hour * 60 + now.minute
-    if 8 * 60 + 30 <= minute < 9 * 60 + 30:
+    # توسيع النافذة من 8:00 صباحاً حتى 9:30 صباحاً نيويورك لضمان عدم تفويت تقرير ما قبل الافتتاح
+    if 8 * 60 <= minute < 9 * 60 + 30:
         return "PREMARKET_HOUR"
     elif 9 * 60 + 30 <= minute < 16 * 60:
         return "RTH"
@@ -179,14 +186,32 @@ def get_stock_bars(symbol, timeframe="1Min"):
         "limit": 300,
         "feed": STOCK_FEED,
     }
-    r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
-    if r.status_code != 200:
+    try:
+        r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
+        if r.status_code != 200:
+            log.warning("فشل جلب بيانات Alpaca لـ %s | الكود: %s", symbol, r.status_code)
+            return pd.DataFrame()
+        rows = r.json().get("bars", {}).get(symbol, [])
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).rename(columns={"c":"close","h":"high","l":"low","v":"volume","t":"timestamp"})
+        return df
+    except Exception as exc:
+        log.error("خطأ في جلب بيانات %s: %s", symbol, exc)
         return pd.DataFrame()
-    rows = r.json().get("bars", {}).get(symbol, [])
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).rename(columns={"c":"close","h":"high","l":"low","v":"volume"})
-    return df
+
+
+def filter_today_bars(df):
+    """فلترة البيانات لليوم الحالي فقط لحساب VWAP اللحظي بدقة"""
+    if df.empty or "timestamp" not in df.columns:
+        return df
+    try:
+        df["dt"] = pd.to_datetime(df["timestamp"])
+        latest_date = df["dt"].dt.date.max()
+        df_today = df[df["dt"].dt.date == latest_date].copy()
+        return df_today if len(df_today) >= 3 else df
+    except Exception:
+        return df
 
 
 def get_qqq_liquidity_bias():
@@ -195,37 +220,46 @@ def get_qqq_liquidity_bias():
     لتأكيد اتجاه SPY و SPX وباقي الأسهم القيادية
     """
     df_qqq = get_stock_bars("QQQ", timeframe="1Min")
-    if df_qqq.empty or len(df_qqq) < 15:
+    df_qqq = filter_today_bars(df_qqq)
+    
+    if df_qqq.empty or len(df_qqq) < 10:
         return "NEUTRAL"
 
     close = df_qqq["close"].astype(float)
     volume = df_qqq["volume"].astype(float)
 
-    # حساب VWAP اللحظي لمؤشر ناسداك
-    vwap = (volume * close).cumsum() / volume.cumsum()
+    # حساب VWAP اللحظي للجلسة الحالية
+    vol_sum = volume.cumsum()
+    vwap = (volume * close).cumsum() / np.where(vol_sum == 0, 1, vol_sum)
 
     if close.iloc[-1] > vwap.iloc[-1]:
-        return "BULLISH"  # سيولة شرائية مؤسسية تدعم CALL
+        return "BULLISH"
     elif close.iloc[-1] < vwap.iloc[-1]:
-        return "BEARISH"  # سيولة بيعية تؤكد PUT
+        return "BEARISH"
 
     return "NEUTRAL"
 
 
 def detect_qqq_early_setup(df):
     """خوارزمية مخصصة لمؤشر ناسداك QQQ تعتمد على VWAP والانضغاط السعري"""
-    if df is None or len(df) < 20:
+    df_session = filter_today_bars(df)
+    if df_session is None or len(df_session) < 15:
+        df_session = df
+        
+    if len(df_session) < 15:
         return None, 0.0
 
-    close = df["close"].astype(float)
-    volume = df["volume"].astype(float)
+    close = df_session["close"].astype(float)
+    volume = df_session["volume"].astype(float)
 
-    vwap = (volume * close).cumsum() / volume.cumsum()
+    vol_sum = volume.cumsum()
+    vwap = (volume * close).cumsum() / np.where(vol_sum == 0, 1, vol_sum)
 
     std_recent = close.tail(6).std()
     squeeze_ratio = (std_recent / close.iloc[-1]) * 100.0
 
-    vol_surge = volume.tail(3).mean() / volume.iloc[-15:-3].mean() if volume.iloc[-15:-3].mean() > 0 else 1.0
+    vol_prior = volume.iloc[-15:-3].mean()
+    vol_surge = volume.tail(3).mean() / vol_prior if vol_prior > 0 else 1.0
 
     is_squeezing = squeeze_ratio <= 0.14
     has_volume = vol_surge >= 1.35
@@ -271,7 +305,8 @@ def detect_strong_setup(df):
 def get_premarket_forecast_all():
     spy_data = None
     try:
-        df_spy = yf.download("SPY", period="5d", interval="5m", progress=False)
+        # إضافة prepost=True لضمان جلب بيانات ما قبل الافتتاح
+        df_spy = yf.download("SPY", period="5d", interval="5m", prepost=True, progress=False)
         if not df_spy.empty:
             if isinstance(df_spy.columns, pd.MultiIndex):
                 df_spy.columns = df_spy.columns.get_level_values(0)
@@ -484,13 +519,21 @@ def format_eod_report():
 def run_premarket():
     state = daily_state_get()
     if state["pm_report_sent"]:
+        log.info("تقرير ما قبل الافتتاح تم إرساله سابقاً لليوم.")
         return
+        
+    log.info("جاري إعداد تقرير ما قبل الافتتاح...")
     spy_fc, comp_fc = get_premarket_forecast_all()
+    
     if spy_fc or comp_fc:
         msg = format_premarket_report(spy_fc, comp_fc)
         if telegram_send(msg):
             mark_pm_sent()
-            log.info("تم إرسال تقرير التوقعات قبل الافتتاح.")
+            log.info("تم إرسال تقرير التوقعات قبل الافتتاح بنجاح.")
+        else:
+            log.error("فشل إرسال تقرير ما قبل الافتتاح عبر التليجرام.")
+    else:
+        log.warning("لم يتم الحصول على بيانات كافية لإرسال تقرير ما قبل الافتتاح.")
 
 
 def run_rth():
@@ -498,7 +541,6 @@ def run_rth():
     if state["sent_count"] >= MAX_ALERTS_PER_DAY:
         return
 
-    # 🟢 قراءة اتجاه سيولة ناسداك اللحظي لتطبيق الفلترة المزدوجة
     qqq_bias = get_qqq_liquidity_bias()
 
     for symbol in SCAN_STOCKS:
@@ -509,7 +551,6 @@ def run_rth():
         if df.empty or len(df) < 15:
             continue
             
-        # 1. توجيه خاص لمؤشر ناسداك QQQ
         if symbol == "QQQ":
             direction, confidence = detect_qqq_early_setup(df)
         else:
@@ -518,14 +559,13 @@ def run_rth():
         if not direction:
             continue
 
-        # 2. 🛡️ تطبيق الفلترة المزدوجة بإنحياز سيولة ناسداك على باقي المؤشرات والأسهم
         if symbol != "QQQ":
             if direction == "CALL" and qqq_bias == "BEARISH":
                 log.info("تم إلغاء توصية CALL على %s بسبب سلبية سيولة ناسداك.", symbol)
-                continue  # استبعاد صفقة الشراء إذا كانت سيولة ناسداك بيعية
+                continue
             elif direction == "PUT" and qqq_bias == "BULLISH":
                 log.info("تم إلغاء توصية PUT على %s بسبب إيجابية سيولة ناسداك.", symbol)
-                continue  # استبعاد صفقة البيع إذا كانت سيولة ناسداك شرائية
+                continue
 
         spot = float(df["close"].iloc[-1])
         opt = find_high_conviction_option(symbol, direction, spot)
@@ -550,7 +590,6 @@ def main():
     ensure_db()
     log.info("تشغيل البوت %s %s...", APP_NAME, VERSION)
 
-    # إرسال إشعار بدء تشغيل النظام على التليجرام
     startup_msg = (
         f"🚀 *تم تشغيل نظام {APP_NAME} ({VERSION}) بنجاح*\n"
         f"⏱️ *التوقيت:* `{now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')}`\n"
