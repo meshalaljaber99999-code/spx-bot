@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v59.1 — Dual Intermarket Liquidity Filter Edition
+صَفاء التحليل v59.2 — Realtime Intermarket Edition
 توصيات تحليليّة وإشارات فقط — لا يوجد تنفيذ تلقائي للأوامر.
+تم حل مشكلة التأخير بالاعتماد على أحدث سعر تنفيذي مباشر (Real-time Trade Price).
 """
 
 import os
@@ -22,7 +23,7 @@ import yfinance as yf
 
 APP_NAME = "صَفاء التحليل"
 APP_NAME_ASCII = "SafaaAnalysis"
-VERSION = "v59.1-INTERMARKET"
+VERSION = "v59.2-REALTIME"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -169,11 +170,27 @@ def market_phase():
 
 
 # ================= ================= =================
-# الخوارزميات، السيولة المزدوجة، والتحليل الفني
+# الخوارزميات، السعر اللحظي المباشر، والتحليل الفني
 # ================= ================= =================
 
+def get_realtime_stock_price(symbol):
+    """جلب أحدث سعر تنفيذي مباشر للسهم لحظياً لتفادي تأخير الشموع"""
+    url = f"{DATA_URL}/v2/stocks/{symbol}/trades/latest"
+    try:
+        r = session.get(url, headers=alpaca_headers(), params={"feed": STOCK_FEED}, timeout=5)
+        if r.status_code == 200:
+            trade = r.json().get("trade", {})
+            if isinstance(trade, dict):
+                price = float(trade.get("p", 0))
+                if price > 0:
+                    return price
+    except Exception as exc:
+        log.warning("تعذر جلب السعر اللحظي المباشر لـ %s: %s", symbol, exc)
+    return None
+
+
 def get_stock_bars(symbol, timeframe="1Min"):
-    """جلب بيانات الشموع مع حماية صحة نمط استجابة Alpaca API"""
+    """جلب بيانات الشموع مع دعم القوائم والقواميس الآمن من Alpaca API"""
     end = datetime.now(UTC)
     start = end - timedelta(days=2)
     url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
@@ -193,7 +210,6 @@ def get_stock_bars(symbol, timeframe="1Min"):
         res_json = r.json()
         raw_bars = res_json.get("bars")
         
-        # تصحيح النمط: التعامل سواء كانت الاستجابة قائمة أو قاموس
         if isinstance(raw_bars, dict):
             rows = raw_bars.get(symbol, [])
         elif isinstance(raw_bars, list):
@@ -313,7 +329,6 @@ def get_premarket_forecast_all():
     try:
         df_spy = yf.download("SPY", period="5d", interval="5m", prepost=True, progress=False)
         if not df_spy.empty:
-            # معالجة MultiIndex بأمان
             if isinstance(df_spy.columns, pd.MultiIndex):
                 close_series = df_spy["Close"]["SPY"] if "SPY" in df_spy["Close"].columns else df_spy["Close"].iloc[:, 0]
             else:
@@ -353,7 +368,10 @@ def get_premarket_forecast_all():
             df = get_stock_bars(sym, timeframe="5Min")
             if df.empty:
                 continue
-            spot = float(df["close"].iloc[-1])
+            
+            live_spot = get_realtime_stock_price(sym)
+            spot = live_spot if (live_spot and live_spot > 0) else float(df["close"].iloc[-1])
+            
             ret = df["close"].pct_change().dropna()
             vol = ret.std() * np.sqrt(78) * spot
             move = max(MIN_MOVE_POINTS, vol)
@@ -484,7 +502,7 @@ def format_conviction_alert(opt, confidence):
         f"📌 *الأصل:* `{opt['symbol']}`\n"
         f"🧭 *الاتجاه المتوقع:* {dir_ar}\n"
         f"📅 *نوع العقد:* `{opt['exp_label']}` (تاريخ: `{opt['exp_date']}`)\n"
-        f"💹 *السعر الحالي (قبل الكسر):* `{opt['spot']:.2f}`\n"
+        f"💹 *السعر الحالي المباشر:* `{opt['spot']:.2f}`\n"
         f"🎯 *السترايك المستهدف:* `{opt['strike']:.2f}`\n"
         f"📄 *العقد:* `{opt['contract']}`\n"
         f"🟢 *Ask:* `${opt['ask']:.2f}` | ⚖️ *Mid:* `${opt['mid']:.2f}`\n"
@@ -498,7 +516,8 @@ def format_eod_report():
     state = daily_state_get()
     try:
         df_spy = get_stock_bars("SPY", timeframe="5Min")
-        close_spy = df_spy["close"].iloc[-1] if not df_spy.empty else 0.0
+        live_spy = get_realtime_stock_price("SPY")
+        close_spy = live_spy if (live_spy and live_spy > 0) else (df_spy["close"].iloc[-1] if not df_spy.empty else 0.0)
         high_spy = df_spy["close"].max() if not df_spy.empty else 0.0
         low_spy = df_spy["close"].min() if not df_spy.empty else 0.0
         close_spx = close_spy * 10
@@ -575,13 +594,16 @@ def run_rth():
                 log.info("تم إلغاء توصية PUT على %s بسبب إيجابية سيولة ناسداك.", symbol)
                 continue
 
-        spot = float(df["close"].iloc[-1])
+        # 👈 جلب السعر التنفيذي اللحظي المباشر لحساب السترايك الدقيق
+        live_spot = get_realtime_stock_price(symbol)
+        spot = live_spot if (live_spot and live_spot > 0) else float(df["close"].iloc[-1])
+
         opt = find_high_conviction_option(symbol, direction, spot)
         if opt:
             msg = format_conviction_alert(opt, confidence)
             if telegram_send(msg):
                 increment_alert_count()
-                log.info("تم إرسال توصية قوية (مؤكدة بسيولة ناسداك): %s %s", symbol, direction)
+                log.info("تم إرسال توصية قوية (مؤكدة بالسعر اللحظي المباشر): %s %s عند سعر %.2f", symbol, direction, spot)
 
 
 def run_post_market():
@@ -601,7 +623,7 @@ def main():
     startup_msg = (
         f"🚀 *تم تشغيل نظام {APP_NAME} ({VERSION}) بنجاح*\n"
         f"⏱️ *التوقيت:* `{now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')}`\n"
-        f"🛡️ *فلتر سيولة ناسداك المزدوج:* `مفعل 🟢`\n"
+        f"⚡ *محرك السعر اللحظي المباشر:* `مفعل 🟢`\n"
         f"✅ *الحالة:* النظام يعمل وفي انتظار نافذة السوق."
     )
     telegram_send(startup_msg)
