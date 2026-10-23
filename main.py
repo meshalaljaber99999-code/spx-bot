@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v57 — Full Telegram Automation Edition
+صَفاء التحليل v58 — Full Precision Edition (Nasdaq VWAP + Dow Jones DIA)
 توصيات تحليليّة وإشارات فقط — لا يوجد تنفيذ تلقائي للأوامر.
 """
 
@@ -21,7 +21,7 @@ import yfinance as yf
 # ================= ================= =================
 
 APP_NAME = "صَفاء التحليل"
-VERSION = "v57-COMPLETE"
+VERSION = "v58-PRECISION"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -34,15 +34,16 @@ STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip()
 OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v57.db")
+DB_PATH = os.getenv("DB_PATH", "./data/safaa_v58.db")
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 MIN_MOVE_POINTS = float(os.getenv("MIN_MOVE_POINTS", "2.5"))
 MAX_ALERTS_PER_DAY = int(os.getenv("MAX_ALERTS_PER_DAY", "15"))
 
+# إضافة QQQ و DIA لقائمة المسح الرئيسية
 SCAN_STOCKS = [s.strip().upper() for s in os.getenv(
-    "SCAN_STOCKS", "NVDA,AAPL,TSLA,META,AMZN,AMD,QQQ,SPY"
+    "SCAN_STOCKS", "NVDA,AAPL,TSLA,META,AMZN,AMD,QQQ,SPY,DIA"
 ).split(",") if s.strip()]
 
 session = requests.Session()
@@ -58,7 +59,7 @@ def now_ny():
 
 def get_target_expiration(symbol):
     today = now_ny().date()
-    if symbol in ("SPY", "QQQ", "SPX"):
+    if symbol in ("SPY", "QQQ", "DIA", "SPX"):
         return today.isoformat(), "0DTE (ينتهي اليوم)"
     
     days_ahead = 4 - today.weekday()
@@ -164,10 +165,41 @@ def market_phase():
 
 
 # ================= ================= =================
-# الخوارزميات وجلب البيانات
+# الخوارزميات ورصد الانضغاط (مع VWAP المخصص لـ QQQ)
 # ================= ================= =================
 
+def detect_qqq_early_setup(df):
+    """خوارزمية مخصصة لمؤشر ناسداك QQQ تعتمد على VWAP والانضغاط السعري"""
+    if df is None or len(df) < 20:
+        return None, 0.0
+
+    close = df["close"].astype(float)
+    volume = df["volume"].astype(float)
+
+    # حساب مؤشر VWAP اللحظي
+    vwap = (volume * close).cumsum() / volume.cumsum()
+
+    # قياس الانضغاط السعري
+    std_recent = close.tail(6).std()
+    squeeze_ratio = (std_recent / close.iloc[-1]) * 100.0
+
+    # تراكم السيولة
+    vol_surge = volume.tail(3).mean() / volume.iloc[-15:-3].mean() if volume.iloc[-15:-3].mean() > 0 else 1.0
+
+    is_squeezing = squeeze_ratio <= 0.14
+    has_volume = vol_surge >= 1.35
+
+    if is_squeezing and has_volume:
+        if close.iloc[-1] > vwap.iloc[-1]:
+            return "CALL", min(96, int(83 + (vol_surge * 5)))
+        elif close.iloc[-1] < vwap.iloc[-1]:
+            return "PUT", min(96, int(83 + (vol_surge * 5)))
+
+    return None, 0.0
+
+
 def detect_strong_setup(df):
+    """خوارزمية الأسهم والمؤشرات الأخرى (SPY, DIA, الأسهم)"""
     if df is None or len(df) < 20:
         return None, 0.0
 
@@ -175,8 +207,7 @@ def detect_strong_setup(df):
     volume = df["volume"].astype(float)
 
     std_recent = close.tail(6).std()
-    avg_price = close.iloc[-1]
-    squeeze_ratio = (std_recent / avg_price) * 100.0
+    squeeze_ratio = (std_recent / close.iloc[-1]) * 100.0
 
     vol_recent_mean = volume.tail(3).mean()
     vol_prior_mean = volume.iloc[-15:-3].mean()
@@ -253,7 +284,7 @@ def get_premarket_forecast_all():
 
     companies_data = []
     for sym in SCAN_STOCKS:
-        if sym in ("SPY", "QQQ"):
+        if sym in ("SPY", "SPX"):
             continue
         try:
             df = get_stock_bars(sym, timeframe="5Min")
@@ -373,7 +404,7 @@ def format_premarket_report(spy_fc, comp_fc):
         ])
 
     if comp_fc:
-        lines.append("🏢 *توقعات عقود الشركات (مستهدف 2.5+ نقطة):*")
+        lines.append("🏢 *توقعات عقود الشركات والمؤشرات:*")
         for c in comp_fc:
             lines.append(
                 f"• *{c['symbol']}* (`{c['spot']:.2f}`): النطاق `{c['low']} — {c['high']}` | الاتجاه: {c['direction']} | السترايك: `{c['target_strike']}`"
@@ -427,7 +458,7 @@ def format_eod_report():
 
 
 # ================= ================= =================
-# تشغيل المسح
+# تشغيل المسح وتوجيه QQQ
 # ================= ================= =================
 
 def run_premarket():
@@ -455,7 +486,12 @@ def run_rth():
         if df.empty or len(df) < 15:
             continue
             
-        direction, confidence = detect_strong_setup(df)
+        # توجيه خاص لمؤشر ناسداك QQQ للاستفادة من VWAP
+        if symbol == "QQQ":
+            direction, confidence = detect_qqq_early_setup(df)
+        else:
+            direction, confidence = detect_strong_setup(df)
+            
         if not direction:
             continue
             
