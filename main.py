@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v59 — Dual Intermarket Liquidity Filter Edition (Nasdaq VWAP Confirmation)
+صَفاء التحليل v59.1 — Dual Intermarket Liquidity Filter Edition
 توصيات تحليليّة وإشارات فقط — لا يوجد تنفيذ تلقائي للأوامر.
 """
 
@@ -21,8 +21,8 @@ import yfinance as yf
 # ================= ================= =================
 
 APP_NAME = "صَفاء التحليل"
-APP_NAME_ASCII = "SafaaAnalysis"  # اسم متوافق مع ترويسات HTTP
-VERSION = "v59-INTERMARKET"
+APP_NAME_ASCII = "SafaaAnalysis"
+VERSION = "v59.1-INTERMARKET"
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
@@ -42,13 +42,11 @@ MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 MIN_MOVE_POINTS = float(os.getenv("MIN_MOVE_POINTS", "2.5"))
 MAX_ALERTS_PER_DAY = int(os.getenv("MAX_ALERTS_PER_DAY", "15"))
 
-# قائمة المؤشرات والأسهم القيادية المفحوصة
 SCAN_STOCKS = [s.strip().upper() for s in os.getenv(
     "SCAN_STOCKS", "NVDA,AAPL,TSLA,META,AMZN,AMD,QQQ,SPY,DIA"
 ).split(",") if s.strip()]
 
 session = requests.Session()
-# إصلاح خطأ latin-1: استخدام اسم باللغة الإنجليزية في User-Agent
 session.headers.update({"User-Agent": f"{APP_NAME_ASCII}/{VERSION}"})
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -161,7 +159,6 @@ def market_phase():
     if now.weekday() >= 5:
         return "CLOSED"
     minute = now.hour * 60 + now.minute
-    # توسيع النافذة من 8:00 صباحاً حتى 9:30 صباحاً نيويورك لضمان عدم تفويت تقرير ما قبل الافتتاح
     if 8 * 60 <= minute < 9 * 60 + 30:
         return "PREMARKET_HOUR"
     elif 9 * 60 + 30 <= minute < 16 * 60:
@@ -176,6 +173,7 @@ def market_phase():
 # ================= ================= =================
 
 def get_stock_bars(symbol, timeframe="1Min"):
+    """جلب بيانات الشموع مع حماية صحة نمط استجابة Alpaca API"""
     end = datetime.now(UTC)
     start = end - timedelta(days=2)
     url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
@@ -191,9 +189,21 @@ def get_stock_bars(symbol, timeframe="1Min"):
         if r.status_code != 200:
             log.warning("فشل جلب بيانات Alpaca لـ %s | الكود: %s", symbol, r.status_code)
             return pd.DataFrame()
-        rows = r.json().get("bars", {}).get(symbol, [])
+        
+        res_json = r.json()
+        raw_bars = res_json.get("bars")
+        
+        # تصحيح النمط: التعامل سواء كانت الاستجابة قائمة أو قاموس
+        if isinstance(raw_bars, dict):
+            rows = raw_bars.get(symbol, [])
+        elif isinstance(raw_bars, list):
+            rows = raw_bars
+        else:
+            rows = []
+
         if not rows:
             return pd.DataFrame()
+
         df = pd.DataFrame(rows).rename(columns={"c":"close","h":"high","l":"low","v":"volume","t":"timestamp"})
         return df
     except Exception as exc:
@@ -215,10 +225,7 @@ def filter_today_bars(df):
 
 
 def get_qqq_liquidity_bias():
-    """
-    قراءة اتجاه السيولة المؤسسية في ناسداك (QQQ)
-    لتأكيد اتجاه SPY و SPX وباقي الأسهم القيادية
-    """
+    """قراءة اتجاه السيولة المؤسسية في ناسداك (QQQ)"""
     df_qqq = get_stock_bars("QQQ", timeframe="1Min")
     df_qqq = filter_today_bars(df_qqq)
     
@@ -228,7 +235,6 @@ def get_qqq_liquidity_bias():
     close = df_qqq["close"].astype(float)
     volume = df_qqq["volume"].astype(float)
 
-    # حساب VWAP اللحظي للجلسة الحالية
     vol_sum = volume.cumsum()
     vwap = (volume * close).cumsum() / np.where(vol_sum == 0, 1, vol_sum)
 
@@ -259,7 +265,7 @@ def detect_qqq_early_setup(df):
     squeeze_ratio = (std_recent / close.iloc[-1]) * 100.0
 
     vol_prior = volume.iloc[-15:-3].mean()
-    vol_surge = volume.tail(3).mean() / vol_prior if vol_prior > 0 else 1.0
+    vol_surge = (volume.tail(3).mean() / vol_prior) if vol_prior > 0 else 1.0
 
     is_squeezing = squeeze_ratio <= 0.14
     has_volume = vol_surge >= 1.35
@@ -305,14 +311,16 @@ def detect_strong_setup(df):
 def get_premarket_forecast_all():
     spy_data = None
     try:
-        # إضافة prepost=True لضمان جلب بيانات ما قبل الافتتاح
         df_spy = yf.download("SPY", period="5d", interval="5m", prepost=True, progress=False)
         if not df_spy.empty:
+            # معالجة MultiIndex بأمان
             if isinstance(df_spy.columns, pd.MultiIndex):
-                df_spy.columns = df_spy.columns.get_level_values(0)
+                close_series = df_spy["Close"]["SPY"] if "SPY" in df_spy["Close"].columns else df_spy["Close"].iloc[:, 0]
+            else:
+                close_series = df_spy["Close"]
             
-            latest_spy = float(df_spy["Close"].iloc[-1])
-            returns_spy = df_spy["Close"].pct_change().dropna()
+            latest_spy = float(close_series.dropna().iloc[-1])
+            returns_spy = close_series.pct_change().dropna()
             vol_spy = returns_spy.std() * np.sqrt(78) * latest_spy
             move_spy = max(3.5, vol_spy)
             
@@ -322,7 +330,7 @@ def get_premarket_forecast_all():
             spx_low = round(spy_low * 10, 2)
             spx_high = round(spy_high * 10, 2)
             
-            ma20 = df_spy["Close"].tail(20).mean()
+            ma20 = close_series.tail(20).mean()
             spy_trend = "صاعد 🟢" if latest_spy > ma20 else ("هابط 🔴" if latest_spy < ma20 else "عرضي ⚪")
             confidence = int(min(92, max(75, 80 + (abs(latest_spy - ma20) / ma20) * 1000)))
             
