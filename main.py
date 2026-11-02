@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v60.0 — Institutional Predictive Edition
-توصيات وإشارات تحليليّة تنبؤية استباقية تسبق السعر باستغلال:
+‎صَفاء التحليل v60.0 — Institutional Predictive Edition
+‎توصيات وإشارات تحليليّة تنبؤية استباقية تسبق السعر باستغلال:
 1. Order Flow Imbalance & Volume Velocity (تدفق الأوامر والامتصاص)
 2. Liquidity Sweeps & Stop Loss Hunts (صيد السيولة ومصايد صناع السوق)
 3. 0DTE Options Gamma Exposure (GEX & Gamma Squeeze Zones)
 4. LightGBM ML Multi-Factor Engine (نموذج التنبؤ الرقمي التوافقي)
 5. Multi-Timeframe Intermarket Confluence (التوافق اللحظي بين الأطر الزمنية)
 
-تطوير وتنفيذ: تصميم أبو سحاب
+‎تطوير وتنفيذ: تصميم أبو سحاب
 """
 
 import os
 import time
 import logging
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -23,7 +23,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# استيراد مكتبة LightGBM للتعلم الآلي مع آلية احتياطية في حال عدم توفرها
+‎# استيراد مكتبة LightGBM للتعلم الآلي مع آلية احتياطية في حال عدم توفرها
 try:
     import lightgbm as lgb
     HAS_LGBM = True
@@ -31,12 +31,12 @@ except ImportError:
     HAS_LGBM = False
 
 # ================= ================= =================
-# الإعدادات الأساسية والهوية
+‎# الإعدادات الأساسية والهوية
 # ================= ================= =================
 
 APP_NAME = "صَفاء التحليل"
 APP_NAME_ASCII = "SafaaAnalysis"
-VERSION = "v60.0-PREDICTIVE-INSTITUTIONAL"
+VERSION = "v60.1-PREDICTIVE-INSTITUTIONAL"
 SIGNATURE = "⚡ تصميم أبو سحاب"
 
 NY = ZoneInfo("America/New_York")
@@ -109,6 +109,14 @@ def ensure_db():
                 gamma_status TEXT
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS predictions_eval (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT, timestamp TEXT, kind TEXT, symbol TEXT, direction TEXT,
+                spot_price REAL, confidence INTEGER,
+                close_price REAL, move_pct REAL, result TEXT
+            )
+        """)
 
 
 def daily_state_get():
@@ -147,6 +155,59 @@ def mark_eod_sent():
         """, (today,))
 
 
+def log_prediction(kind, symbol, direction, spot, confidence):
+‎    """يسجل كل توقع (CALL = صعود، PUT = هبوط) ليُقيَّم آخر اليوم."""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute(
+                "INSERT INTO predictions_eval(day, timestamp, kind, symbol, direction, spot_price, confidence) VALUES (?,?,?,?,?,?,?)",
+                (now_ny().date().isoformat(), now_ny().isoformat(timespec="seconds"),
+                 kind, symbol, direction, float(spot), int(confidence)))
+    except Exception as exc:
+        log.warning("تعذر تسجيل التوقع: %s", exc)
+
+
+def rth_close(symbol):
+‎    """آخر إغلاق دقيقة ضمن جلسة اليوم (حتى 16:00 نيويورك)."""
+    df = get_stock_bars(symbol, timeframe="1Min", limit=1000)
+    if df.empty:
+        return None
+    ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(NY)
+    mask = (ts.dt.date == now_ny().date()) & ((ts.dt.hour * 60 + ts.dt.minute) <= 16 * 60)
+    return float(df.loc[mask, "close"].iloc[-1]) if mask.any() else None
+
+
+def evaluate_predictions():
+‎    """يقارن توقعات اليوم بالإغلاق الفعلي: HIT لو تحرك السعر باتجاه التوقع من لحظة التوصية حتى الإغلاق."""
+    today = now_ny().date().isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            "SELECT id, symbol, direction, spot_price FROM predictions_eval WHERE day=? AND result IS NULL",
+            (today,)).fetchall()
+        cache = {}
+        for pid, sym, direction, spot in rows:
+            if sym not in cache:
+                cache[sym] = rth_close(sym)
+            close = cache[sym]
+            if not close or not spot:
+                continue
+            move = (close - spot) / spot * 100.0
+            hit = (move > 0) if direction == "CALL" else (move < 0)
+            con.execute("UPDATE predictions_eval SET close_price=?, move_pct=?, result=? WHERE id=?",
+                        (close, move, "HIT" if hit else "MISS", pid))
+
+
+def accuracy_summary():
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            "SELECT kind, COUNT(*), SUM(result='HIT') FROM predictions_eval WHERE result IS NOT NULL GROUP BY kind"
+        ).fetchall()
+    if not rows:
+        return "لا توجد بيانات كافية بعد"
+    names = {"alert": "توصيات الأسهم", "premarket": "اتجاه SPY الصباحي"}
+    return " | ".join(f"{names.get(k, k)}: {int(h or 0)}/{n} ({(h or 0) / n * 100:.0f}%)" for k, n, h in rows)
+
+
 def telegram_send(message):
     if not TG_TOKEN or not TG_CHAT:
         log.warning("بيانات التليجرام غير مكتملة.")
@@ -180,11 +241,11 @@ def market_phase():
 
 
 # ================= ================= =================
-# 1. محرك تدفق الأوامر والسيولة اللحظية (Order Flow & Velocity)
+‎# 1. محرك تدفق الأوامر والسيولة اللحظية (Order Flow & Velocity)
 # ================= ================= =================
 
 def get_realtime_stock_price(symbol):
-    """جلب أحدث سعر تنفيذي مباشر للسهم لحظياً (Realtime Trade Price)"""
+‎    """جلب أحدث سعر تنفيذي مباشر للسهم لحظياً (Realtime Trade Price)"""
     url = f"{DATA_URL}/v2/stocks/{symbol}/trades/latest"
     try:
         r = session.get(url, headers=alpaca_headers(), params={"feed": STOCK_FEED}, timeout=5)
@@ -200,7 +261,7 @@ def get_realtime_stock_price(symbol):
 
 
 def get_stock_bars(symbol, timeframe="1Min", limit=300):
-    """جلب بيانات الشموع من Alpaca API"""
+‎    """جلب بيانات الشموع من Alpaca API"""
     end = datetime.now(UTC)
     start = end - timedelta(days=3)
     url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
@@ -210,6 +271,7 @@ def get_stock_bars(symbol, timeframe="1Min", limit=300):
         "end": end.isoformat().replace("+00:00", "Z"),
         "limit": limit,
         "feed": STOCK_FEED,
+        "sort": "desc",   # أحدث الشموع أولاً (الافتراضي asc كان يرجّع شموع قديمة)
     }
     try:
         r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
@@ -223,7 +285,7 @@ def get_stock_bars(symbol, timeframe="1Min", limit=300):
             return pd.DataFrame()
 
         df = pd.DataFrame(rows).rename(columns={"c": "close", "h": "high", "l": "low", "v": "volume", "t": "timestamp"})
-        return df
+        return df.iloc[::-1].reset_index(drop=True)   # ترتيب تصاعدي: الأقدم -> الأحدث
     except Exception as exc:
         log.error("خطأ جلب بيانات %s: %s", symbol, exc)
         return pd.DataFrame()
@@ -231,7 +293,7 @@ def get_stock_bars(symbol, timeframe="1Min", limit=300):
 
 def calculate_order_flow_analytics(df):
     """
-    تحليل تدفق الأوامر والامتصاص وتسارع السيولة (Order Flow Dynamics):
+‎    تحليل تدفق الأوامر والامتصاص وتسارع السيولة (Order Flow Dynamics):
     - Volume Velocity: تسارع الفوليوم اللحظي مقارنة بالمتوسط المتحرك.
     - Absorption Ratio: كشف عمليات الشراء/البيع الخفية (ارتفاع الفوليوم مع ضيق النطاق السعري).
     """
@@ -243,17 +305,17 @@ def calculate_order_flow_analytics(df):
     high = df["high"].astype(float)
     low = df["low"].astype(float)
 
-    # حساب VWAP اللحظي
+‎    # حساب VWAP اللحظي
     vol_sum = volume.cumsum()
     vwap = (volume * close).cumsum() / np.where(vol_sum == 0, 1, vol_sum)
     vwap_dist_pct = ((close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]) * 100.0
 
-    # حساب Volume Velocity
+‎    # حساب Volume Velocity
     recent_vol = volume.tail(3).mean()
     prior_vol = volume.iloc[-15:-3].mean()
     volume_velocity = round((recent_vol / prior_vol), 2) if prior_vol > 0 else 1.0
 
-    # حساب Absorption (الامتصاص المؤسسي عند الدعم/المقاومة)
+‎    # حساب Absorption (الامتصاص المؤسسي عند الدعم/المقاومة)
     candle_range = (high.iloc[-1] - low.iloc[-1])
     avg_range = (high.tail(10) - low.tail(10)).mean()
     is_narrow_range = candle_range < (avg_range * 0.65)
@@ -269,13 +331,13 @@ def calculate_order_flow_analytics(df):
 
 
 # ================= ================= =================
-# 2. رصد صيد السيولة والمصايد (Liquidity Sweeps & Stop Hunts)
+‎# 2. رصد صيد السيولة والمصايد (Liquidity Sweeps & Stop Hunts)
 # ================= ================= =================
 
 def detect_liquidity_sweep(df, window=20):
     """
-    رصد كسر القيعان/القمم اللحظية الوهمي لجمع السيولة (Liquidity Sweep):
-    يحدث عندما يكسر السعر أعلى/أدنى مستوى خلال (window) دقيقة بفوليوم مفاجئ ثم يرتد داخل النطاق.
+‎    رصد كسر القيعان/القمم اللحظية الوهمي لجمع السيولة (Liquidity Sweep):
+‎    يحدث عندما يكسر السعر أعلى/أدنى مستوى خلال (window) دقيقة بفوليوم مفاجئ ثم يرتد داخل النطاق.
     """
     if df.empty or len(df) < window + 2:
         return None
@@ -294,11 +356,11 @@ def detect_liquidity_sweep(df, window=20):
     curr_vol = volumes.iloc[-1]
     avg_vol = volumes.iloc[-15:-1].mean()
 
-    # صيد سيولة البائعين (Bullish Liquidity Sweep)
+‎    # صيد سيولة البائعين (Bullish Liquidity Sweep)
     if curr_low < prev_low and curr_close > prev_low and curr_vol > (avg_vol * 1.4):
         return "BULLISH_SWEEP"
 
-    # صيد سيولة المشترين (Bearish Liquidity Sweep)
+‎    # صيد سيولة المشترين (Bearish Liquidity Sweep)
     if curr_high > prev_high and curr_close < prev_high and curr_vol > (avg_vol * 1.4):
         return "BEARISH_SWEEP"
 
@@ -306,13 +368,13 @@ def detect_liquidity_sweep(df, window=20):
 
 
 # ================= ================= =================
-# 3. تحليل تدفق عقود الخيارات وتكشف الجاما (0DTE Gamma Exposure)
+‎# 3. تحليل تدفق عقود الخيارات وتكشف الجاما (0DTE Gamma Exposure)
 # ================= ================= =================
 
 def calculate_0dte_gamma_exposure(symbol, spot):
     """
-    تقدير مستويات تسارع الجاما (Gamma Acceleration & Flip Level) لعقود 0DTE / الأسبوعية.
-    تحدد المناطق التي يُجبر فيها صناع السوق (Dealers) على التحويط السريع.
+‎    تقدير مستويات تسارع الجاما (Gamma Acceleration & Flip Level) لعقود 0DTE / الأسبوعية.
+‎    تحدد المناطق التي يُجبر فيها صناع السوق (Dealers) على التحويط السريع.
     """
     today_str = now_ny().date().isoformat()
     url = f"{TRADING_URL}/v2/options/contracts"
@@ -349,7 +411,7 @@ def calculate_0dte_gamma_exposure(symbol, spot):
 
 
 # ================= ================= =================
-# 4. محرك التعلم الآلي والتنبؤ التوافقي (LightGBM Scoring Engine)
+‎# 4. محرك التعلم الآلي والتنبؤ التوافقي (LightGBM Scoring Engine)
 # ================= ================= =================
 
 class LightGBMPredictor:
@@ -368,7 +430,7 @@ class LightGBMPredictor:
 
     def predict(self, features_dict):
         """
-        تقييم احتمالية الصفقة باستخدام نموذج LightGBM أو نظام التجميع الإحصائي الموزون (GBDT Rules).
+‎        تقييم احتمالية الصفقة باستخدام نموذج LightGBM أو نظام التجميع الإحصائي الموزون (GBDT Rules).
         """
         # Feature vector: [vwap_dist, volume_velocity, squeeze_ratio, multi_tf_align, sweep_val, gamma_val]
         vwap_dist = features_dict.get("vwap_dist_pct", 0.0)
@@ -388,7 +450,7 @@ class LightGBMPredictor:
             except Exception:
                 pass
 
-        # المحرك التجميعي المحسّن (Ensemble Heuristic Engine)
+‎        # المحرك التجميعي المحسّن (Ensemble Heuristic Engine)
         score = 80.0
         score += min(10.0, (vol_vel - 1.0) * 4.0)
         score += 5.0 if squeeze <= 0.14 else 0.0
@@ -404,11 +466,11 @@ predictor_engine = LightGBMPredictor(MODEL_PATH)
 
 
 # ================= ================= =================
-# 5. التوافق اللحظي بين الأطر الزمنية والأسواق (Intermarket Multi-TF)
+‎# 5. التوافق اللحظي بين الأطر الزمنية والأسواق (Intermarket Multi-TF)
 # ================= ================= =================
 
 def check_multi_timeframe_alignment(symbol):
-    """تحليل توافق الاتجاه على أطر 1m و 5m و 15m"""
+‎    """تحليل توافق الاتجاه على أطر 1m و 5m و 15m"""
     df_1m = get_stock_bars(symbol, timeframe="1Min", limit=50)
     df_5m = get_stock_bars(symbol, timeframe="5Min", limit=50)
 
@@ -433,7 +495,7 @@ def check_multi_timeframe_alignment(symbol):
 
 
 def get_qqq_intermarket_bias():
-    """قراءة سيولة وتوافق مؤشر ناسداك QQQ"""
+‎    """قراءة سيولة وتوافق مؤشر ناسداك QQQ"""
     df_qqq = get_stock_bars("QQQ", timeframe="1Min", limit=100)
     if df_qqq.empty:
         return "NEUTRAL"
@@ -446,11 +508,11 @@ def get_qqq_intermarket_bias():
 
 
 # ================= ================= =================
-# الخوارزمية الشاملة لكشف الإشارات عالية التناغم
+‎# الخوارزمية الشاملة لكشف الإشارات عالية التناغم
 # ================= ================= =================
 
 def analyze_symbol_institutional_setup(symbol):
-    """تحليل استباقي متكامل يدمج كافة المحركات الإشارية"""
+‎    """تحليل استباقي متكامل يدمج كافة المحركات الإشارية"""
     df_1m = get_stock_bars(symbol, timeframe="1Min", limit=200)
     if df_1m.empty or len(df_1m) < 25:
         return None
@@ -459,31 +521,31 @@ def analyze_symbol_institutional_setup(symbol):
     live_spot = get_realtime_stock_price(symbol)
     spot = live_spot if (live_spot and live_spot > 0) else close.iloc[-1]
 
-    # 1. تحليل تدفق الأوامر وتسارع السيولة
+‎    # 1. تحليل تدفق الأوامر وتسارع السيولة
     of_analytics = calculate_order_flow_analytics(df_1m)
 
-    # 2. كشف مصايد وصيد السيولة (Liquidity Sweeps)
+‎    # 2. كشف مصايد وصيد السيولة (Liquidity Sweeps)
     sweep_signal = detect_liquidity_sweep(df_1m, window=20)
 
-    # 3. تكشف الجاما (0DTE Gamma Exposure)
+‎    # 3. تكشف الجاما (0DTE Gamma Exposure)
     gamma_status, gamma_flip = calculate_0dte_gamma_exposure(symbol, spot)
 
-    # 4. التوافق متعدد الأطر الزمنية
+‎    # 4. التوافق متعدد الأطر الزمنية
     multi_tf_align = check_multi_timeframe_alignment(symbol)
 
-    # 5. الانضغاط السعري (Squeeze Ratio)
+‎    # 5. الانضغاط السعري (Squeeze Ratio)
     std_recent = close.tail(6).std()
     squeeze_ratio = (std_recent / spot) * 100.0
 
-    # تحديد الاتجاه التنبؤي
+‎    # تحديد الاتجاه التنبؤي
     direction = None
 
-    # أولوية 1: إشارة صيد السيولة (Sweep Reversal)
+‎    # أولوية 1: إشارة صيد السيولة (Sweep Reversal)
     if sweep_signal == "BULLISH_SWEEP":
         direction = "CALL"
     elif sweep_signal == "BEARISH_SWEEP":
         direction = "PUT"
-    # أولوية 2: توافق الجاما + الانضغاط + تدفق الأوامر
+‎    # أولوية 2: توافق الجاما + الانضغاط + تدفق الأوامر
     elif squeeze_ratio <= 0.18 and of_analytics["volume_velocity"] >= 1.25:
         if multi_tf_align == 1 or of_analytics["vwap_dist_pct"] > 0:
             direction = "CALL"
@@ -493,7 +555,7 @@ def analyze_symbol_institutional_setup(symbol):
     if not direction:
         return None
 
-    # 6. تقييم نسبة الثقة عبر محرك LightGBM
+‎    # 6. تقييم نسبة الثقة عبر محرك LightGBM
     features_dict = {
         "vwap_dist_pct": of_analytics["vwap_dist_pct"],
         "volume_velocity": of_analytics["volume_velocity"],
@@ -598,7 +660,7 @@ def find_high_conviction_option(symbol, direction, spot):
 
 
 # ================= ================= =================
-# تنسيق الرسائل مع التوقيع والعلامة الفنية
+‎# تنسيق الرسائل مع التوقيع والعلامة الفنية
 # ================= ================= =================
 
 def format_conviction_alert(opt, setup):
@@ -677,6 +739,7 @@ def format_eod_report():
         f"📉 *أدنى سعر لـ SPY اليوم:* `{low_spy:.2f}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📬 *عدد التوصيات المرسلة اليوم:* `{state['sent_count']} توصيات`\n"
+        f"🎯 *دقة التوقعات التراكمية:* {accuracy_summary()}\n"
         f"✅ *محرك التنبؤ:* مستقر وجاهز للجلسة القادمة.\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{SIGNATURE} — {APP_NAME}"
@@ -704,6 +767,7 @@ def get_premarket_forecast_all():
             confidence = int(min(95, max(75, 80 + (abs(latest_spy - ma20) / ma20) * 1000)))
             
             spy_data = {
+                "spot": latest_spy,
                 "spy_low": spy_low,
                 "spy_high": spy_high,
                 "spx_low": spx_low,
@@ -748,7 +812,7 @@ def get_premarket_forecast_all():
 
 
 # ================= ================= =================
-# تشغيل حلقات المسح والمراقبة
+‎# تشغيل حلقات المسح والمراقبة
 # ================= ================= =================
 
 def run_premarket():
@@ -761,6 +825,9 @@ def run_premarket():
         msg = format_premarket_report(spy_fc, comp_fc)
         if telegram_send(msg):
             mark_pm_sent()
+            if spy_fc and "عرضي" not in spy_fc["trend"]:
+                log_prediction("premarket", "SPY", "CALL" if "صاعد" in spy_fc["trend"] else "PUT",
+                               spy_fc["spot"], spy_fc["confidence"])
             log.info("تم إرسال تقرير ما قبل الافتتاح بنجاح.")
 
 
@@ -779,7 +846,7 @@ def run_rth():
         if not setup:
             continue
 
-        # فلترة التوافق بين الأصول مع مؤشر ناسداك
+‎        # فلترة التوافق بين الأصول مع مؤشر ناسداك
         if symbol != "QQQ":
             if setup["direction"] == "CALL" and qqq_bias == "BEARISH":
                 log.info("إلغاء صفقة CALL على %s بسبب سلبية سيولة ناسداك.", symbol)
@@ -793,6 +860,7 @@ def run_rth():
             msg = format_conviction_alert(opt, setup)
             if telegram_send(msg):
                 increment_alert_count()
+                log_prediction("alert", symbol, setup["direction"], setup["spot"], setup["confidence"])
                 log.info("تم إرسال توصية تنبؤية مؤسسية: %s %s عند سعر %.2f (ثقة %d%%)", symbol, setup["direction"], setup["spot"], setup["confidence"])
 
 
@@ -800,6 +868,7 @@ def run_post_market():
     state = daily_state_get()
     if state["eod_report_sent"]:
         return
+    evaluate_predictions()
     msg = format_eod_report()
     if telegram_send(msg):
         mark_eod_sent()
