@@ -23,7 +23,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-‎# استيراد مكتبة LightGBM للتعلم الآلي مع آلية احتياطية في حال عدم توفرها
 try:
     import lightgbm as lgb
     HAS_LGBM = True
