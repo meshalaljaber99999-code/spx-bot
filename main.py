@@ -1,909 +1,760 @@
 # -*- coding: utf-8 -*-
 """
-‎صَفاء التحليل v60.0 — Institutional Predictive Edition
-‎توصيات وإشارات تحليليّة تنبؤية استباقية تسبق السعر باستغلال:
-1. Order Flow Imbalance & Volume Velocity (تدفق الأوامر والامتصاص)
-2. Liquidity Sweeps & Stop Loss Hunts (صيد السيولة ومصايد صناع السوق)
-3. 0DTE Options Gamma Exposure (GEX & Gamma Squeeze Zones)
-4. LightGBM ML Multi-Factor Engine (نموذج التنبؤ الرقمي التوافقي)
-5. Multi-Timeframe Intermarket Confluence (التوافق اللحظي بين الأطر الزمنية)
-
-‎تطوير وتنفيذ: تصميم أبو سحاب
+صَفاء التحليل SPX — نسخة المصادر المجانية v1
+تصميم أبو سحاب
+تحليل احتمالي فقط — لا تنفيذ تلقائي — Fail Closed
 """
-
-import os
-import time
-import logging
-import sqlite3
+import os, re, json, gzip, math, time, sqlite3, logging
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
-try:
-    import lightgbm as lgb
-    HAS_LGBM = True
-except ImportError:
-    HAS_LGBM = False
-
-# ================= ================= =================
-‎# الإعدادات الأساسية والهوية
-# ================= ================= =================
-
-APP_NAME = "صَفاء التحليل"
-APP_NAME_ASCII = "SafaaAnalysis"
-VERSION = "v60.1-PREDICTIVE-INSTITUTIONAL"
-SIGNATURE = "⚡ تصميم أبو سحاب"
-
+# ============================ الإعدادات ============================
 NY = ZoneInfo("America/New_York")
-UTC = timezone.utc
 
-ALPACA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
-ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
-TRADING_URL = os.getenv("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-STOCK_FEED = os.getenv("ALPACA_STOCK_FEED", "iex").strip()
-OPTIONS_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative").strip().lower()
 
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DB_PATH = os.getenv("DB_PATH", "./data/safaa_v60.db")
-MODEL_PATH = os.getenv("MODEL_PATH", "./models/safaa_lgbm_v60.txt")
+def env(k, d=""):
+    return os.getenv(k, d).strip()
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
-MIN_MOVE_POINTS = float(os.getenv("MIN_MOVE_POINTS", "2.5"))
-MAX_ALERTS_PER_DAY = int(os.getenv("MAX_ALERTS_PER_DAY", "20"))
-MIN_CONFIDENCE_THRESHOLD = int(os.getenv("MIN_CONFIDENCE_THRESHOLD", "84"))
 
-SCAN_STOCKS = [s.strip().upper() for s in os.getenv(
-    "SCAN_STOCKS", "NVDA,AAPL,TSLA,META,AMZN,AMD,QQQ,SPY,DIA"
-).split(",") if s.strip()]
-
-session = requests.Session()
-session.headers.update({"User-Agent": f"{APP_NAME_ASCII}/{VERSION}"})
+ALPACA_KEY = env("APCA_API_KEY_ID")
+ALPACA_SECRET = env("APCA_API_SECRET_KEY")
+DATA_URL = env("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+STOCK_FEED = env("ALPACA_STOCK_FEED", "iex")
+FRED_KEY = env("FRED_API_KEY")
+TG_TOKEN = env("TELEGRAM_BOT_TOKEN")
+TG_CHAT = env("TELEGRAM_CHAT_ID")
+DB_PATH = env("DB_PATH", "./data/safaa_spx.db")
+MAX_STALE_MIN = int(env("MAX_STALE_MIN", "35"))      # البيانات المجانية متأخرة ~15 دقيقة
+UPDATE_MINUTES = int(env("UPDATE_MINUTES", "60"))
+_DEF_W = "NVDA:7.5,AAPL:6.5,MSFT:6.5,AMZN:4,GOOGL:4,META:3,AVGO:2.5,TSLA:2,JPM:1.5,LLY:1.3"
+LEADER_W = {k.strip().upper(): float(v) for k, v in
+            (p.split(":") for p in env("LEADER_WEIGHTS", _DEF_W).split(",") if ":" in p)}
+LEADERS = list(LEADER_W.keys())
+SECTORS = env("SECTORS", "XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLU").split(",")
+SIGNATURE = "⚡ تصميم أبو سحاب"
+CRITICAL = ["SPX", "ES", "VIX", "CHAIN"]   # تعطل أي منها = توقف الإصدار
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("safaa_v60")
+log = logging.getLogger("safaa_spx")
+
+
+class SourceError(Exception):
+    pass
 
 
 def now_ny():
     return datetime.now(NY)
 
 
-def alpaca_headers():
-    return {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-        "Accept": "application/json",
-    }
+def is_rth(now):
+    m = now.hour * 60 + now.minute
+    return now.weekday() < 5 and 570 <= m < 960
 
 
-def ensure_db():
+def n0(v):
+    return "—" if v is None else f"{v:,.0f}"
+
+
+# ============================ التخزين ============================
+def init_db():
     folder = os.path.dirname(DB_PATH)
     if folder:
         os.makedirs(folder, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS daily_state (
-                day TEXT PRIMARY KEY,
-                sent_count INTEGER NOT NULL DEFAULT 0,
-                pm_report_sent INTEGER NOT NULL DEFAULT 0,
-                eod_report_sent INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS predictions_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                symbol TEXT,
-                direction TEXT,
-                spot_price REAL,
-                confidence INTEGER,
-                sweep_detected INTEGER,
-                volume_velocity REAL,
-                gamma_status TEXT
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS predictions_eval (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                day TEXT, timestamp TEXT, kind TEXT, symbol TEXT, direction TEXT,
-                spot_price REAL, confidence INTEGER,
-                close_price REAL, move_pct REAL, result TEXT
-            )
-        """)
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT,
+            anchor REAL, hi REAL, lo REAL, hi_near REAL, hi_far REAL, lo_near REAL, lo_far REAL,
+            p_up REAL, p_down REAL, p_neutral REAL, score REAL,
+            data_quality REAL, agreement REAL, payload TEXT)""")
+        c.execute("CREATE TABLE IF NOT EXISTS realized (day TEXT PRIMARY KEY, high REAL, low REAL, close REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS data_quality (ts TEXT, source TEXT, ok INTEGER, detail TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS gex_levels (
+            ts TEXT, spot REAL, flip REAL, call_wall REAL, put_wall REAL, net_gex REAL, regime TEXT)""")
+        c.execute("CREATE TABLE IF NOT EXISTS options_snapshots (ts TEXT, blob BLOB)")
 
 
-def daily_state_get():
-    today = now_ny().date().isoformat()
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute("SELECT sent_count, pm_report_sent, eod_report_sent FROM daily_state WHERE day=?", (today,)).fetchone()
-        if row:
-            return {"sent_count": int(row[0]), "pm_report_sent": bool(row[1]), "eod_report_sent": bool(row[2])}
-        return {"sent_count": 0, "pm_report_sent": False, "eod_report_sent": False}
+def kv_get(k):
+    with sqlite3.connect(DB_PATH) as c:
+        r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return r[0] if r else None
 
 
-def increment_alert_count():
-    today = now_ny().date().isoformat()
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO daily_state(day, sent_count, pm_report_sent, eod_report_sent) VALUES (?, 1, 0, 0)
-            ON CONFLICT(day) DO UPDATE SET sent_count=sent_count+1
-        """, (today,))
+def kv_set(k, v):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
 
 
-def mark_pm_sent():
-    today = now_ny().date().isoformat()
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO daily_state(day, sent_count, pm_report_sent, eod_report_sent) VALUES (?, 0, 1, 0)
-            ON CONFLICT(day) DO UPDATE SET pm_report_sent=1
-        """, (today,))
+def save_quality(now, q):
+    with sqlite3.connect(DB_PATH) as c:
+        c.executemany("INSERT INTO data_quality VALUES (?,?,?,?)",
+                      [(now.isoformat(timespec="seconds"), n, int(ok), msg) for n, (ok, msg) in q.items()])
 
 
-def mark_eod_sent():
-    today = now_ny().date().isoformat()
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO daily_state(day, sent_count, pm_report_sent, eod_report_sent) VALUES (?, 0, 0, 1)
-            ON CONFLICT(day) DO UPDATE SET eod_report_sent=1
-        """, (today,))
+def save_prediction(now, kind, fc):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""INSERT INTO predictions (ts,day,kind,anchor,hi,lo,hi_near,hi_far,lo_near,lo_far,
+                     p_up,p_down,p_neutral,score,data_quality,agreement,payload)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (now.isoformat(timespec="seconds"), now.date().isoformat(), kind, fc["anchor"], fc["hi"], fc["lo"],
+                   fc["hi_near"], fc["hi_far"], fc["lo_near"], fc["lo_far"],
+                   fc["probs"]["up"], fc["probs"]["down"], fc["probs"]["neutral"], fc["score"],
+                   fc["data_quality"], fc["agreement"], json.dumps(fc, default=float, ensure_ascii=False)))
+        g = fc["gex"]
+        c.execute("INSERT INTO gex_levels VALUES (?,?,?,?,?,?,?)",
+                  (now.isoformat(timespec="seconds"), g["spot"], g["flip"], g["call_wall"], g["put_wall"],
+                   g["net"], g["regime"]))
 
 
-def log_prediction(kind, symbol, direction, spot, confidence):
-‎    """يسجل كل توقع (CALL = صعود، PUT = هبوط) ليُقيَّم آخر اليوم."""
+def save_snapshot(now, chain):
+    """لقطة مضغوطة للسلسلة — هذه بيانات التدريب المستقبلية (لا يوجد تاريخ خيارات مجاني)."""
     try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.execute(
-                "INSERT INTO predictions_eval(day, timestamp, kind, symbol, direction, spot_price, confidence) VALUES (?,?,?,?,?,?,?)",
-                (now_ny().date().isoformat(), now_ny().isoformat(timespec="seconds"),
-                 kind, symbol, direction, float(spot), int(confidence)))
-    except Exception as exc:
-        log.warning("تعذر تسجيل التوقع: %s", exc)
+        df = chain["df"]
+        spot = chain["spot"]
+        today = now.date()
+        x = df[(df.exp >= today) & (df.exp <= today + timedelta(days=7)) &
+               (df.strike.between(spot * 0.94, spot * 1.06))].copy()
+        x["exp"] = x["exp"].astype(str)
+        blob = gzip.compress(x.to_json(orient="records").encode())
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("INSERT INTO options_snapshots VALUES (?,?)", (now.isoformat(timespec="seconds"), blob))
+    except Exception as e:
+        log.warning("تعذر حفظ اللقطة: %s", e)
 
 
-def rth_close(symbol):
-‎    """آخر إغلاق دقيقة ضمن جلسة اليوم (حتى 16:00 نيويورك)."""
-    df = get_stock_bars(symbol, timeframe="1Min", limit=1000)
-    if df.empty:
-        return None
-    ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(NY)
-    mask = (ts.dt.date == now_ny().date()) & ((ts.dt.hour * 60 + ts.dt.minute) <= 16 * 60)
-    return float(df.loc[mask, "close"].iloc[-1]) if mask.any() else None
-
-
-def evaluate_predictions():
-‎    """يقارن توقعات اليوم بالإغلاق الفعلي: HIT لو تحرك السعر باتجاه التوقع من لحظة التوصية حتى الإغلاق."""
-    today = now_ny().date().isoformat()
-    with sqlite3.connect(DB_PATH) as con:
-        rows = con.execute(
-            "SELECT id, symbol, direction, spot_price FROM predictions_eval WHERE day=? AND result IS NULL",
-            (today,)).fetchall()
-        cache = {}
-        for pid, sym, direction, spot in rows:
-            if sym not in cache:
-                cache[sym] = rth_close(sym)
-            close = cache[sym]
-            if not close or not spot:
-                continue
-            move = (close - spot) / spot * 100.0
-            hit = (move > 0) if direction == "CALL" else (move < 0)
-            con.execute("UPDATE predictions_eval SET close_price=?, move_pct=?, result=? WHERE id=?",
-                        (close, move, "HIT" if hit else "MISS", pid))
-
-
-def accuracy_summary():
-    with sqlite3.connect(DB_PATH) as con:
-        rows = con.execute(
-            "SELECT kind, COUNT(*), SUM(result='HIT') FROM predictions_eval WHERE result IS NOT NULL GROUP BY kind"
-        ).fetchall()
-    if not rows:
-        return "لا توجد بيانات كافية بعد"
-    names = {"alert": "توصيات الأسهم", "premarket": "اتجاه SPY الصباحي"}
-    return " | ".join(f"{names.get(k, k)}: {int(h or 0)}/{n} ({(h or 0) / n * 100:.0f}%)" for k, n, h in rows)
-
-
-def telegram_send(message):
+# ============================ التيليجرام ============================
+def tg(text):
     if not TG_TOKEN or not TG_CHAT:
-        log.warning("بيانات التليجرام غير مكتملة.")
+        log.warning("بيانات التيليجرام غير مكتملة")
         return False
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        r = session.post(url, json={
-            "chat_id": TG_CHAT,
-            "text": message,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        }, timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text[:4000], "disable_web_page_preview": True}, timeout=15)
         return r.status_code == 200
-    except Exception as exc:
-        log.error("خطأ في إرسال التليجرام: %s", exc)
+    except Exception as e:
+        log.error("خطأ تيليجرام: %s", e)
         return False
 
 
-def market_phase():
+# ============================ طبقة جمع البيانات ============================
+def yf_hist(sym, period, interval):
+    try:
+        df = yf.Ticker(sym).history(period=period, interval=interval,
+                                    prepost=(interval != "1d"), auto_adjust=False)
+    except Exception as e:
+        raise SourceError(f"{sym}: {str(e)[:80]}")
+    if df is None or df.empty:
+        raise SourceError(f"{sym}: لا توجد بيانات")
+    df = df.dropna(subset=["Close"]).copy()
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    df.index = idx.tz_convert(NY)
+    return df
+
+
+def age_min(df):
+    return (now_ny() - df.index[-1].to_pydatetime()).total_seconds() / 60.0
+
+
+def daily_completed(sym, today):
+    df = yf_hist(sym, "3mo", "1d")
+    df = df[df.index.date < today]
+    if len(df) < 15:
+        raise SourceError(f"{sym}: تاريخ يومي غير كافٍ")
+    return df
+
+
+def session_close(df, day):
+    m = df.index.hour * 60 + df.index.minute
+    d = df[(df.index.date == day) & (m < 960)]
+    return float(d["Close"].iloc[-1]) if not d.empty else None
+
+
+def get_spx(now):
+    today = now.date()
+    dd = daily_completed("^GSPC", today)
+    tr = pd.concat([dd.High - dd.Low, (dd.High - dd.Close.shift()).abs(),
+                    (dd.Low - dd.Close.shift()).abs()], axis=1).max(axis=1)
+    prev = float(dd.Close.iloc[-1])
+    out = dict(prev_close=prev, atr=float(tr.tail(14).mean()), spot=prev,
+               day_high=None, day_low=None, closes=None)
+    if is_rth(now):
+        df = yf_hist("^GSPC", "5d", "5m")
+        a = age_min(df)
+        t = df[df.index.date == today]
+        if t.empty or a > MAX_STALE_MIN:
+            raise SourceError(f"SPX متأخر {a:.0f} دقيقة")
+        out.update(spot=float(t.Close.iloc[-1]), day_high=float(t.High.max()),
+                   day_low=float(t.Low.min()), closes=df.Close.tail(60))
+    return out
+
+
+def get_future(sym, now):
+    df = yf_hist(sym, "5d", "5m")
+    a = age_min(df)
+    if a > MAX_STALE_MIN:
+        raise SourceError(f"{sym} متأخر {a:.0f} دقيقة")
+    today = now.date()
+    days = sorted({d for d in df.index.date if d < today})
+    if not days:
+        raise SourceError(f"{sym}: لا يوجد إغلاق سابق")
+    pdv = days[-1]
+    pc = session_close(df, pdv)
+    if not pc:
+        raise SourceError(f"{sym}: تعذر تحديد الإغلاق السابق")
+    last = float(df.Close.iloc[-1])
+    cut = datetime.combine(pdv, dtime(16, 0), tzinfo=NY)
+    on = df[df.index > cut]
+    return dict(last=last, prev_close=pc, ret_pct=(last / pc - 1) * 100,
+                on_high=float(on.High.max()), on_low=float(on.Low.min()), closes=df.Close.tail(60))
+
+
+def get_vix(now):
+    today = now.date()
+    dd = daily_completed("^VIX", today)
+    prev = float(dd.Close.iloc[-1])
+    vix = prev
+    rth = is_rth(now)
+    if rth:
+        df = yf_hist("^VIX", "5d", "5m")
+        if age_min(df) > MAX_STALE_MIN:
+            raise SourceError("VIX متأخر")
+        vix = float(df.Close.iloc[-1])
+    v9 = None
+    try:
+        d9 = daily_completed("^VIX9D", today)
+        v9 = float(d9.Close.iloc[-1])
+        if rth:
+            v9 = float(yf_hist("^VIX9D", "5d", "5m").Close.iloc[-1])
+    except SourceError:
+        pass
+    return dict(vix=vix, prev=prev, chg_pct=(vix / prev - 1) * 100, vix9d=v9)
+
+
+# ---- خيارات SPX من ملفات Cboe المتأخرة (مجانية، رابط غير رسمي) ----
+CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json"
+OPT_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+
+
+def gex_levels(spot, df, today, max_dte=7, band=0.06):
+    x = df.copy()
+    x["dte"] = x["exp"].map(lambda e: (e - today).days)
+    z = x[x.dte == 0]
+    z_ratio = float(z[z.cp == "C"].vol.sum() / max(1.0, z[z.cp == "P"].vol.sum())) if not z.empty else None
+    x = x[(x.dte >= 0) & (x.dte <= max_dte) & (x.strike.between(spot * (1 - band), spot * (1 + band)))
+          & (x.gamma > 0) & (x.oi > 0)].copy()
+    if x.empty:
+        raise SourceError("GEX: لا توجد عقود صالحة")
+    sign = np.where(x.cp == "C", 1.0, -1.0)
+    x["gex"] = x.gamma * x.oi * 100 * spot * spot * 0.01 * sign   # دولار لكل 1% حركة
+    by = x.groupby("strike").gex.sum().sort_index()
+    calls = x[x.cp == "C"].groupby("strike").gex.sum()
+    puts = x[x.cp == "P"].groupby("strike").gex.sum()
+    above = calls[calls.index >= spot]
+    below = puts[puts.index <= spot]
+    call_wall = float(above.idxmax()) if not above.empty else None
+    put_wall = float(below.idxmin()) if not below.empty else None
+    cum = by.cumsum()
+    s = np.sign(cum.values)
+    cross = [i for i in range(1, len(s)) if s[i] != s[i - 1] and s[i] != 0]
+    flip = float(cum.index[min(cross, key=lambda i: abs(cum.index[i] - spot))]) if cross else None
+    net = float(by.sum())
+    regime = ("POSITIVE" if spot > flip else "NEGATIVE") if flip else ("POSITIVE" if net > 0 else "NEGATIVE")
+    tot = x.gex.abs().sum()
+    z_share = float(x[x.dte == 0].gex.abs().sum() / tot) if tot > 0 else 0.0
+    return dict(spot=float(spot), flip=flip, call_wall=call_wall, put_wall=put_wall, net=net,
+                regime=regime, zero_dte_share=z_share, zero_dte_cp_vol=z_ratio)
+
+
+def get_chain(now):
+    try:
+        r = requests.get(CBOE_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+    except Exception as e:
+        raise SourceError(f"Cboe: {str(e)[:80]}")
+    if r.status_code != 200:
+        raise SourceError(f"Cboe HTTP {r.status_code}")
+    j = r.json().get("data", {})
+    spot = float(j.get("current_price") or 0)
+    rows = []
+    for o in j.get("options", []):
+        m = OPT_RE.match(o.get("option", ""))
+        if not m:
+            continue
+        root, ymd, cp, k = m.groups()
+        rows.append(dict(root=root, exp=datetime.strptime(ymd, "%y%m%d").date(), cp=cp, strike=int(k) / 1000.0,
+                         oi=float(o.get("open_interest") or 0), vol=float(o.get("volume") or 0),
+                         gamma=float(o.get("gamma") or 0), delta=float(o.get("delta") or 0),
+                         iv=float(o.get("iv") or 0)))
+    if not rows or spot <= 0:
+        raise SourceError("Cboe: بيانات فارغة")
+    df = pd.DataFrame(rows)
+    return dict(spot=spot, df=df, gex=gex_levels(spot, df, now.date()))
+
+
+# ---- Alpaca المجاني (IEX) ----
+def ah():
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        raise SourceError("مفاتيح Alpaca غير مضبوطة")
+    return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+
+
+def get_breadth(now):
+    if not is_rth(now):
+        raise SourceError("غير مؤكد قبل الافتتاح")
+    r = requests.get(f"{DATA_URL}/v2/stocks/snapshots", headers=ah(),
+                     params={"symbols": ",".join(LEADERS + SECTORS), "feed": STOCK_FEED}, timeout=15)
+    if r.status_code != 200:
+        raise SourceError(f"Alpaca HTTP {r.status_code}")
+    j = r.json()
+    j = j.get("snapshots", j)
+
+    def rets(names):
+        out = []
+        for s in names:
+            sn = j.get(s) or {}
+            p = (sn.get("latestTrade") or {}).get("p")
+            pc = (sn.get("prevDailyBar") or {}).get("c")
+            if p and pc:
+                out.append((p / pc - 1) * 100)
+        return out
+
+    L, S = rets(LEADERS), rets(SECTORS)
+    if len(L) < 5:
+        raise SourceError("بيانات القياديات غير كافية")
+    return dict(leaders_up=sum(v > 0 for v in L) / len(L), leaders_avg=float(np.mean(L)),
+                sectors_up=(sum(v > 0 for v in S) / len(S)) if S else None)
+
+
+def get_spy_vwap(now):
+    if not is_rth(now):
+        raise SourceError("خارج الجلسة")
+    s = datetime.combine(now.date(), dtime(9, 30), tzinfo=NY).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get(f"{DATA_URL}/v2/stocks/SPY/bars", headers=ah(),
+                     params={"timeframe": "1Min", "start": s, "limit": 1000, "feed": STOCK_FEED}, timeout=15)
+    bars = (r.json().get("bars") or []) if r.status_code == 200 else []
+    if len(bars) < 10:
+        raise SourceError("VWAP: شموع غير كافية")
+    df = pd.DataFrame(bars)
+    vwap = (((df.h + df.l + df.c) / 3) * df.v).sum() / df.v.sum()
+    return dict(dist_pct=float((df.c.iloc[-1] / vwap - 1) * 100))
+
+
+def fred_last(series):
+    if not FRED_KEY:
+        raise SourceError("FRED_API_KEY غير مضبوط")
+    r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                     params=dict(series_id=series, api_key=FRED_KEY, file_type="json",
+                                 sort_order="desc", limit=6), timeout=15)
+    obs = [o for o in r.json().get("observations", []) if o.get("value") not in (".", "", None)]
+    if len(obs) < 2:
+        raise SourceError(f"FRED {series}: بيانات غير كافية")
+    return float(obs[0]["value"]), float(obs[1]["value"])
+
+
+def get_macro(now):
+    out = {}
+    try:
+        y10, y10p = fred_last("DGS10")
+        out.update(y10=y10, y10_bps=(y10 - y10p) * 100)
+    except Exception:
+        pass
+    try:
+        dx = yf_hist("DX-Y.NYB", "10d", "1d")
+        out.update(dxy=float(dx.Close.iloc[-1]), dxy_chg=(float(dx.Close.iloc[-1] / dx.Close.iloc[-2]) - 1) * 100)
+    except Exception:
+        pass
+    if not out:
+        raise SourceError("لا توجد بيانات ماكرو")
+    return out
+
+
+def get_news(now):
+    r = requests.get(f"{DATA_URL}/v1beta1/news", headers=ah(), params={"symbols": "SPY", "limit": 3}, timeout=15)
+    if r.status_code != 200:
+        raise SourceError(f"News HTTP {r.status_code}")
+    return [n.get("headline", "")[:110] for n in r.json().get("news", [])]
+
+
+def get_leaders(now):
+    """الشركات الكبرى موزونة، وتعمل قبل الافتتاح وأثناء الجلسة (Yahoo، متأخر)."""
+    syms = list(LEADER_W)
+    try:
+        raw = yf.download(syms, period="5d", interval="5m", prepost=True, group_by="ticker",
+                          progress=False, auto_adjust=False, threads=True)
+    except Exception as e:
+        raise SourceError(f"القياديات: {str(e)[:80]}")
+    if raw is None or raw.empty:
+        raise SourceError("القياديات: لا بيانات")
+    today = now.date()
+    items = []
+    for s in syms:
+        try:
+            sub = raw[s].dropna(subset=["Close"]).copy()
+        except KeyError:
+            continue
+        if sub.empty:
+            continue
+        idx = sub.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        sub.index = idx.tz_convert(NY)
+        if age_min(sub) > 90:
+            continue
+        days = sorted({dd for dd in sub.index.date if dd < today})
+        if not days:
+            continue
+        pc = session_close(sub, days[-1])
+        if not pc:
+            continue
+        items.append(dict(sym=s, ret=(float(sub.Close.iloc[-1]) / pc - 1) * 100, w=LEADER_W[s]))
+    if len(items) < 5:
+        raise SourceError("القياديات: بيانات غير كافية")
+    tw = sum(i["w"] for i in items)
+    return dict(items=items,
+                wavg=sum(i["ret"] * i["w"] for i in items) / tw,
+                wup=sum(i["w"] for i in items if i["ret"] > 0) / tw,
+                top=sorted(items, key=lambda i: -i["w"])[:5])
+
+
+def get_nasdaq(now):
+    """مؤشر ناسداك 100 (^NDX) — حي أثناء الجلسة فقط، وقبل الافتتاح نستخدم NQ."""
+    today = now.date()
+    dd = daily_completed("^NDX", today)
+    prev = float(dd.Close.iloc[-1])
+    last = prev
+    live = is_rth(now)
+    if live:
+        df = yf_hist("^NDX", "5d", "5m")
+        if age_min(df) > MAX_STALE_MIN:
+            raise SourceError("NDX متأخر")
+        last = float(df.Close.iloc[-1])
+    return dict(last=last, prev=prev, ret_pct=(last / prev - 1) * 100, live=live)
+
+
+SOURCES = [
+    ("SPX", get_spx), ("ES", lambda n: get_future("ES=F", n)), ("NQ", lambda n: get_future("NQ=F", n)),
+    ("VIX", get_vix), ("CHAIN", get_chain), ("LEADERS", get_leaders), ("NASDAQ", get_nasdaq),
+    ("BREADTH", get_breadth), ("VWAP", get_spy_vwap), ("MACRO", get_macro), ("NEWS", get_news),
+]
+
+
+# ============================ طبقة التحقق ============================
+def collect(now):
+    d, q = {}, {}
+    for name, fn in SOURCES:
+        try:
+            d[name] = fn(now)
+            q[name] = (True, "")
+        except Exception as e:
+            d[name] = None
+            q[name] = (False, str(e)[:120])
+    # فحص تطابق Cboe مع SPX: يكشف البيانات القديمة
+    if q["CHAIN"][0] and q["SPX"][0]:
+        ref = d["SPX"]["spot"] if is_rth(now) else d["SPX"]["prev_close"]
+        if abs(d["CHAIN"]["spot"] / ref - 1) > 0.008:
+            q["CHAIN"] = (False, f"Cboe {d['CHAIN']['spot']:.0f} لا يطابق SPX {ref:.0f} (بيانات قديمة؟)")
+            d["CHAIN"] = None
+    return d, q
+
+
+# ============================ الدمج والتوقع ============================
+def lab(v, thr, up, down, flat):
+    return up if v > thr else (down if v < -thr else flat)
+
+
+def build_forecast(d, now):
+    spx, es, vix, ch = d["SPX"], d["ES"], d["VIX"], d["CHAIN"]
+    nq, br, vw, mc = d.get("NQ"), d.get("BREADTH"), d.get("VWAP"), d.get("MACRO")
+    ld, nd = d.get("LEADERS"), d.get("NASDAQ")
+    gex = ch["gex"]
+    rth = is_rth(now)
+    anchor = spx["spot"] if rth else spx["prev_close"] * es["last"] / es["prev_close"]
+
+    comps = {}
+    f, w = [math.tanh(es["ret_pct"] / 0.5)], [0.7]
+    if nq:
+        f.append(math.tanh(nq["ret_pct"] / 0.7))
+        w.append(0.3)
+    comps["futures"] = (float(np.average(f, weights=w)), 0.27)
+    comps["vix"] = (-math.tanh(vix["chg_pct"] / 6.0), 0.13)
+    g = 0.0
+    if gex["call_wall"] and 0 <= (gex["call_wall"] - anchor) / anchor < 0.0015:
+        g -= 0.4
+    if gex["put_wall"] and 0 <= (anchor - gex["put_wall"]) / anchor < 0.0015:
+        g += 0.4
+    comps["gex"] = (g, 0.13)
+    cl = spx["closes"] if rth and spx["closes"] is not None else es["closes"]
+    e5, e13 = cl.ewm(span=5, adjust=False).mean().iloc[-1], cl.ewm(span=13, adjust=False).mean().iloc[-1]
+    tech = math.tanh((e5 - e13) / cl.iloc[-1] * 1500)
+    if vw:
+        tech = 0.7 * tech + 0.3 * math.tanh(vw["dist_pct"] / 0.15)
+    comps["technical"] = (tech, 0.12)
+    if ld:
+        comps["leaders"] = (0.5 * math.tanh(ld["wavg"] / 0.5) + 0.5 * math.tanh((ld["wup"] - 0.5) * 4), 0.15)
+    if br and br.get("sectors_up") is not None:
+        comps["breadth"] = (math.tanh((br["sectors_up"] - 0.5) * 4), 0.05)
+    if mc:
+        parts = []
+        if "dxy_chg" in mc:
+            parts.append(-math.tanh(mc["dxy_chg"] / 0.4))
+        if "y10_bps" in mc:
+            parts.append(-math.tanh(mc["y10_bps"] / 6.0))
+        if parts:
+            comps["macro"] = (float(np.mean(parts)), 0.08)
+
+    # ناسداك: أثناء الجلسة NDX الفعلي، وقبل الافتتاح الفرق بين NQ وES
+    rel, rel_src = None, ""
+    if nd and nd["live"]:
+        spx_ret = (spx["spot"] / spx["prev_close"] - 1) * 100
+        rel, rel_src = nd["ret_pct"] - spx_ret, "NDX"
+        comps["nasdaq"] = (math.tanh(nd["ret_pct"] / 0.7), 0.07)
+    elif nq:
+        rel, rel_src = nq["ret_pct"] - es["ret_pct"], "NQ"
+
+    tw = sum(wt for _, wt in comps.values())
+    S = sum(sc * wt for sc, wt in comps.values()) / tw
+    quality = tw
+    sig_n = [sc for sc, _ in comps.values() if abs(sc) > 0.1]
+    agreement = (sum(1 for sc in sig_n if np.sign(sc) == np.sign(S)) / len(sig_n)) if sig_n else 0.0
+    conflicts = sum(1 for sc, _ in comps.values() if abs(sc) > 0.15 and np.sign(sc) != np.sign(S))
+    near_wall = (gex["call_wall"] and S > 0 and 0 <= (gex["call_wall"] - anchor) / anchor < 0.002) or \
+                (gex["put_wall"] and S < 0 and 0 <= (anchor - gex["put_wall"]) / anchor < 0.002)
+    rev_score = conflicts + (1 if near_wall else 0)
+    reversal = "مرتفع" if rev_score >= 3 else ("متوسط" if rev_score >= 1 else "منخفض")
+
+    neutral = 0.4 * math.exp(-(S / 0.2) ** 2)
+    sg = 1 / (1 + math.exp(-4 * S))
+    probs = dict(up=(1 - neutral) * sg, down=(1 - neutral) * (1 - sg), neutral=neutral)
+    label = max(probs, key=probs.get)
+
+    iv = vix["vix"] if not vix["vix9d"] else 0.5 * vix["vix"] + 0.5 * vix["vix9d"]
+    sig_day = 0.6 * (anchor * iv / 100 / math.sqrt(252)) + 0.4 * (spx["atr"] / 1.596)
+    sig_day *= 0.9 if gex["regime"] == "POSITIVE" else 1.12
+    m = now.hour * 60 + now.minute
+    frac = 1.0 if m < 570 else max(0.05, (960 - m) / 390.0)
+    sig = sig_day * math.sqrt(frac)
+    c = anchor + S * 0.15 * sig
+    hi, lo = c + 0.798 * sig, c - 0.798 * sig
+    hi_near, hi_far = c + 0.126 * sig, c + 1.645 * sig
+    lo_near, lo_far = c - 0.126 * sig, c - 1.645 * sig
+    if rth:
+        dh, dl = spx["day_high"], spx["day_low"]
+        hi, hi_near, hi_far = max(hi, dh), max(hi_near, dh), max(hi_far, dh)
+        lo, lo_near, lo_far = min(lo, dl), min(lo_near, dl), min(lo_far, dl)
+
+    L = [f"ES: {lab(es['ret_pct'], 0.15, 'داعم للصعود', 'داعم للهبوط', 'محايد')} ({es['ret_pct']:+.2f}%)"]
+    L.append(f"NQ: {lab(nq['ret_pct'], 0.2, 'داعم للصعود', 'داعم للهبوط', 'محايد')} ({nq['ret_pct']:+.2f}%)"
+             if nq else "NQ: غير متاح")
+    if rel is not None:
+        tag = lab(rel, 0.15, "قيادة تقنية", "تأخر تقنية", "متوافق مع SPX")
+        base = f"NDX {nd['ret_pct']:+.2f}% | " if rel_src == "NDX" else ""
+        L.append(f"ناسداك: {base}الفرق عن SPX {rel:+.2f}% ({tag})")
+    v9 = f" | VIX9D {vix['vix9d']:.1f}" if vix["vix9d"] else ""
+    L.append(f"VIX: {vix['vix']:.1f} ({vix['chg_pct']:+.1f}%) "
+             f"{lab(vix['chg_pct'], 3, 'ارتفاع التقلب', 'انخفاض التقلب', 'مستقر')}{v9}")
+    L.append(f"GEX: جاما {'إيجابية' if gex['regime']=='POSITIVE' else 'سلبية'} | Flip {n0(gex['flip'])} | "
+             f"مقاومة {n0(gex['call_wall'])} | دعم {n0(gex['put_wall'])}")
+    zr = gex["zero_dte_cp_vol"]
+    L.append(f"0DTE: {gex['zero_dte_share']*100:.0f}% من الجاما" + (f" | حجم Call/Put {zr:.2f}" if zr else ""))
+    if ld:
+        L.append(f"الشركات الكبرى (موزونة): {ld['wavg']:+.2f}% | {ld['wup']*100:.0f}% من الوزن صاعد")
+        L.append("الأكبر وزناً: " + " | ".join(f"{i['sym']} {i['ret']:+.1f}%" for i in ld["top"]))
+    else:
+        L.append("الشركات الكبرى: غير متاح")
+    if br and br.get("sectors_up") is not None:
+        L.append(f"Breadth (قطاعات): {br['sectors_up']*100:.0f}% صاعدة")
+    else:
+        L.append("Breadth (قطاعات): " + ("غير مؤكد قبل الافتتاح" if not rth else "غير متاح"))
+    if mc:
+        bits = []
+        if "y10" in mc:
+            bits.append(f"10Y {mc['y10']:.2f}% ({mc.get('y10_bps', 0):+.0f}bp)")
+        if "dxy" in mc:
+            bits.append(f"DXY {mc['dxy']:.1f} ({mc['dxy_chg']:+.2f}%)")
+        L.append("Macro: " + " | ".join(bits))
+    if d.get("NEWS"):
+        L.append("أخبار: " + d["NEWS"][0])
+
+    levels = dict(r1=gex["call_wall"] if gex["call_wall"] and gex["call_wall"] > anchor else None, r2=hi_far,
+                  s1=gex["put_wall"] if gex["put_wall"] and gex["put_wall"] < anchor else None, s2=lo_far)
+    return dict(anchor=anchor, spot=spx["spot"], hi=hi, lo=lo, hi_near=hi_near, hi_far=hi_far,
+                lo_near=lo_near, lo_far=lo_far, probs=probs, label=label, score=S, reversal=reversal,
+                data_quality=quality, agreement=agreement, gex=gex_public(gex), lines=L, levels=levels,
+                comps={k: round(v[0], 3) for k, v in comps.items()})
+
+
+def gex_public(g):
+    return {k: g[k] for k in ("spot", "flip", "call_wall", "put_wall", "net", "regime")}
+
+
+# ============================ التقارير ============================
+def format_report(fc, title):
+    p, lv = fc["probs"], fc["levels"]
+    out = ["💎 صَفاء التحليل", title, f"📅 {now_ny():%Y-%m-%d %H:%M} (نيويورك)", "━━━━━━━━━━━━",
+           "القمة المتوقعة", n0(fc["hi"]), "القاع المتوقع", n0(fc["lo"]),
+           f"نطاق القمة (80%): {n0(fc['hi_near'])} – {n0(fc['hi_far'])}",
+           f"نطاق القاع (80%): {n0(fc['lo_far'])} – {n0(fc['lo_near'])}",
+           "━━━━━━━━━━━━", "تحليل الأسواق"] + fc["lines"] + [
+           "━━━━━━━━━━━━", "توقعات النموذج (تقديرية، غير معايَرة بعد)",
+           f"الصعود {p['up']*100:.0f}%", f"الهبوط {p['down']*100:.0f}%", f"العرضي {p['neutral']*100:.0f}%",
+           f"خطر الانعكاس: {fc['reversal']}",
+           f"جودة البيانات: {fc['data_quality']*100:.0f}% | اتفاق الإشارات: {fc['agreement']*100:.0f}%",
+           "━━━━━━━━━━━━", "مستويات المراقبة",
+           f"المقاومة الأولى: {n0(lv['r1'])}", f"المقاومة الثانية: {n0(lv['r2'])}",
+           f"الدعم الأول: {n0(lv['s1'])}", f"الدعم الثاني: {n0(lv['s2'])}",
+           "━━━━━━━━━━━━", "بيانات مجانية متأخرة ~15 دقيقة",
+           "تحليل احتمالي — لا يوجد ضمان للربح", SIGNATURE]
+    return "\n".join(out)
+
+
+def format_close_risk(fc):
+    g = fc["gex"]
+    return "\n".join(["🔔 مخاطر الإغلاق (15:45 نيويورك)", f"جاما: {'إيجابية' if g['regime']=='POSITIVE' else 'سلبية'}",
+                      f"Flip {n0(g['flip'])} | مقاومة {n0(g['call_wall'])} | دعم {n0(g['put_wall'])}",
+                      f"السعر {n0(fc['spot'])} | خطر الانعكاس: {fc['reversal']}",
+                      "قرب الإغلاق وانتهاء 0DTE يزيدان تذبذب الحركة", SIGNATURE])
+
+
+def eval_summary():
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("""SELECT p.anchor,p.hi,p.lo,p.hi_near,p.hi_far,p.lo_near,p.lo_far,p.p_up,p.p_down,
+                            r.high,r.low,r.close FROM predictions p JOIN realized r ON p.day=r.day
+                            WHERE p.kind='premarket'""").fetchall()
+    n = len(rows)
+    if n == 0:
+        return "لا توجد بيانات تقييم كافية بعد"
+    mh = np.mean([abs(r[1] - r[9]) for r in rows])
+    ml = np.mean([abs(r[2] - r[10]) for r in rows])
+    da = np.mean([(r[11] > r[0]) == (r[7] > r[8]) for r in rows])
+    ch = np.mean([r[3] <= r[9] <= r[4] for r in rows])
+    cl = np.mean([r[6] <= r[10] <= r[5] for r in rows])
+    note = " (عينة صغيرة — لا يُعتمد عليها)" if n < 20 else ""
+    return (f"التقييم التراكمي ({n} يوم){note}\nخطأ القمة: {mh:.1f} نقطة | خطأ القاع: {ml:.1f} نقطة\n"
+            f"دقة الاتجاه: {da*100:.0f}% | تغطية نطاق 80%: قمة {ch*100:.0f}% / قاع {cl*100:.0f}%")
+
+
+# ============================ الجدولة والتشغيل ============================
+def halt(bad):
+    last = kv_get("last_halt")
+    if last and (now_ny() - datetime.fromisoformat(last)).total_seconds() < 1800:
+        return
+    kv_set("last_halt", now_ny().isoformat())
+    tg("⛔ توقف إصدار التوقعات (Fail Closed)\n" + "\n".join(bad) +
+       "\nلن تصدر توقعات حتى تعود المصادر الأساسية.\n" + SIGNATURE)
+
+
+def run_forecast(kind):
+    now = now_ny()
+    d, q = collect(now)
+    save_quality(now, q)
+    bad = [f"{n}: {q[n][1]}" for n in CRITICAL if not q[n][0]]
+    if bad:
+        log.warning("توقف: %s", bad)
+        halt(bad)
+        return None
+    fc = build_forecast(d, now)
+    save_prediction(now, kind, fc)
+    return fc, d, now
+
+
+def job_pre_update():
+    return bool(run_forecast("premarket_update"))
+
+
+def job_pre_final():
+    r = run_forecast("premarket")
+    if not r:
+        return False
+    fc, d, now = r
+    tg(format_report(fc, "تقرير توقعات S&P 500 — قبل الافتتاح"))
+    save_snapshot(now, d["CHAIN"])
+    return True
+
+
+def job_rth(now):
+    r = run_forecast("intraday")
+    if not r:
+        return
+    fc, d, now = r
+    if now.minute < 5 or now.minute in range(30, 35):
+        save_snapshot(now, d["CHAIN"])
+    last_label, last_send = kv_get("last_label"), kv_get("last_send")
+    due = (not last_send) or (now - datetime.fromisoformat(last_send)).total_seconds() >= UPDATE_MINUTES * 60
+    if fc["label"] != last_label or due:
+        if tg(format_report(fc, "تحديث توقعات S&P 500 — أثناء الجلسة")):
+            kv_set("last_label", fc["label"])
+            kv_set("last_send", now.isoformat())
+
+
+def job_close_risk():
+    r = run_forecast("close_risk")
+    if not r:
+        return False
+    tg(format_close_risk(r[0]))
+    return True
+
+
+def job_eval():
+    now = now_ny()
+    try:
+        df = yf_hist("^GSPC", "5d", "5m")
+    except SourceError:
+        return False
+    m = df.index.hour * 60 + df.index.minute
+    t = df[(df.index.date == now.date()) & (m < 960)]
+    if t.empty:
+        return False
+    hi, lo, cl = float(t.High.max()), float(t.Low.min()), float(t.Close.iloc[-1])
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT OR REPLACE INTO realized VALUES (?,?,?,?)", (now.date().isoformat(), hi, lo, cl))
+        row = c.execute("SELECT hi,lo FROM predictions WHERE day=? AND kind='premarket'",
+                        (now.date().isoformat(),)).fetchone()
+    today_line = (f"توقع القمة {n0(row[0])} مقابل الفعلي {n0(hi)} | توقع القاع {n0(row[1])} مقابل الفعلي {n0(lo)}"
+                  if row else "لا يوجد توقع قبل الافتتاح اليوم")
+    tg("\n".join(["📊 حفظ النتائج والتقييم", f"إغلاق SPX: {cl:,.2f}", today_line, eval_summary(), SIGNATURE]))
+    return True
+
+
+def once(key, now, start, window, fn):
+    m = now.hour * 60 + now.minute
+    k = f"{now.date()}:{key}"
+    if start <= m < start + window and not kv_get(k):
+        if fn():
+            kv_set(k, "1")
+
+
+def tick():
     now = now_ny()
     if now.weekday() >= 5:
-        return "CLOSED"
-    minute = now.hour * 60 + now.minute
-    if 8 * 60 <= minute < 9 * 60 + 30:
-        return "PREMARKET_HOUR"
-    elif 9 * 60 + 30 <= minute < 16 * 60:
-        return "RTH"
-    elif 16 * 60 <= minute < 16 * 60 + 30:
-        return "POST_MARKET"
-    return "CLOSED"
-
-
-# ================= ================= =================
-‎# 1. محرك تدفق الأوامر والسيولة اللحظية (Order Flow & Velocity)
-# ================= ================= =================
-
-def get_realtime_stock_price(symbol):
-‎    """جلب أحدث سعر تنفيذي مباشر للسهم لحظياً (Realtime Trade Price)"""
-    url = f"{DATA_URL}/v2/stocks/{symbol}/trades/latest"
-    try:
-        r = session.get(url, headers=alpaca_headers(), params={"feed": STOCK_FEED}, timeout=5)
-        if r.status_code == 200:
-            trade = r.json().get("trade", {})
-            if isinstance(trade, dict):
-                price = float(trade.get("p", 0))
-                if price > 0:
-                    return price
-    except Exception as exc:
-        log.warning("تعذر جلب السعر اللحظي المباشر لـ %s: %s", symbol, exc)
-    return None
-
-
-def get_stock_bars(symbol, timeframe="1Min", limit=300):
-‎    """جلب بيانات الشموع من Alpaca API"""
-    end = datetime.now(UTC)
-    start = end - timedelta(days=3)
-    url = f"{DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": timeframe,
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-        "limit": limit,
-        "feed": STOCK_FEED,
-        "sort": "desc",   # أحدث الشموع أولاً (الافتراضي asc كان يرجّع شموع قديمة)
-    }
-    try:
-        r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        
-        res_json = r.json()
-        raw_bars = res_json.get("bars")
-        rows = raw_bars.get(symbol, []) if isinstance(raw_bars, dict) else (raw_bars if isinstance(raw_bars, list) else [])
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows).rename(columns={"c": "close", "h": "high", "l": "low", "v": "volume", "t": "timestamp"})
-        return df.iloc[::-1].reset_index(drop=True)   # ترتيب تصاعدي: الأقدم -> الأحدث
-    except Exception as exc:
-        log.error("خطأ جلب بيانات %s: %s", symbol, exc)
-        return pd.DataFrame()
-
-
-def calculate_order_flow_analytics(df):
-    """
-‎    تحليل تدفق الأوامر والامتصاص وتسارع السيولة (Order Flow Dynamics):
-    - Volume Velocity: تسارع الفوليوم اللحظي مقارنة بالمتوسط المتحرك.
-    - Absorption Ratio: كشف عمليات الشراء/البيع الخفية (ارتفاع الفوليوم مع ضيق النطاق السعري).
-    """
-    if df.empty or len(df) < 15:
-        return {"volume_velocity": 1.0, "absorption_detected": False, "vwap_dist_pct": 0.0}
-
-    close = df["close"].astype(float)
-    volume = df["volume"].astype(float)
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-
-‎    # حساب VWAP اللحظي
-    vol_sum = volume.cumsum()
-    vwap = (volume * close).cumsum() / np.where(vol_sum == 0, 1, vol_sum)
-    vwap_dist_pct = ((close.iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]) * 100.0
-
-‎    # حساب Volume Velocity
-    recent_vol = volume.tail(3).mean()
-    prior_vol = volume.iloc[-15:-3].mean()
-    volume_velocity = round((recent_vol / prior_vol), 2) if prior_vol > 0 else 1.0
-
-‎    # حساب Absorption (الامتصاص المؤسسي عند الدعم/المقاومة)
-    candle_range = (high.iloc[-1] - low.iloc[-1])
-    avg_range = (high.tail(10) - low.tail(10)).mean()
-    is_narrow_range = candle_range < (avg_range * 0.65)
-    is_high_volume = volume.iloc[-1] > (volume.tail(10).mean() * 1.5)
-    absorption_detected = bool(is_narrow_range and is_high_volume)
-
-    return {
-        "volume_velocity": volume_velocity,
-        "absorption_detected": absorption_detected,
-        "vwap_dist_pct": vwap_dist_pct,
-        "vwap_val": vwap.iloc[-1]
-    }
-
-
-# ================= ================= =================
-‎# 2. رصد صيد السيولة والمصايد (Liquidity Sweeps & Stop Hunts)
-# ================= ================= =================
-
-def detect_liquidity_sweep(df, window=20):
-    """
-‎    رصد كسر القيعان/القمم اللحظية الوهمي لجمع السيولة (Liquidity Sweep):
-‎    يحدث عندما يكسر السعر أعلى/أدنى مستوى خلال (window) دقيقة بفوليوم مفاجئ ثم يرتد داخل النطاق.
-    """
-    if df.empty or len(df) < window + 2:
-        return None
-
-    highs = df["high"].astype(float)
-    lows = df["low"].astype(float)
-    closes = df["close"].astype(float)
-    volumes = df["volume"].astype(float)
-
-    prev_high = highs.iloc[-(window + 1):-1].max()
-    prev_low = lows.iloc[-(window + 1):-1].min()
-
-    curr_high = highs.iloc[-1]
-    curr_low = lows.iloc[-1]
-    curr_close = closes.iloc[-1]
-    curr_vol = volumes.iloc[-1]
-    avg_vol = volumes.iloc[-15:-1].mean()
-
-‎    # صيد سيولة البائعين (Bullish Liquidity Sweep)
-    if curr_low < prev_low and curr_close > prev_low and curr_vol > (avg_vol * 1.4):
-        return "BULLISH_SWEEP"
-
-‎    # صيد سيولة المشترين (Bearish Liquidity Sweep)
-    if curr_high > prev_high and curr_close < prev_high and curr_vol > (avg_vol * 1.4):
-        return "BEARISH_SWEEP"
-
-    return None
-
-
-# ================= ================= =================
-‎# 3. تحليل تدفق عقود الخيارات وتكشف الجاما (0DTE Gamma Exposure)
-# ================= ================= =================
-
-def calculate_0dte_gamma_exposure(symbol, spot):
-    """
-‎    تقدير مستويات تسارع الجاما (Gamma Acceleration & Flip Level) لعقود 0DTE / الأسبوعية.
-‎    تحدد المناطق التي يُجبر فيها صناع السوق (Dealers) على التحويط السريع.
-    """
-    today_str = now_ny().date().isoformat()
-    url = f"{TRADING_URL}/v2/options/contracts"
-    params = {
-        "underlying_symbols": symbol,
-        "expiration_date": today_str,
-        "status": "active",
-        "limit": 100,
-    }
-    try:
-        r = session.get(url, headers=alpaca_headers(), params=params, timeout=10)
-        if r.status_code != 200:
-            return "GAMMA_NEUTRAL", spot
-
-        contracts = r.json().get("option_contracts", [])
-        if not contracts:
-            return "GAMMA_NEUTRAL", spot
-
-        strikes = [float(c.get("strike_price", 0)) for c in contracts if c.get("strike_price")]
-        if not strikes:
-            return "GAMMA_NEUTRAL", spot
-
-        gamma_flip_level = float(np.median(strikes))
-        
-        if spot > gamma_flip_level * 1.002:
-            return "POSITIVE_GAMMA_SQUEEZE", gamma_flip_level
-        elif spot < gamma_flip_level * 0.998:
-            return "NEGATIVE_GAMMA_ACCELERATION", gamma_flip_level
-
-        return "GAMMA_BALANCED", gamma_flip_level
-    except Exception as exc:
-        log.warning("خطأ حساب الجاما لـ %s: %s", symbol, exc)
-        return "GAMMA_NEUTRAL", spot
-
-
-# ================= ================= =================
-‎# 4. محرك التعلم الآلي والتنبؤ التوافقي (LightGBM Scoring Engine)
-# ================= ================= =================
-
-class LightGBMPredictor:
-    def __init__(self, model_file):
-        self.model_file = model_file
-        self.model = None
-        self.load_model()
-
-    def load_model(self):
-        if HAS_LGBM and os.path.exists(self.model_file):
-            try:
-                self.model = lgb.Booster(model_file=self.model_file)
-                log.info("تم تحميل نموذج LightGBM بنجاح من: %s", self.model_file)
-            except Exception as e:
-                log.warning("تعذر تحميل ملف نموذج LightGBM: %s. استخدام المحرك التراكمي المحسّن.", e)
-
-    def predict(self, features_dict):
-        """
-‎        تقييم احتمالية الصفقة باستخدام نموذج LightGBM أو نظام التجميع الإحصائي الموزون (GBDT Rules).
-        """
-        # Feature vector: [vwap_dist, volume_velocity, squeeze_ratio, multi_tf_align, sweep_val, gamma_val]
-        vwap_dist = features_dict.get("vwap_dist_pct", 0.0)
-        vol_vel = features_dict.get("volume_velocity", 1.0)
-        squeeze = features_dict.get("squeeze_ratio", 0.2)
-        multi_tf = features_dict.get("multi_tf_align", 0)  # +1, -1, 0
-        sweep = 1 if features_dict.get("sweep") == "BULLISH_SWEEP" else (-1 if features_dict.get("sweep") == "BEARISH_SWEEP" else 0)
-        gamma = 1 if "POSITIVE" in features_dict.get("gamma_status", "") else (-1 if "NEGATIVE" in features_dict.get("gamma_status", "") else 0)
-
-        feature_vector = np.array([[vwap_dist, vol_vel, squeeze, multi_tf, sweep, gamma]])
-
-        if self.model and HAS_LGBM:
-            try:
-                raw_prob = self.model.predict(feature_vector)[0]
-                confidence = int(np.clip(raw_prob * 100, 70, 98))
-                return confidence
-            except Exception:
-                pass
-
-‎        # المحرك التجميعي المحسّن (Ensemble Heuristic Engine)
-        score = 80.0
-        score += min(10.0, (vol_vel - 1.0) * 4.0)
-        score += 5.0 if squeeze <= 0.14 else 0.0
-        score += 6.0 if abs(multi_tf) > 0 else 0.0
-        score += 7.0 if sweep != 0 else 0.0
-        score += 4.0 if gamma != 0 else 0.0
-
-        confidence = int(np.clip(score, 75, 97))
-        return confidence
-
-
-predictor_engine = LightGBMPredictor(MODEL_PATH)
-
-
-# ================= ================= =================
-‎# 5. التوافق اللحظي بين الأطر الزمنية والأسواق (Intermarket Multi-TF)
-# ================= ================= =================
-
-def check_multi_timeframe_alignment(symbol):
-‎    """تحليل توافق الاتجاه على أطر 1m و 5m و 15m"""
-    df_1m = get_stock_bars(symbol, timeframe="1Min", limit=50)
-    df_5m = get_stock_bars(symbol, timeframe="5Min", limit=50)
-
-    if df_1m.empty or df_5m.empty:
-        return 0
-
-    close_1m = df_1m["close"].astype(float)
-    close_5m = df_5m["close"].astype(float)
-
-    ema5_1m = close_1m.ewm(span=5, adjust=False).mean().iloc[-1]
-    ema13_1m = close_1m.ewm(span=13, adjust=False).mean().iloc[-1]
-
-    ema5_5m = close_5m.ewm(span=5, adjust=False).mean().iloc[-1]
-    ema13_5m = close_5m.ewm(span=13, adjust=False).mean().iloc[-1]
-
-    if (ema5_1m > ema13_1m) and (ema5_5m > ema13_5m):
-        return 1  # Bullish Alignment
-    elif (ema5_1m < ema13_1m) and (ema5_5m < ema13_5m):
-        return -1  # Bearish Alignment
-
-    return 0
-
-
-def get_qqq_intermarket_bias():
-‎    """قراءة سيولة وتوافق مؤشر ناسداك QQQ"""
-    df_qqq = get_stock_bars("QQQ", timeframe="1Min", limit=100)
-    if df_qqq.empty:
-        return "NEUTRAL"
-    analytics = calculate_order_flow_analytics(df_qqq)
-    if analytics["vwap_dist_pct"] > 0.05:
-        return "BULLISH"
-    elif analytics["vwap_dist_pct"] < -0.05:
-        return "BEARISH"
-    return "NEUTRAL"
-
-
-# ================= ================= =================
-‎# الخوارزمية الشاملة لكشف الإشارات عالية التناغم
-# ================= ================= =================
-
-def analyze_symbol_institutional_setup(symbol):
-‎    """تحليل استباقي متكامل يدمج كافة المحركات الإشارية"""
-    df_1m = get_stock_bars(symbol, timeframe="1Min", limit=200)
-    if df_1m.empty or len(df_1m) < 25:
-        return None
-
-    close = df_1m["close"].astype(float)
-    live_spot = get_realtime_stock_price(symbol)
-    spot = live_spot if (live_spot and live_spot > 0) else close.iloc[-1]
-
-‎    # 1. تحليل تدفق الأوامر وتسارع السيولة
-    of_analytics = calculate_order_flow_analytics(df_1m)
-
-‎    # 2. كشف مصايد وصيد السيولة (Liquidity Sweeps)
-    sweep_signal = detect_liquidity_sweep(df_1m, window=20)
-
-‎    # 3. تكشف الجاما (0DTE Gamma Exposure)
-    gamma_status, gamma_flip = calculate_0dte_gamma_exposure(symbol, spot)
-
-‎    # 4. التوافق متعدد الأطر الزمنية
-    multi_tf_align = check_multi_timeframe_alignment(symbol)
-
-‎    # 5. الانضغاط السعري (Squeeze Ratio)
-    std_recent = close.tail(6).std()
-    squeeze_ratio = (std_recent / spot) * 100.0
-
-‎    # تحديد الاتجاه التنبؤي
-    direction = None
-
-‎    # أولوية 1: إشارة صيد السيولة (Sweep Reversal)
-    if sweep_signal == "BULLISH_SWEEP":
-        direction = "CALL"
-    elif sweep_signal == "BEARISH_SWEEP":
-        direction = "PUT"
-‎    # أولوية 2: توافق الجاما + الانضغاط + تدفق الأوامر
-    elif squeeze_ratio <= 0.18 and of_analytics["volume_velocity"] >= 1.25:
-        if multi_tf_align == 1 or of_analytics["vwap_dist_pct"] > 0:
-            direction = "CALL"
-        elif multi_tf_align == -1 or of_analytics["vwap_dist_pct"] < 0:
-            direction = "PUT"
-
-    if not direction:
-        return None
-
-‎    # 6. تقييم نسبة الثقة عبر محرك LightGBM
-    features_dict = {
-        "vwap_dist_pct": of_analytics["vwap_dist_pct"],
-        "volume_velocity": of_analytics["volume_velocity"],
-        "squeeze_ratio": squeeze_ratio,
-        "multi_tf_align": multi_tf_align,
-        "sweep": sweep_signal,
-        "gamma_status": gamma_status
-    }
-
-    confidence = predictor_engine.predict(features_dict)
-
-    if confidence < MIN_CONFIDENCE_THRESHOLD:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "spot": spot,
-        "confidence": confidence,
-        "sweep_signal": sweep_signal,
-        "volume_velocity": of_analytics["volume_velocity"],
-        "gamma_status": gamma_status,
-        "absorption": of_analytics["absorption_detected"],
-        "vwap_dist": of_analytics["vwap_dist_pct"]
-    }
-
-
-def get_target_expiration(symbol):
-    today = now_ny().date()
-    if symbol in ("SPY", "QQQ", "DIA", "SPX"):
-        return today.isoformat(), "0DTE (ينتهي اليوم)"
-    days_ahead = 4 - today.weekday()
-    if days_ahead < 0:
-        days_ahead += 7
-    exp_date = today + timedelta(days=days_ahead)
-    return (today.isoformat(), "0DTE (ينتهي اليوم)") if exp_date == today else (exp_date.isoformat(), f"أسبوعي (ينتهي بعد {(exp_date - today).days} أيام)")
-
-
-def find_high_conviction_option(symbol, direction, spot):
-    target_move = 15.0 if symbol == "SPX" else MIN_MOVE_POINTS
-    target_strike = round(spot + target_move) if direction == "CALL" else round(spot - target_move)
-    exp_date, exp_type_label = get_target_expiration(symbol)
-
-    url = f"{TRADING_URL}/v2/options/contracts"
-    params = {
-        "underlying_symbols": symbol,
-        "expiration_date": exp_date,
-        "type": direction.lower(),
-        "status": "active",
-        "limit": 100,
-    }
-    r = session.get(url, headers=alpaca_headers(), params=params, timeout=15)
-    if r.status_code != 200:
-        return None
-        
-    data = r.json()
-    contracts = data.get("option_contracts", data.get("contracts", []))
-    if isinstance(contracts, dict):
-        contracts = contracts.get("option_contracts", [])
-        
-    best_contract = None
-    min_diff = 999
-    for c in contracts:
-        s_price = float(c.get("strike_price", 0))
-        diff = abs(s_price - target_strike)
-        if diff < min_diff:
-            min_diff = diff
-            best_contract = c
-            
-    if not best_contract:
-        return None
-
-    q_url = f"{DATA_URL}/v1beta1/options/quotes/latest"
-    q_r = session.get(q_url, headers=alpaca_headers(), params={"symbols": best_contract["symbol"], "feed": OPTIONS_FEED}, timeout=15)
-    if q_r.status_code != 200:
-        return None
-    
-    q_data = q_r.json().get("quotes", {}).get(best_contract["symbol"], {})
-    ask = float(q_data.get("ap", 0) or 0)
-    bid = float(q_data.get("bp", 0) or 0)
-    if ask <= 0 or bid <= 0:
-        return None
-        
-    mid = round((ask + bid) / 2, 2)
-    spread = (ask - bid) / mid if mid > 0 else 1.0
-    if spread > MAX_SPREAD_PCT:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "spot": spot,
-        "strike": float(best_contract["strike_price"]),
-        "contract": best_contract["symbol"],
-        "ask": ask,
-        "bid": bid,
-        "mid": mid,
-        "target_move": target_move,
-        "exp_date": exp_date,
-        "exp_label": exp_type_label
-    }
-
-
-# ================= ================= =================
-‎# تنسيق الرسائل مع التوقيع والعلامة الفنية
-# ================= ================= =================
-
-def format_conviction_alert(opt, setup):
-    dir_ar = "شراء CALL 🟢" if opt["direction"] == "CALL" else "شراء PUT 🔴"
-    sweep_txt = "⚡ صيد سيولة محدد (Liquidity Sweep)" if setup.get("sweep_signal") else "مستمر (Flow Acceleration)"
-    abs_txt = "نعم (امتصاص مؤسسي)" if setup.get("absorption") else "عادي"
-    
-    return (
-        f"🔥 *توصية عالية القوة والتنبؤ (توقع حركة {opt['target_move']}+ نقطة)*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *الأصل:* `{opt['symbol']}`\n"
-        f"🧭 *الاتجاه التنبؤي:* {dir_ar}\n"
-        f"📅 *نوع العقد:* `{opt['exp_label']}` (تاريخ: `{opt['exp_date']}`)\n"
-        f"💹 *السعر التنفيذي اللحظي:* `{opt['spot']:.2f}`\n"
-        f"🎯 *السترايك المستهدف:* `{opt['strike']:.2f}`\n"
-        f"📄 *رمز العقد:* `{opt['contract']}`\n"
-        f"🟢 *Ask:* `${opt['ask']:.2f}` | ⚖️ *Mid:* `${opt['mid']:.2f}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 *مؤشرات محرك المؤسسات:* \n"
-        f"• *تسارع السيولة (Velocity):* `{setup['volume_velocity']}x`\n"
-        f"• *نمط الحركة:* `{sweep_txt}`\n"
-        f"• *حالة الجاما:* `{setup['gamma_status']}`\n"
-        f"• *الامتصاص المؤسسي:* `{abs_txt}`\n"
-        f"🎯 *نسبة ثقة LightGBM:* `{setup['confidence']}%`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{SIGNATURE} — {APP_NAME} {VERSION}"
-    )
-
-
-def format_premarket_report(spy_fc, comp_fc):
-    lines = [
-        f"🎯 *توقعات التداول اليومية المؤسسية (قبل الافتتاح)*",
-        f"📅 `{now_ny().strftime('%Y-%m-%d')}`",
-        f"━━━━━━━━━━━━━━━━━━"
-    ]
-    if spy_fc:
-        lines.extend([
-            f"📊 *SPX المتوقع:* `{spy_fc['spx_low']} — {spy_fc['spx_high']}`",
-            f"📊 *SPY المتوقع:* `{spy_fc['spy_low']} — {spy_fc['spy_high']}`",
-            f"📈 *أعلى نطاق متوقع:* `{spy_fc['spy_high']}` (SPY) / `{spy_fc['spx_high']}` (SPX)",
-            f"📉 *أدنى نطاق متوقع:* `{spy_fc['spy_low']}` (SPY) / `{spy_fc['spx_low']}` (SPX)",
-            f"🧭 *اتجاه السوق:* {spy_fc['trend']} | *الثقة:* `{spy_fc['confidence']}%`",
-            f"━━━━━━━━━━━━━━━━━━"
-        ])
-    if comp_fc:
-        lines.append("🏢 *توقعات الأسهم والمؤشرات المقترنة:*")
-        for c in comp_fc:
-            lines.append(
-                f"• *{c['symbol']}* (`{c['spot']:.2f}`): النطاق `{c['low']} — {c['high']}` | الاتجاه: {c['direction']} | السترايك: `{c['target_strike']}`"
-            )
-        lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"{SIGNATURE} — {APP_NAME}")
-    return "\n".join(lines)
-
-
-def format_eod_report():
-    today_str = now_ny().strftime('%Y-%m-%d')
-    state = daily_state_get()
-    try:
-        df_spy = get_stock_bars("SPY", timeframe="5Min", limit=100)
-        live_spy = get_realtime_stock_price("SPY")
-        close_spy = live_spy if (live_spy and live_spy > 0) else (df_spy["close"].iloc[-1] if not df_spy.empty else 0.0)
-        high_spy = df_spy["close"].max() if not df_spy.empty else 0.0
-        low_spy = df_spy["close"].min() if not df_spy.empty else 0.0
-        close_spx = close_spy * 10
-    except Exception:
-        close_spy, high_spy, low_spy, close_spx = 0.0, 0.0, 0.0, 0.0
-
-    return (
-        f"🔔 *تقرير إغلاق السوق وحصاد التوصيات*\n"
-        f"📅 `{today_str}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *إغلاق SPX:* `{close_spx:.2f}`\n"
-        f"📊 *إغلاق SPY:* `{close_spy:.2f}`\n"
-        f"📈 *أعلى سعر لـ SPY اليوم:* `{high_spy:.2f}`\n"
-        f"📉 *أدنى سعر لـ SPY اليوم:* `{low_spy:.2f}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📬 *عدد التوصيات المرسلة اليوم:* `{state['sent_count']} توصيات`\n"
-        f"🎯 *دقة التوقعات التراكمية:* {accuracy_summary()}\n"
-        f"✅ *محرك التنبؤ:* مستقر وجاهز للجلسة القادمة.\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{SIGNATURE} — {APP_NAME}"
-    )
-
-
-def get_premarket_forecast_all():
-    spy_data = None
-    try:
-        df_spy = yf.download("SPY", period="5d", interval="5m", prepost=True, progress=False)
-        if not df_spy.empty:
-            close_series = df_spy["Close"]["SPY"] if isinstance(df_spy.columns, pd.MultiIndex) and "SPY" in df_spy["Close"].columns else df_spy["Close"]
-            latest_spy = float(close_series.dropna().iloc[-1])
-            returns_spy = close_series.pct_change().dropna()
-            vol_spy = returns_spy.std() * np.sqrt(78) * latest_spy
-            move_spy = max(3.5, vol_spy)
-            
-            spy_low = round(latest_spy - move_spy, 2)
-            spy_high = round(latest_spy + move_spy, 2)
-            spx_low = round(spy_low * 10, 2)
-            spx_high = round(spy_high * 10, 2)
-            
-            ma20 = close_series.tail(20).mean()
-            spy_trend = "صاعد 🟢" if latest_spy > ma20 else ("هابط 🔴" if latest_spy < ma20 else "عرضي ⚪")
-            confidence = int(min(95, max(75, 80 + (abs(latest_spy - ma20) / ma20) * 1000)))
-            
-            spy_data = {
-                "spot": latest_spy,
-                "spy_low": spy_low,
-                "spy_high": spy_high,
-                "spx_low": spx_low,
-                "spx_high": spx_high,
-                "trend": spy_trend,
-                "confidence": confidence
-            }
-    except Exception as exc:
-        log.error("خطأ توقعات SPY ما قبل الافتتاح: %s", exc)
-
-    companies_data = []
-    for sym in SCAN_STOCKS:
-        if sym in ("SPY", "SPX"):
-            continue
-        try:
-            df = get_stock_bars(sym, timeframe="5Min", limit=50)
-            if df.empty:
-                continue
-            live_spot = get_realtime_stock_price(sym)
-            spot = live_spot if (live_spot and live_spot > 0) else float(df["close"].iloc[-1])
-            ret = df["close"].pct_change().dropna()
-            vol = ret.std() * np.sqrt(78) * spot
-            move = max(MIN_MOVE_POINTS, vol)
-            low_p = round(spot - move, 2)
-            high_p = round(spot + move, 2)
-            ma15 = df["close"].tail(15).mean()
-            direction = "CALL 🟢" if spot >= ma15 else "PUT 🔴"
-            target_strike = round(spot + MIN_MOVE_POINTS, 1) if spot >= ma15 else round(spot - MIN_MOVE_POINTS, 1)
-            
-            companies_data.append({
-                "symbol": sym,
-                "spot": spot,
-                "low": low_p,
-                "high": high_p,
-                "direction": direction,
-                "target_strike": target_strike
-            })
-        except Exception as exc:
-            log.warning("تخطي السهم %s في تقرير ما قبل الافتتاح: %s", sym, exc)
-
-    return spy_data, companies_data
-
-
-# ================= ================= =================
-‎# تشغيل حلقات المسح والمراقبة
-# ================= ================= =================
-
-def run_premarket():
-    state = daily_state_get()
-    if state["pm_report_sent"]:
         return
-    log.info("جاري إعداد تقرير التوقعات المؤسسية ما قبل الافتتاح...")
-    spy_fc, comp_fc = get_premarket_forecast_all()
-    if spy_fc or comp_fc:
-        msg = format_premarket_report(spy_fc, comp_fc)
-        if telegram_send(msg):
-            mark_pm_sent()
-            if spy_fc and "عرضي" not in spy_fc["trend"]:
-                log_prediction("premarket", "SPY", "CALL" if "صاعد" in spy_fc["trend"] else "PUT",
-                               spy_fc["spot"], spy_fc["confidence"])
-            log.info("تم إرسال تقرير ما قبل الافتتاح بنجاح.")
-
-
-def run_rth():
-    state = daily_state_get()
-    if state["sent_count"] >= MAX_ALERTS_PER_DAY:
-        return
-
-    qqq_bias = get_qqq_intermarket_bias()
-
-    for symbol in SCAN_STOCKS:
-        if daily_state_get()["sent_count"] >= MAX_ALERTS_PER_DAY:
-            break
-
-        setup = analyze_symbol_institutional_setup(symbol)
-        if not setup:
-            continue
-
-‎        # فلترة التوافق بين الأصول مع مؤشر ناسداك
-        if symbol != "QQQ":
-            if setup["direction"] == "CALL" and qqq_bias == "BEARISH":
-                log.info("إلغاء صفقة CALL على %s بسبب سلبية سيولة ناسداك.", symbol)
-                continue
-            elif setup["direction"] == "PUT" and qqq_bias == "BULLISH":
-                log.info("إلغاء صفقة PUT على %s بسبب إيجابية سيولة ناسداك.", symbol)
-                continue
-
-        opt = find_high_conviction_option(symbol, setup["direction"], setup["spot"])
-        if opt:
-            msg = format_conviction_alert(opt, setup)
-            if telegram_send(msg):
-                increment_alert_count()
-                log_prediction("alert", symbol, setup["direction"], setup["spot"], setup["confidence"])
-                log.info("تم إرسال توصية تنبؤية مؤسسية: %s %s عند سعر %.2f (ثقة %d%%)", symbol, setup["direction"], setup["spot"], setup["confidence"])
-
-
-def run_post_market():
-    state = daily_state_get()
-    if state["eod_report_sent"]:
-        return
-    evaluate_predictions()
-    msg = format_eod_report()
-    if telegram_send(msg):
-        mark_eod_sent()
-        log.info("تم إرسال تقرير إغلاق السوق.")
+    m = now.hour * 60 + now.minute
+    once("pre_update", now, 9 * 60, 15, job_pre_update)
+    once("pre_final", now, 9 * 60 + 20, 12, job_pre_final)
+    if 575 <= m < 955:
+        k = f"{now.date()}:rth:{m // 5}"
+        if not kv_get(k):
+            kv_set(k, "1")
+            job_rth(now)
+    once("close_risk", now, 15 * 60 + 45, 10, job_close_risk)
+    once("eval", now, 16 * 60 + 15, 90, job_eval)
 
 
 def main():
-    ensure_db()
-    log.info("تشغيل البوت %s %s...", APP_NAME, VERSION)
-
-    startup_msg = (
-        f"🚀 *تم تشغيل نظام {APP_NAME} ({VERSION}) بنجاح*\n"
-        f"⏱️ *التوقيت:* `{now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')}`\n"
-        f"⚡ *محرك التنبؤ المؤسسي:* `مفعل 🟢`\n"
-        f"🎯 *محرك صيد السيولة (Sweeps):* `مفعل 🟢`\n"
-        f"📊 *تحليل الجاما (0DTE GEX):* `مفعل 🟢`\n"
-        f"🤖 *نموذج LightGBM ML:* `{'مفعل 🟢' if HAS_LGBM else 'المحرك التراكمي 🟢'}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{SIGNATURE}"
-    )
-    telegram_send(startup_msg)
-
+    init_db()
+    log.info("تشغيل صَفاء التحليل SPX")
+    tg("🚀 تم تشغيل صَفاء التحليل SPX (مصادر مجانية)\nلا تنفيذ تلقائي — تحليل احتمالي فقط\n" + SIGNATURE)
     while True:
         try:
-            phase = market_phase()
-            if phase == "PREMARKET_HOUR":
-                run_premarket()
-            elif phase == "RTH":
-                run_rth()
-            elif phase == "POST_MARKET":
-                run_post_market()
-            else:
-                log.info("السوق مغلق حالياً | التوقيت: %s", now_ny().strftime("%Y-%m-%d %H:%M:%S %Z"))
-        except Exception as exc:
-            log.error("خطأ تشغيلي: %s", exc)
-        time.sleep(POLL_SECONDS)
+            tick()
+        except Exception as e:
+            log.exception("خطأ تشغيلي: %s", e)
+        time.sleep(20)
 
 
 if __name__ == "__main__":
