@@ -752,8 +752,45 @@ def tick():
     once("eval", now, 16 * 60 + 15, 90, job_eval)
 
 
+def tg_file(path, caption=""):
+    if not TG_TOKEN or not TG_CHAT:
+        return False
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
+                              data={"chat_id": TG_CHAT, "caption": caption[:900]},
+                              files={"document": f}, timeout=90)
+        return r.status_code == 200
+    except Exception as e:
+        log.error("خطأ إرسال ملف: %s", e)
+        return False
+
+
+def dump_1m_once():
+    """يرسل بيانات الدقيقة (آخر 7 أيام) كملفات CSV مرة واحدة."""
+    if kv_get("dump_1m_done"):
+        return
+    folder = os.path.dirname(DB_PATH) or "."
+    sent = []
+    for sym, name in [("^GSPC", "spx"), ("ES=F", "es"), ("NQ=F", "nq"), ("^VIX", "vix")]:
+        try:
+            df = yf.Ticker(sym).history(period="7d", interval="1m", prepost=True, auto_adjust=False)
+            if df is None or df.empty:
+                continue
+            path = os.path.join(folder, f"{name}_1m_{now_ny():%Y%m%d}.csv")
+            df.to_csv(path)
+            if tg_file(path, f"{sym} — بيانات الدقيقة — {len(df)} صف"):
+                sent.append(name)
+        except Exception as e:
+            log.warning("تعذر تجهيز %s: %s", sym, e)
+    if sent:
+        kv_set("dump_1m_done", "1")
+        tg("📦 تم إرسال بيانات الدقيقة: " + ", ".join(sent) + "\nاحفظها، وأرسل لي ملف spx للتحليل.")
+
+
 def main():
     init_db()
+    dump_1m_once()
     log.info("تشغيل صَفاء التحليل SPX")
     tg("🚀 تم تشغيل صَفاء التحليل SPX (مصادر مجانية)\nلا تنفيذ تلقائي — تحليل احتمالي فقط\n" + SIGNATURE)
     while True:
