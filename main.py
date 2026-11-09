@@ -77,6 +77,9 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS gex_levels (
             ts TEXT, spot REAL, flip REAL, call_wall REAL, put_wall REAL, net_gex REAL, regime TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS options_snapshots (ts TEXT, blob BLOB)")
+        c.execute("""CREATE TABLE IF NOT EXISTS bars_1m (
+            symbol TEXT, ts TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL,
+            PRIMARY KEY (symbol, ts))""")
 
 
 def kv_get(k):
@@ -767,25 +770,36 @@ def tg_file(path, caption=""):
 
 
 def dump_1m_once():
-    """يرسل بيانات الدقيقة (آخر 7 أيام) كملفات CSV مرة واحدة."""
+    """يحمّل بيانات الدقيقة (آخر 7 أيام) ويخزنها في قاعدة البيانات + يرسل ملخص."""
     if kv_get("dump_1m_done"):
         return
     folder = os.path.dirname(DB_PATH) or "."
-    sent = []
-    for sym, name in [("^GSPC", "spx"), ("ES=F", "es"), ("NQ=F", "nq"), ("^VIX", "vix")]:
+    stored = []
+    for sym, name in [("^GSPC", "SPX"), ("ES=F", "ES"), ("NQ=F", "NQ"), ("^VIX", "VIX")]:
         try:
             df = yf.Ticker(sym).history(period="7d", interval="1m", prepost=True, auto_adjust=False)
             if df is None or df.empty:
                 continue
-            path = os.path.join(folder, f"{name}_1m_{now_ny():%Y%m%d}.csv")
+            # تخزين في قاعدة البيانات
+            rows = []
+            for ts, row in df.iterrows():
+                t = ts.tz_convert(NY).isoformat(timespec="seconds") if ts.tzinfo else str(ts)
+                rows.append((name, t, float(row["Open"]), float(row["High"]),
+                             float(row["Low"]), float(row["Close"]), float(row.get("Volume", 0) or 0)))
+            with sqlite3.connect(DB_PATH) as c:
+                c.executemany("""INSERT OR REPLACE INTO bars_1m
+                                 (symbol, ts, open, high, low, close, volume)
+                                 VALUES (?,?,?,?,?,?,?)""", rows)
+            stored.append(f"{name}:{len(rows)}")
+            # حفظ نسخة CSV احتياطية
+            path = os.path.join(folder, f"{name.lower()}_1m_{now_ny():%Y%m%d}.csv")
             df.to_csv(path)
-            if tg_file(path, f"{sym} — بيانات الدقيقة — {len(df)} صف"):
-                sent.append(name)
         except Exception as e:
             log.warning("تعذر تجهيز %s: %s", sym, e)
-    if sent:
+    if stored:
         kv_set("dump_1m_done", "1")
-        tg("📦 تم إرسال بيانات الدقيقة: " + ", ".join(sent) + "\nاحفظها، وأرسل لي ملف spx للتحليل.")
+        tg("📦 تم تخزين بيانات الدقيقة في قاعدة البيانات:\n" + "\n".join(stored) +
+           "\nالبوت صار يقدر يستخدمها لاحقًا للتحليل والتقييم.")
 
 
 def main():
