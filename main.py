@@ -203,12 +203,16 @@ def get_future(sym, now):
     a = age_min(df)
     if a > MAX_STALE_MIN:
         raise SourceError(f"{sym} متأخر {a:.0f} دقيقة")
-    today = now.date()
+        today = now.date()
     days = sorted({d for d in df.index.date if d < today})
     if not days:
         raise SourceError(f"{sym}: لا يوجد إغلاق سابق")
-    pdv = days[-1]
-    pc = session_close(df, pdv)
+    pdv, pc = None, None
+    for d_ in reversed(days):
+        pc = session_close(df, d_)
+        if pc:
+            pdv = d_
+            break
     if not pc:
         raise SourceError(f"{sym}: تعذر تحديد الإغلاق السابق")
     last = float(df.Close.iloc[-1])
