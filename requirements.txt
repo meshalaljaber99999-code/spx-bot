@@ -5,3 +5,4 @@ scikit-learn
 yfinance
 python-dotenv
 Pillow
+‏lightgbm
