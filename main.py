@@ -1303,8 +1303,699 @@ def train_model():
         print("النموذج لا يتفوق على خط الأساس — لم يُحفظ.")
 
 
+# ===================== وحدة توصيات العقود — أكبر 40 شركة =====================
+from concurrent.futures import ThreadPoolExecutor
+
+REC_TICKERS = [x.strip().upper() for x in env(
+    "REC_TICKERS",
+    "NVDA,AAPL,MSFT,AMZN,GOOGL,META,AVGO,TSLA,BRK-B,LLY,JPM,WMT,V,ORCL,MA,XOM,NFLX,COST,JNJ,HD,"
+    "PLTR,BAC,ABBV,PG,CVX,UNH,KO,GE,AMD,CSCO,TMUS,WFC,MS,IBM,PM,CRM,ABT,AXP,LIN,MCD").split(",") if x.strip()]
+REC_MOVE = float(env("REC_MOVE", "5"))
+REC_MIN_SCORE = float(env("REC_MIN_SCORE", "98"))
+REC_MIN_FP = int(env("REC_MIN_FP", "4"))
+REC_MIN_TOUCH = float(env("REC_MIN_TOUCH", "0.50"))
+REC_MIN_FREQ = float(env("REC_MIN_FREQ", "0.35"))
+_SEC = {"رقائق": "NVDA AVGO AMD", "تقنية": "AAPL MSFT ORCL CRM PLTR IBM CSCO",
+        "اتصالات وإعلام": "GOOGL META NFLX TMUS", "استهلاكي": "AMZN TSLA WMT COST HD MCD PG KO PM",
+        "مالية": "BRK-B JPM V MA BAC WFC MS AXP", "صحة": "LLY JNJ ABBV UNH ABT",
+        "طاقة": "XOM CVX", "صناعي": "GE LIN"}
+SECTOR = {s: k for k, v in _SEC.items() for s in v.split()}
+REL = [{"NVDA", "AVGO", "AMD"}, {"JPM", "BAC", "WFC", "MS"}, {"V", "MA"}, {"XOM", "CVX"},
+       {"AAPL", "MSFT", "GOOGL", "META", "AMZN"}, {"LLY", "ABBV", "JNJ"}]
+KW = ("downgrade", "upgrade", "investigation", "probe", "guidance", "fda", "lawsuit", "recall",
+      "antitrust", "merger", "acquire", "acquisition", "bankruptcy", "tariff", "outage", "breach")
+
+
+class Rej(Exception):
+    pass
+
+
+def _ncdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _ivn(v):
+    v = float(v or 0)
+    return v / 100 if v > 3 else v
+
+
+def _a(s):
+    return s.replace("-", ".")
+
+
+def _ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def _tr(dd):
+    return pd.concat([dd.High - dd.Low, (dd.High - dd.Close.shift()).abs(),
+                      (dd.Low - dd.Close.shift()).abs()], axis=1).max(axis=1)
+
+
+def _par(fn, items, workers=6):
+    out = {}
+
+    def w(x):
+        try:
+            return x, fn(x)
+        except Exception as e:
+            return x, e
+    with ThreadPoolExecutor(workers) as ex:
+        for k, v in ex.map(w, items):
+            out[k] = v
+    return out
+
+
+def _split(raw, s, daily=False):
+    try:
+        sub = raw[s].dropna(subset=["Close"]).copy()
+    except KeyError:
+        return None
+    if sub.empty:
+        return None
+    idx = pd.DatetimeIndex(sub.index)
+    if daily:
+        sub.index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
+    else:
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        sub.index = idx.tz_convert(NY)
+    return sub
+
+
+def rec_init():
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS recs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, sym TEXT, sector TEXT,
+            side TEXT, strike REAL, expiry TEXT, dte INTEGER, spot REAL, mid REAL, t1 REAL, t2 REAL,
+            stop REAL, cancel_lvl REAL, c_t1 REAL, c_t2 REAL, c_stop REAL, score REAL, fp INTEGER,
+            sent INTEGER, status TEXT, result TEXT, pct REAL, closed_ts TEXT, payload TEXT)""")
+
+
+# ---------------- مصادر البيانات ----------------
+def _chain(s, now):
+    root0 = s.replace("-", "")
+    r = requests.get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{root0}.json",
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=40)
+    if r.status_code != 200:
+        raise SourceError(f"Cboe HTTP {r.status_code}")
+    j = r.json().get("data", {})
+    spot = float(j.get("current_price") or 0)
+    rows = []
+    for o in j.get("options", []):
+        m = OPT_RE.match(o.get("option", ""))
+        if not m or m.group(1) != root0:
+            continue
+        _, ymd, cp, k = m.groups()
+        e = datetime.strptime(ymd, "%y%m%d").date()
+        if e < now.date() or (e - now.date()).days > 3:
+            continue
+        rows.append(dict(exp=e, cp=cp, strike=int(k) / 1000.0, oi=float(o.get("open_interest") or 0),
+                         vol=float(o.get("volume") or 0), gamma=float(o.get("gamma") or 0),
+                         delta=float(o.get("delta") or 0), iv=_ivn(o.get("iv")),
+                         bid=float(o.get("bid") or 0), ask=float(o.get("ask") or 0)))
+    if not rows or spot <= 0:
+        raise SourceError("Cboe فارغ")
+    return dict(spot=spot, df=pd.DataFrame(rows))
+
+
+def _earn(s, now):
+    k = f"earn:{s}"
+    raw = kv_get(k)
+    if raw:
+        j = json.loads(raw)
+        if j.get("asof") == now.date().isoformat():
+            return j["d"]
+    cal = yf.Ticker(s).calendar
+    ds = cal.get("Earnings Date") if isinstance(cal, dict) else None
+    if not ds:
+        raise SourceError("أرباح غير معروفة")
+    ds = [pd.Timestamp(x).date().isoformat() for x in ds]
+    kv_set(k, json.dumps({"asof": now.date().isoformat(), "d": ds}))
+    return ds
+
+
+def _alp_prices(syms):
+    out = {}
+    try:
+        r = requests.get(f"{DATA_URL}/v2/stocks/snapshots", headers=ah(),
+                         params={"symbols": ",".join(_a(s) for s in syms), "feed": STOCK_FEED}, timeout=20)
+        j = r.json()
+        j = j.get("snapshots", j)
+        for s in syms:
+            lt = (j.get(_a(s)) or {}).get("latestTrade") or {}
+            if lt.get("p") and lt.get("t"):
+                out[s] = (float(lt["p"]), pd.Timestamp(lt["t"]))
+    except Exception as e:
+        log.warning("Alpaca snapshots: %s", e)
+    return out
+
+
+def _news_syms(syms, now):
+    out = set()
+    try:
+        st = (now - timedelta(hours=18)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = requests.get(f"{DATA_URL}/v1beta1/news", headers=ah(),
+                         params={"symbols": ",".join(_a(s) for s in syms), "limit": 50, "start": st}, timeout=20)
+        for n in r.json().get("news", []):
+            t = (n.get("headline", "") + " " + (n.get("summary") or "")).lower()
+            if any(k in t for k in KW):
+                out.update(x.replace(".", "-") for x in n.get("symbols", []))
+    except Exception as e:
+        log.warning("أخبار: %s", e)
+    return out
+
+
+# ---------------- بوابات النظام ----------------
+def rec_calendar(now):
+    base = env("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets").rstrip("/")
+    r = requests.get(f"{base}/v2/calendar", headers=ah(), timeout=15,
+                     params={"start": now.date().isoformat(), "end": (now.date() + timedelta(days=10)).isoformat()})
+    if r.status_code != 200:
+        raise SourceError(f"تقويم السوق HTTP {r.status_code}")
+    cal = r.json()
+    if not cal or cal[0]["date"] != now.date().isoformat():
+        raise SourceError("ليس يوم تداول")
+    if cal[0].get("close") != "16:00":
+        raise SourceError("جلسة مختصرة")
+    if len(cal) > 1:
+        gap = (datetime.strptime(cal[1]["date"], "%Y-%m-%d").date() - now.date()).days
+        if gap > (3 if now.weekday() == 4 else 1):
+            raise SourceError("يوم قبل عطلة")
+
+
+def rec_econ(now, zero):
+    raw = env("ECON_EVENTS")
+    if not raw:
+        if env("REC_ECON_REQUIRED", "1") == "1":
+            raise SourceError("ECON_EVENTS فارغ (أضف مواعيد FOMC/CPI/الوظائف)")
+        return
+    for it in raw.split(";"):
+        it = it.strip()
+        if not it:
+            continue
+        t = datetime.strptime(it, "%Y-%m-%d %H:%M").replace(tzinfo=NY)
+        if abs((t - now).total_seconds()) <= 3600 or (zero and t.date() == now.date() and t > now):
+            raise SourceError(f"حدث اقتصادي {it}")
+
+
+def rec_market(now):
+    es, vx = get_future("ES=F", now), get_vix(now)
+    return dict(es=es["ret_pct"], vix=vx["chg_pct"], drop=float(kv_get(f"dropmax:{now.date()}") or 0))
+
+
+# ---------------- الاختبار الرجعي (حركة السهم لا ربح العقد) ----------------
+def rec_backtest(daily):
+    sig, base = [], []
+    for s, dd in daily.items():
+        if dd is None or len(dd) < 200:
+            continue
+        cs = dd.Close
+        c, h, l, v = cs.values, dd.High.values, dd.Low.values, dd.Volume.values
+        e9, e21, e50 = [_ema(cs, n).values for n in (9, 21, 50)]
+        bbw = 4 * cs.rolling(20).std() / cs.rolling(20).mean()
+        pct = bbw.rolling(121).apply(lambda x: (x[:-1] < x[-1]).mean(), raw=True).values
+        vm = pd.Series(v).rolling(20).mean().shift(1).values
+        for i in range(125, len(c) - 3):
+            for d in (1, -1):
+                res = 0
+                for j in range(i + 1, i + 4):
+                    st = (l[j] <= c[i] - 2.5) if d == 1 else (h[j] >= c[i] + 2.5)
+                    tg_ = (h[j] >= c[i] + REC_MOVE) if d == 1 else (l[j] <= c[i] - REC_MOVE)
+                    if st:
+                        break
+                    if tg_:
+                        res = 1
+                        break
+                base.append((dd.index[i], res))
+                up = d == 1 and c[i] > h[i - 1] and e9[i] > e21[i] > e50[i]
+                dn = d == -1 and c[i] < l[i - 1] and e9[i] < e21[i] < e50[i]
+                if (up or dn) and pct[i - 1] <= 0.25 and vm[i] > 0 and v[i] / vm[i] >= 1.5:
+                    sig.append((dd.index[i], res))
+    if not base:
+        return dict(n=0, wr=0, base=0, wr_test=0, base_test=0, n_test=0)
+    cut = sorted({b[0] for b in base})[int(len({b[0] for b in base}) * 0.7)]
+    m = lambda rows: float(np.mean([x[1] for x in rows])) if rows else 0.0
+    st_ = [x for x in sig if x[0] >= cut]
+    return dict(n=len(sig), wr=m(sig), base=m(base), n_test=len(st_), wr_test=m(st_),
+                base_test=m([x for x in base if x[0] >= cut]), wr_train=m([x for x in sig if x[0] < cut]))
+
+
+def rec_accuracy():
+    with sqlite3.connect(DB_PATH) as c:
+        n, w = c.execute("SELECT COUNT(*), SUM(result='win') FROM recs WHERE sent=1 "
+                         "AND result IN ('win','loss','expired')").fetchone()
+    if n and n >= 20:
+        return f"{(w or 0) / n * 100:.0f}% ({n} توصية)"
+    try:
+        j = json.loads(kv_get("rec_bt") or "{}")
+        if j.get("n", 0) >= 30:
+            return f"{j['wr'] * 100:.0f}% (اختبار رجعي، {j['n']} حالة)"
+    except ValueError:
+        pass
+    return "قيد التراكم"
+
+
+# ---------------- اختيار العقد ----------------
+def _pick(ch, spot, dirn, dte_set, now, gap, opex):
+    today, df, best, why = now.date(), ch["df"], None, "لا عقد مناسب"
+    m = now.hour * 60 + now.minute
+    for e in sorted(df.exp.unique()):
+        dte = (e - today).days
+        if dte not in dte_set or (dte == 0 and (gap > 0.015 or opex)):
+            continue
+        x = df[df.exp == e]
+        k0 = x.loc[(x.strike - spot).abs().nsmallest(4).index]
+        iv = float(k0[k0.iv > 0].iv.mean())
+        if iv != iv:
+            continue
+        days = dte if dte > 0 else (1.0 if m < 570 else max(0.05, (960 - m) / 390))
+        sig = spot * iv * math.sqrt(days / 365)
+        if sig < REC_MOVE:
+            why = "الحركة المتوقعة"
+            continue
+        touch = 2 * (1 - _ncdf(REC_MOVE / sig))
+        if touch < REC_MIN_TOUCH + (0.05 if opex else 0):
+            why = "احتمال اللمس"
+            continue
+        cp = "C" if dirn == 1 else "P"
+        c = x[(x.cp == cp) & (x.delta.abs().between(0.30, 0.50)) & (x.oi >= 1000) & (x.vol >= 500)
+              & (x.bid > 0) & (x.ask > 0)].copy()
+        if c.empty:
+            why = "السيولة"
+            continue
+        c["mid"] = (c.bid + c.ask) / 2
+        c = c[(c.ask - c.bid) / c.mid <= 0.05]
+        if c.empty:
+            why = "فارق السعر"
+            continue
+        o = c.iloc[(c.delta.abs() - 0.40).abs().argsort()].iloc[0]
+        mid, k, dl, gm = float(o.mid), float(o.strike), float(o.delta), float(o.gamma)
+        be = k + mid if dirn == 1 else k - mid
+        be_r = max(0.0, (be - spot) * dirn) / sig
+        if be_r > 0.70:
+            why = "نقطة التعادل"
+            continue
+        T1 = max(REC_MOVE, 0.6 * sig)
+        T2 = max(1.5 * T1, sig)
+        S1, S2, SS = spot + dirn * T1, spot + dirn * T2, spot - dirn * T1 / 2
+        est = lambda S: max(mid + dl * (S - spot) + 0.5 * gm * (S - spot) ** 2, 0.01)
+        v1, v2, vs = est(S1), est(S2), est(SS)
+        reward = (v2 - mid) / mid
+        if reward < 2.0:
+            why = "ربح/قسط"
+            continue
+        if (v1 - mid) / max(mid - vs, 0.01) < 2.0:
+            why = "عائد/مخاطرة"
+            continue
+        p25 = x[(x.cp == "P") & (x.delta.abs().between(0.2, 0.3))].iv.mean()
+        c25 = x[(x.cp == "C") & (x.delta.abs().between(0.2, 0.3))].iv.mean()
+        skew = float((p25 - c25) / iv) if (p25 == p25 and c25 == c25) else 0.0
+        cand = dict(expiry=e.isoformat(), dte=dte, strike=k, mid=mid, t1=S1, t2=S2, stop=SS, c_t1=v1, c_t2=v2,
+                    c_stop=vs, reward=reward, be=be_r, oi=float(o.oi), iv=iv, skew=skew)
+        if best is None or reward > best["reward"]:
+            best = cand
+    return best, why
+
+
+# ---------------- تحليل سهم واحد ----------------
+def rec_analyze(s, X):
+    now, today = X["now"], X["now"].date()
+    dd, it, ch, ed = X["daily"].get(s), X["intra"].get(s), X["chain"].get(s), X["earn"].get(s)
+    if dd is None or it is None or ch is None or isinstance(ch, Exception) or ed is None \
+            or isinstance(ed, Exception):
+        raise SourceError("بيانات ناقصة")
+    dd = dd[dd.index.date < today]
+    bars = it[it.index + timedelta(minutes=5) <= now]
+    if len(dd) < 130 or len(bars) < 40:
+        raise SourceError("بيانات قصيرة")
+    if (now - bars.index[-1].to_pydatetime()).total_seconds() / 60 > MAX_STALE_MIN:
+        raise SourceError("بيانات متأخرة")
+    spot, prevc = float(bars.Close.iloc[-1]), float(dd.Close.iloc[-1])
+    tr = _tr(dd)
+    atr, atr50 = float(tr.tail(14).mean()), float(tr.tail(50).mean())
+    # سعران مستقلان
+    a = X["alp"].get(s)
+    if a and (now - a[1].to_pydatetime()).total_seconds() < 600:
+        if abs(a[0] / spot - 1) > 0.003:
+            raise SourceError("السعران مختلفان")
+    else:
+        ref = prevc if not is_rth(now) else spot
+        if abs(ch["spot"] / ref - 1) > 0.01:
+            raise SourceError("Cboe قديم")
+    # كسر حقيقي
+    ph, pl = float(dd.High.iloc[-1]), float(dd.Low.iloc[-1])
+    avgv = float(np.nan_to_num(bars.Volume.tail(23).iloc[:-3].mean()))
+    vr = float(bars.Volume.tail(3).max()) / max(avgv, 1.0)
+    c2, dirn, lvl = bars.Close.tail(2), 0, None
+    if (c2 > ph).all():
+        dirn, lvl = 1, ph
+    elif (c2 < pl).all():
+        dirn, lvl = -1, pl
+    if not dirn or vr < 1.5:
+        raise Rej("لا كسر حقيقي")
+    # اتجاه على 3 أطر
+    cd = dd.Close
+    e9, e21, e50 = _ema(cd, 9), _ema(cd, 21), _ema(cd, 50)
+    td = 1 if (e9.iloc[-1] > e21.iloc[-1] > e50.iloc[-1] and cd.iloc[-1] > e21.iloc[-1]) else \
+        (-1 if (e9.iloc[-1] < e21.iloc[-1] < e50.iloc[-1] and cd.iloc[-1] < e21.iloc[-1]) else 0)
+
+    def tf(rule):
+        c = bars.Close.resample(rule).last().dropna()
+        if len(c) < 25:
+            raise SourceError("إطار قصير")
+        x9, x21 = _ema(c, 9).iloc[-1], _ema(c, 21).iloc[-1]
+        return 1 if (x9 > x21 and c.iloc[-1] > x21) else (-1 if (x9 < x21 and c.iloc[-1] < x21) else 0)
+    if not (td == tf("1h") == tf("15min") == dirn):
+        raise Rej("الأطر غير متوافقة")
+    # ملف السهم
+    hi_, lo_, op_ = dd.High.values[-63:], dd.Low.values[-63:], dd.Open.values[-63:]
+    exc = [max(hi_[i:i + 3].max() - op_[i], op_[i] - lo_[i:i + 3].min()) for i in range(len(op_) - 3)]
+    if float(np.mean([x >= REC_MOVE for x in exc])) < REC_MIN_FREQ:
+        raise Rej("سهم هادئ")
+    moved = (spot - prevc) * dirn
+    if moved >= 0.8 * REC_MOVE:
+        raise Rej("الحركة استُهلكت")
+    day = bars.index[-1].date()
+    b = bars[bars.index.date == day]
+    vw = float(((b.High + b.Low + b.Close) / 3 * b.Volume).sum() / max(b.Volume.sum(), 1.0))
+    if abs(spot - vw) > 0.6 * atr:
+        raise Rej("بعيد عن VWAP")
+    # أرباح
+    mx = max(X["dte"])
+    grp = next((g for g in REL if s in g), {s})
+    for mbr in grp:
+        em = X["earn"].get(mbr)
+        if em is None or isinstance(em, Exception):
+            raise SourceError("أرباح غير معروفة")
+        for d_ in em:
+            dt_ = datetime.strptime(d_, "%Y-%m-%d").date()
+            if today <= dt_ <= today + timedelta(days=mx + 1):
+                raise Rej("أرباح قريبة")
+    # السوق
+    mk = X["mkt"]
+    if dirn == 1 and (mk["es"] < -0.5 or mk["vix"] > 8 or mk["drop"] >= 70):
+        raise Rej("السوق معاكس")
+    if dirn == -1 and (mk["es"] > 0.5 or mk["vix"] < -8):
+        raise Rej("السوق معاكس")
+    # العقد
+    gap = abs(spot / prevc - 1)
+    cdte, cb = _pick(ch, spot, dirn, X["dte"], now, gap, X["opex"])
+    if not cb:
+        raise Rej(cdte if isinstance(cdte, str) else cb)
+    c = cb
+    rv = float(np.log(cd).diff().tail(20).std() * math.sqrt(252))
+    ivrv = c["iv"] / max(rv, 1e-6)
+    if ivrv > 1.5:
+        raise Rej("IV مرتفع")
+    # الجاما والتدفق
+    try:
+        g = gex_levels(ch["spot"], ch["df"], today, max_dte=3, band=0.08)
+    except SourceError:
+        g = None
+    near = lambda x_: bool(x_) and abs(spot / x_ - 1) < 0.008
+    fp3 = bool(g and g["regime"] == "NEGATIVE" and (near(g["flip"]) or
+               (dirn == -1 and near(g["put_wall"])) or (dirn == 1 and near(g["call_wall"]))))
+    df = ch["df"]
+    w = df[df.strike.between(spot * 0.93, spot * 1.07)]
+    cv, pv = float(w[w.cp == "C"].vol.sum()), float(w[w.cp == "P"].vol.sum())
+    ratio = (cv if dirn == 1 else pv) / max(pv if dirn == 1 else cv, 1.0)
+    sd = w[(w.cp == ("C" if dirn == 1 else "P")) & (w.oi > 0)]
+    mvo = float((sd.vol / sd.oi).max()) if not sd.empty else 0.0
+    bbw = (4 * cd.rolling(20).std() / cd.rolling(20).mean()).dropna()
+    sq = float((bbw.tail(120).iloc[:-1] < bbw.iloc[-1]).mean()) <= 0.25 or atr / max(atr50, 1e-6) < 0.8
+    rvol = float(dd.Volume.iloc[-1] / max(dd.Volume.tail(21).iloc[:-1].mean(), 1.0))
+    fps = [sq, rvol >= 2 or vr >= 2, fp3, ratio >= 1.5 or (dirn == -1 and c["skew"] > 0.15),
+           ivrv <= 1.0, s in X["news"]]
+    fp = int(sum(fps))
+    if fp < REC_MIN_FP:
+        raise Rej(f"بصمات {fp}/6")
+    # النقاط
+    sep = (e9.iloc[-1] - e50.iloc[-1]) * dirn / atr
+    s_trend = 14 + 6 * clip(sep / 1.5, 0, 1)
+    s_vol = 5 * clip(rvol / 2, 0, 1) + (5 if (spot - vw) * dirn >= 0 else 0)
+    s_lvl = 10 * clip((0.9 * atr - abs(spot - lvl)) / (0.6 * atr), 0, 1)
+    s_flow = 8 * clip(ratio - 1, 0, 1) + 7 * clip(mvo / 0.5, 0, 1)
+    s_iv = 10 * clip((1.5 - ivrv) / 0.6, 0, 1)
+    al = 0.6 * clip(mk["es"] * dirn / 0.25) + 0.4 * clip(-mk["vix"] * dirn / 3)
+    s_mk = 10 * (0.5 + 0.5 * al)
+    s_rr = 7 * clip(c["reward"] / 3, 0, 1) + 4 * clip(c["oi"] / 3000, 0, 1) + 4 * clip((0.7 - c["be"]) / 0.3, 0, 1)
+    score = s_trend + s_vol + s_lvl + s_flow + s_iv + 10 + s_mk + s_rr
+    return dict(sym=s, sector=SECTOR.get(s, "أخرى"), dir=dirn, side="CALL" if dirn == 1 else "PUT",
+                spot=spot, lvl=lvl, score=score, fp=fp, fps=[bool(x_) for x_ in fps],
+                parts=dict(trend=s_trend, vol=s_vol, lvl=s_lvl, flow=s_flow, iv=s_iv, mk=s_mk, rr=s_rr), **c)
+
+
+# ---------------- المسح والإرسال ----------------
+def rec_scan(now, dte_set):
+    zero = dte_set == {0}
+    try:
+        if kv_get("rec_kill"):
+            raise SourceError("متوقف بقاطع الخسائر — شغّل: python safaa_spx.py reset_rec")
+        rec_calendar(now)
+        rec_econ(now, zero)
+        mk = rec_market(now)
+    except SourceError as e:
+        return dict(gate=str(e))
+    syms = REC_TICKERS
+    try:
+        rd = yf.download(syms, period="2y", interval="1d", group_by="ticker", progress=False,
+                         auto_adjust=False, threads=True)
+        ri = yf.download(syms, period="5d", interval="5m", prepost=True, group_by="ticker", progress=False,
+                         auto_adjust=False, threads=True)
+    except Exception as e:
+        raise SourceError(f"تحميل البيانات: {str(e)[:80]}")
+    if rd is None or rd.empty or ri is None or ri.empty:
+        raise SourceError("بيانات yfinance فارغة")
+    daily = {s: _split(rd, s, True) for s in syms}
+    intra = {s: _split(ri, s) for s in syms}
+    wk = now.strftime("%G-%V")
+    if kv_get("rec_bt_wk") != wk:
+        try:
+            kv_set("rec_bt", json.dumps(rec_backtest(daily)))
+            kv_set("rec_bt_wk", wk)
+        except Exception as e:
+            log.warning("الاختبار الرجعي: %s", e)
+    try:
+        bt = json.loads(kv_get("rec_bt") or "{}")
+    except ValueError:
+        bt = {}
+    if env("REC_BT_GATE", "1") == "1" and bt.get("n", 0) >= 30 and bt.get("wr_test", 0) <= bt.get("base_test", 0):
+        return dict(gate="الاختبار الرجعي لا يدعم الإشارات حالياً")
+    X = dict(now=now, dte=dte_set, daily=daily, intra=intra, mkt=mk, alp=_alp_prices(syms),
+             news=_news_syms(syms, now), chain=_par(lambda s: _chain(s, now), syms, 5),
+             earn=_par(lambda s: _earn(s, now), syms, 6),
+             opex=(now.weekday() == 4 and 15 <= now.day <= 21))
+    recs, bad, ok, reasons = [], [], 0, {}
+    for s in syms:
+        try:
+            recs.append(rec_analyze(s, X))
+            ok += 1
+        except Rej as e:
+            ok += 1
+            reasons[s] = str(e)
+        except Exception as e:
+            bad.append(s)
+            reasons[s] = "بيانات: " + str(e)[:40]
+    log.info("أسباب الرفض: %s", reasons)
+    return dict(recs=recs, ok=ok, n=len(syms), bad=bad)
+
+
+def rec_msg(r, now):
+    ksa, sep = now.astimezone(RIYADH), "━━━━━━━━━━━━"
+    lab_ = ("صعود حاد 🟢" if r["dir"] == 1 else "هبوط حاد 🔴") if r["fp"] >= 4 else "حركة عادية ⚪"
+    ico = "🟢" if r["dir"] == 1 else "🔴"
+    return "\n".join([
+        "💎 صَفاء التحليل", f"🎯 توصية عقد{' 0DTE' if r['dte'] == 0 else ''} — {lab_}",
+        f"🕘 {now:%H:%M} نيويورك | {ksa:%H:%M} السعودية", sep,
+        f"📌 {r['sym']} | السعر الآن: {r['spot']:.2f}",
+        f"{ico} {r['side']} | Strike {r['strike']:g} | الانتهاء {r['expiry']}",
+        f"نطاق الدخول: {r['mid'] * 0.92:.2f} – {r['mid'] * 1.08:.2f}", sep,
+        f"🎯 الهدف 1: سهم {r['t1']:.2f} (عقد ≈ {r['c_t1']:.2f})",
+        f"🎯 الهدف 2: سهم {r['t2']:.2f} (عقد ≈ {r['c_t2']:.2f})",
+        f"🛑 الوقف: سهم {r['stop']:.2f} (عقد ≈ {r['c_stop']:.2f})",
+        f"❌ تُلغى الفكرة: إغلاق شمعة 5د {'تحت' if r['dir'] == 1 else 'فوق'} {r['lvl']:.2f}", sep,
+        f"💥 قوة الانفجار: {r['fp'] / 6 * 100:.0f}%", f"📊 نقاط التوافق: {r['score']:.0f}%",
+        f"📈 الدقة التاريخية لهذه الفئة: {rec_accuracy()}", sep,
+        "تحليل احتمالي — لا يوجد ضمان للربح", SIGNATURE])
+
+
+def _rec_save(now, kind, r, sent):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""INSERT INTO recs (ts,day,kind,sym,sector,side,strike,expiry,dte,spot,mid,t1,t2,stop,
+                     cancel_lvl,c_t1,c_t2,c_stop,score,fp,sent,status,payload)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (now.isoformat(timespec="seconds"), now.date().isoformat(), kind, r["sym"], r["sector"],
+                   r["side"], r["strike"], r["expiry"], r["dte"], r["spot"], r["mid"], r["t1"], r["t2"],
+                   r["stop"], r["lvl"], r["c_t1"], r["c_t2"], r["c_stop"], r["score"], r["fp"], int(sent),
+                   "open", json.dumps(r, default=float, ensure_ascii=False)))
+
+
+def rec_run(now, dte_set, kind):
+    rec_init()
+    k = f"recretry:{now.date()}:{kind}"
+    try:
+        res = rec_scan(now, dte_set)
+    except SourceError as e:
+        n = int(kv_get(k) or 0) + 1
+        kv_set(k, n)
+        if n < 3:
+            return False
+        tg(f"🔍 لا توصية — {str(e)[:80]}\n{SIGNATURE}")
+        return True
+    if res.get("gate"):
+        tg(f"🔍 لا توصية — {res['gate']}\n{SIGNATURE}")
+        return True
+    day = now.date().isoformat()
+    with sqlite3.connect(DB_PATH) as c:
+        used = c.execute("SELECT sym, side, sector FROM recs WHERE sent=1 AND day=?", (day,)).fetchall()
+        openr = {x[0] for x in c.execute("SELECT sym FROM recs WHERE sent=1 AND status='open'").fetchall()}
+    final, taken = [], {(u[2], 1 if u[1] == "CALL" else -1) for u in used}
+    for r in sorted(res["recs"], key=lambda x: -x["score"]):
+        if r["score"] < REC_MIN_SCORE:
+            if r["score"] >= 90:
+                _rec_save(now, kind, r, False)
+            continue
+        if r["sym"] in openr or any(u[0] == r["sym"] and u[1] != r["side"] for u in used):
+            continue
+        if (r["sector"], r["dir"]) in taken:
+            continue
+        taken.add((r["sector"], r["dir"]))
+        final.append(r)
+    for r in final:
+        if tg(rec_msg(r, now)):
+            _rec_save(now, kind, r, True)
+    if not final:
+        extra = (" | بيانات ناقصة: " + ", ".join(res["bad"][:6])) if res["bad"] else ""
+        tg(f"🔍 فحص {res['ok']}/{res['n']} — لا توجد توصية اليوم{extra}\n{SIGNATURE}")
+    return True
+
+
+def rec_recheck(now):
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute("SELECT * FROM recs WHERE sent=1 AND status='open' AND kind='pre' AND day=?",
+                         (now.date().isoformat(),)).fetchall()
+    for r in rows:
+        try:
+            px = float(yf_hist(r["sym"], "1d", "5m").Close.iloc[-1])
+        except Exception:
+            continue
+        d = 1 if r["side"] == "CALL" else -1
+        T1, mv = abs(r["t1"] - r["spot"]), (px - r["spot"]) * d
+        name = f"{r['sym']} {r['side']} {r['strike']:g}"
+        if mv >= 0.6 * T1:
+            msg = f"⚠️ {name}: السهم تجاوز نطاق الدخول، التوصية منتهية، لا تطارد."
+        elif mv <= -0.5 * T1 or (px < r["cancel_lvl"] if d == 1 else px > r["cancel_lvl"]):
+            msg = f"❌ أُلغيت {name}: الافتتاح خالف الاتجاه"
+        else:
+            continue
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("UPDATE recs SET status='cancelled', result='cancelled' WHERE id=?", (r["id"],))
+        tg(msg + "\n" + SIGNATURE)
+
+
+def job_rec_pre():
+    return rec_run(now_ny(), {1, 2, 3}, "pre")
+
+
+def job_rec_zero():
+    now = now_ny()
+    try:
+        rec_init()
+        rec_recheck(now)
+    except Exception as e:
+        log.warning("recheck: %s", e)
+    return rec_run(now, {0}, "zero")
+
+
+def _rec_eval_one(r, df, now):
+    d, exp = (1 if r["side"] == "CALL" else -1), datetime.strptime(r["expiry"], "%Y-%m-%d").date()
+    for ts, b in df[df.index > datetime.fromisoformat(r["ts"])].iterrows():
+        if ts.date() > exp:
+            break
+        hs = (b.Low <= r["stop"]) if d == 1 else (b.High >= r["stop"])
+        h1 = (b.High >= r["t1"]) if d == 1 else (b.Low <= r["t1"])
+        if hs:
+            return "loss"
+        if h1:
+            return "win"
+    if exp < now.date() or (exp == now.date() and now.hour >= 16):
+        return "expired"
+    return None
+
+
+def job_rec_eval():
+    now = now_ny()
+    rec_init()
+    with sqlite3.connect(DB_PATH) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute("SELECT * FROM recs WHERE status='open'").fetchall()
+    lines = []
+    for r in rows:
+        try:
+            df = yf_hist(r["sym"], "5d", "5m")
+        except SourceError:
+            continue
+        res = _rec_eval_one(dict(r), df, now)
+        if not res:
+            continue
+        pct = (r["c_t1"] / r["mid"] - 1) * 100 if res == "win" else \
+              ((r["c_stop"] / r["mid"] - 1) * 100 if res == "loss" else None)
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("UPDATE recs SET status='closed', result=?, pct=?, closed_ts=? WHERE id=?",
+                      (res, pct, now.isoformat(timespec="seconds"), r["id"]))
+        if r["sent"]:
+            nm = f"{r['sym']} {r['side']} {r['strike']:g}"
+            lines.append(f"{nm}: بلغ الهدف 1 ✅ ({pct:+.0f}%)" if res == "win" else
+                         (f"{nm}: ضرب الوقف ❌ ({pct:+.0f}%)" if res == "loss" else f"{nm}: انتهى دون الهدف ❌"))
+    if lines:
+        tg("\n".join(["📊 نتائج التوصيات"] + lines + [f"الدقة التراكمية: {rec_accuracy()}", SIGNATURE]))
+    with sqlite3.connect(DB_PATH) as c:
+        last3 = [x[0] for x in c.execute("SELECT result FROM recs WHERE sent=1 AND result IN "
+                                         "('win','loss','expired') ORDER BY closed_ts DESC LIMIT 3").fetchall()]
+        if now.weekday() == 4:
+            since = (now - timedelta(days=7)).date().isoformat()
+            a = c.execute("SELECT COUNT(*), SUM(result='win'), AVG(pct) FROM recs WHERE sent=1 AND day>=? "
+                          "AND result IN ('win','loss','expired')", (since,)).fetchone()
+            b = c.execute("SELECT COUNT(*), SUM(result='win') FROM recs WHERE sent=0 AND day>=? "
+                          "AND result IN ('win','loss','expired')", (since,)).fetchone()
+            tg(f"📅 تقرير الأسبوع\nتوصيات: {a[0]} | نجاح: {(a[1] or 0)}"
+               f"{'' if a[2] is None else f' | متوسط {a[2]:+.0f}%'}\n"
+               f"مرشحات 90-98 (للمعايرة): {b[0]} | نجاح: {(b[1] or 0)}\n{SIGNATURE}")
+    if len(last3) == 3 and all(x in ("loss", "expired") for x in last3):
+        kv_set("rec_kill", "1")
+        tg("⛔ قاطع الخسائر: 3 توصيات متتالية لم تنجح. توقف الإرسال للمراجعة.\n" + SIGNATURE)
+    return True
+
+
+def tick():
+    now = now_ny()
+    if now.weekday() >= 5:
+        return
+    m = now.hour * 60 + now.minute
+    once("pre_update", now, 9 * 60, 15, job_pre_update)
+    once("pre_final", now, 9 * 60 + 20, 12, job_pre_final)
+    if 575 <= m < 955:
+        k = f"{now.date()}:rth:{m // 5}"
+        if not kv_get(k):
+            kv_set(k, "1")
+            job_rth(now)
+    once("close_risk", now, 15 * 60 + 45, 10, job_close_risk)
+    for s in (630, 690, 750, 810, 870, 930):
+        once(f"hr{s}", now, s + 1, 6, job_hourly)
+    once("eval", now, 16 * 60 + 15, 90, job_eval)
+    once("rec_pre", now, 8 * 60 + 30, 15, job_rec_pre)
+    once("rec_zero", now, 10 * 60, 15, job_rec_zero)
+    once("rec_eval", now, 16 * 60 + 20, 90, job_rec_eval)
+
+
 def main():
     init_db()
+    if len(sys.argv) > 1 and sys.argv[1] == "reset_rec":
+        kv_set("rec_kill", "")
+        print("تم تصفير قاطع الخسائر")
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "train":
         train_model()
         return
@@ -1318,6 +2009,10 @@ def main():
         except Exception as e:
             log.exception("خطأ تشغيلي: %s", e)
         time.sleep(20)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
