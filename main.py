@@ -1850,7 +1850,10 @@ def rec_run(now, dte_set, kind):
     with sqlite3.connect(DB_PATH) as c:
         used = c.execute("SELECT sym, side, sector FROM recs WHERE sent=1 AND day=?", (day,)).fetchall()
         openr = {x[0] for x in c.execute("SELECT sym FROM recs WHERE sent=1 AND status='open'").fetchall()}
+    
     final, taken = [], {(u[2], 1 if u[1] == "CALL" else -1) for u in used}
+    
+    # 1. مرحلة التصفية واختيار التوصيات (تتم بالكامل أولاً)
     for r in sorted(res["recs"], key=lambda x: -x["score"]):
         if r["score"] < REC_MIN_SCORE:
             if r["score"] >= 90:
@@ -1862,13 +1865,17 @@ def rec_run(now, dte_set, kind):
             continue
         taken.add((r["sector"], r["dir"]))
         final.append(r)
-        for r in final:
+        
+    # 2. مرحلة الإرسال والحفظ (خارج حلقة التصفية وبمسافة بادئة سليمة)
+    for r in final:
         if tg_pro(rec_msg_pro(r, now)):
             _rec_save(now, kind, r, True)
+            
     if not final:
         extra = (" | بيانات ناقصة: " + ", ".join(res["bad"][:6])) if res["bad"] else ""
         tg(f"🔍 فحص {res['ok']}/{res['n']} — لا توجد توصية اليوم{extra}\n{SIGNATURE}")
     return True
+
 
 
 def rec_recheck(now):
