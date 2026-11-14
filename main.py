@@ -1862,8 +1862,8 @@ def rec_run(now, dte_set, kind):
             continue
         taken.add((r["sector"], r["dir"]))
         final.append(r)
-    for r in final:
-        if tg(rec_msg(r, now)):
+        for r in final:
+        if tg_pro(rec_msg_pro(r, now)):
             _rec_save(now, kind, r, True)
     if not final:
         extra = (" | بيانات ناقصة: " + ", ".join(res["bad"][:6])) if res["bad"] else ""
@@ -2010,9 +2010,53 @@ def main():
             log.exception("خطأ تشغيلي: %s", e)
         time.sleep(20)
 
+def rec_msg_pro(r, now):
+    ksa = now.astimezone(RIYADH)
+    up = r["dir"] == 1
+    sig = ("SHARP RISE 🟢" if up else "SHARP DROP 🔴") if r["fp"] >= 4 else "NORMAL MOVE ⚪"
+    exp = datetime.strptime(r["expiry"], "%Y-%m-%d")
+    dte = "0DTE" if r["dte"] == 0 else f"{r['dte']}DTE"
+    bar = lambda p: "▰" * max(0, min(10, round(p / 10))) + "▱" * (10 - max(0, min(10, round(p / 10))))
+    box = "\n".join([
+        "╔══════════════════╗",
+        "║  💎 SAFAA SIGNAL  ║",
+        "╚══════════════════╝",
+        f"▌ {r['sym']}   {r['side']}   {r['strike']:g}",
+        f"▌ EXP    {exp:%d/%m}   {dte}",
+        f"▌ SPOT   {r['spot']:.2f}",
+        f"▌ ENTRY  {r['mid'] * 0.92:.2f} → {r['mid'] * 1.08:.2f}",
+        "▌",
+        f"▌ T1     {r['t1']:.2f}   ▸ {r['c_t1']:.2f}",
+        f"▌ T2     {r['t2']:.2f}   ▸ {r['c_t2']:.2f}",
+        f"▌ STOP   {r['stop']:.2f}   ▸ {r['c_stop']:.2f}",
+        f"▌ CANCEL 5m close {'below' if up else 'above'} {r['lvl']:.2f}",
+        "▌",
+        f"▌ {sig}",
+        f"▌ BLAST  {bar(r['fp'] / 6 * 100)} {r['fp'] / 6 * 100:.0f}%",
+        f"▌ SCORE  {bar(r['score'])} {r['score']:.0f}%",
+        "╚══════════════════",
+        f"{now:%H:%M} NY · {ksa:%H:%M} KSA",
+    ])
+    return "\n".join([
+        f"<pre>{box}</pre>",
+        f"📈 الدقة التاريخية: {rec_accuracy()}",
+        "تحليل احتمالي — لا يوجد ضمان للربح",
+        "",
+        "<b>✦ ⚡ أبو سحاب ⚡ ✦</b>",
+    ])
 
-if __name__ == "__main__":
-    main()
+
+def tg_pro(text):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text[:4000], "parse_mode": "HTML",
+                                "disable_web_page_preview": True}, timeout=15)
+        if r.status_code != 200:
+            log.error("تيليجرام: %s", r.text[:200])
+        return r.status_code == 200
+    except Exception as e:
+        log.error("خطأ تيليجرام: %s", e)
+        return False
 
 
 if __name__ == "__main__":
