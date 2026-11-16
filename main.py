@@ -514,12 +514,24 @@ def get_nasdaq(now):
 
 
 def get_nyse_breadth(now):
-    df = yf_hist("^ADD", "5d", "5m")
-    if age_min(df) > MAX_STALE_MIN:
-        raise SourceError("ADD متأخر")
-    v = float(df.Close.iloc[-1])
-    return dict(add=v, score=math.tanh(v / 1500.0))
-
+    rsp = yf_hist("RSP", "5d", "5m")
+    spy = yf_hist("SPY", "5d", "5m")
+    if age_min(rsp) > MAX_STALE_MIN or age_min(spy) > MAX_STALE_MIN:
+        raise SourceError("RSP/SPY متأخر")
+    today = now.date()
+    days = sorted({d for d in rsp.index.date if d < today})
+    if not days:
+        raise SourceError("Breadth: لا يوجد إغلاق سابق")
+    rsp_pc = session_close(rsp, days[-1])
+    spy_pc = session_close(spy, days[-1])
+    if not rsp_pc or not spy_pc:
+        raise SourceError("Breadth: تعذر تحديد الإغلاق السابق")
+    rsp_ret = (float(rsp.Close.iloc[-1]) / rsp_pc - 1) * 100
+    spy_ret = (float(spy.Close.iloc[-1]) / spy_pc - 1) * 100
+    spread = rsp_ret - spy_ret
+    # يلتقط الصعود/الهبوط الجماعي ويكشف التباعد إذا صعدت القياديات وحدها
+    raw = rsp_ret - 0.5 * spy_ret
+    return dict(rsp_ret=rsp_ret, spy_ret=spy_ret, spread=spread, score=math.tanh(raw / 0.5))
 
 def get_credit_spread(now):
     hyg = yf_hist("HYG", "5d", "5m")
@@ -812,8 +824,9 @@ def build_forecast(d, now):
         L.append("الأكبر وزناً: " + " | ".join(f"{i['sym']} {i['ret']:+.1f}%" for i in ld["top"]))
     else:
         L.append("الشركات الكبرى: غير متاح")
-    if nyse:
-        L.append(f"اتساع NYSE (ADD): {nyse['add']:.0f}")
+        if nyse:
+        L.append(f"اتساع السوق (RSP/SPY): {nyse['rsp_ret']:+.2f}% (فرق {nyse['spread']:+.2f}%)")
+
     if br and br.get("sectors_up") is not None:
         L.append(f"Breadth (قطاعات): {br['sectors_up']*100:.0f}% صاعدة")
     elif not nyse:
