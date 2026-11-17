@@ -1,1833 +1,761 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل v115.0 | SPY 0-DTE | ADAPTIVE ENGINE | PAPER ONLY
-- Conviction score + graded sizing     - Analog forecasting (kNN)
-- EV engine (edge vs option price)     - Meta-labeling (online logistic)
-- Thompson sampling over strategies    - Volatility engine (straddle vs realized)
-- Put-call parity + gamma walls        - Levels / ORB / heavy-weights
-- Smart exits (partial/BE/trail/time/reversal/level/invalidation)
-- Mid-price entry escalation           - Shadow mode + daily report
+صَفاء التحليل SPX — نسخة المصادر المجانية v1
+تصميم أبو سحاب
+تحليل احتمالي فقط — لا تنفيذ تلقائي — Fail Closed
 """
-import os, sys, json, time, uuid, math, re, logging, hashlib, random, shutil
-from pathlib import Path
-from datetime import datetime, date, timedelta, timezone
+import os, re, json, gzip, math, time, sqlite3, logging
+from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
+
 import requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
-# ========================= 1) CONFIG =========================
-VERSION = "115.0"
-UNDERLYING = "SPY"
+# ============================ الإعدادات ============================
 NY = ZoneInfo("America/New_York")
-UTC = timezone.utc
-
-BASE_DIR = Path(os.getenv("BOT_DATA_DIR", "."))
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = BASE_DIR / "safaa_v115_state.json"
-LEDGER_FILE = BASE_DIR / "safaa_v115_ledger.json"
-INIT_FILE = BASE_DIR / "safaa_v115_initialized.flag"
-LOCK_FILE = BASE_DIR / "safaa_v115.lock"
-
-API_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
-API_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
-TRADING_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-if "paper" not in TRADING_URL.lower():
-    raise RuntimeError("v115 تعمل على Paper فقط.")
-if os.getenv("ALLOW_LIVE_TRADING", "false").lower() == "true":
-    raise RuntimeError("التداول الحقيقي ممنوع.")
-
-ALL_STRATEGIES = ["CALL", "PUT", "BULL_CALL_SPREAD", "BEAR_PUT_SPREAD",
-                  "BULL_PUT_SPREAD", "BEAR_CALL_SPREAD"]
-STRATEGY_MODE = os.getenv("STRATEGY_MODE", "SINGLES").upper()
-if STRATEGY_MODE not in ("AUTO", "SINGLES") and STRATEGY_MODE not in ALL_STRATEGIES:
-    raise RuntimeError(f"STRATEGY_MODE غير صالح: {STRATEGY_MODE}")
-
-# --- Risk (مرنة، تتدرج حسب القناعة)
-RISK_BASE = 0.02
-RISK_MAX = 0.04
-MAX_DAILY_DRAWDOWN = 0.06
-MAX_PREMIUM_FRACTION = 0.05
-MAX_OPEN_POSITIONS = 2
-MAX_TRADES_PER_DAY = 8
-MAX_CONSECUTIVE_LOSSES = 4
-MAX_CONTRACTS = 20
-SINGLE_RISK_FRACTION = 0.60
-ADD_ON_MIN_RETURN = 0.25
-
-# --- Conviction / edge
-CONV_MIN = 30
-MIN_EV_RATIO = 0.02
-META_MIN_N = 10**9
-META_MIN_P = 0.42
-SHADOW_MIN_SCORE = 20
-SHADOW_HORIZON = 15
-SHADOW_WIN_ATR = 0.25
-
-# --- Options selection
-TARGET_DELTA_MIN, TARGET_DELTA_MAX, TARGET_DELTA = 0.38, 0.68, 0.50
-SPREAD_DELTA_MIN, SPREAD_DELTA_MAX = 0.10, 0.70
-MAX_SPREAD_PERCENT = 0.15
-MIN_OPTION_ASK, MAX_OPTION_ASK = 0.15, 9.00
-STRIKE_WINDOW = 15.0
-SPREAD_MIN_WIDTH, SPREAD_MAX_WIDTH = 1.0, 5.0
-SPREAD_MAX_DEBIT, SPREAD_MIN_CREDIT = 3.5, 0.12
-MAX_OPTION_QUOTE_AGE = 90
-
-# --- Exits
-HARD_STOP = 0.45
-STOP_ATR_MULT = 0.9          # إبطال الفكرة على سعر SPY بوحدات ATR15
-BREAKEVEN_AFTER = 0.20
-PARTIAL_AT = 0.30
-TP_FULL = 0.90
-TRAIL_ACTIVATE = 0.40
-TIME_STOP_SEC = 900
-REVERSAL_CONV = 55
-
-# --- Times (دقائق من منتصف الليل بتوقيت نيويورك)
-ENTRY_START = 9 * 60 + 55
-ENTRY_END = 14 * 60
-LATE_SPREAD_AFTER = 14 * 60
-FORCE_EXIT = 15 * 60 + 45
-DEAD_ZONE = (11 * 60 + 30, 13 * 60 + 30)
-
-# --- Execution
-SCAN_SECONDS = 10
-REQUEST_TIMEOUT = 15
-MAX_API_RETRIES = 3
-ENTRY_STEPS = [0.30, 0.55, 0.80, 1.00]   # نسبة من bid إلى ask
-ENTRY_STEP_SECONDS = 12
-EXIT_ORDER_TIMEOUT = 20
-RECONCILE_INTERVAL = 30
-
-# --- Indicators
-RSI_PERIOD = 14
-MIN_SESSION_BARS = 26
-SPY_MAX_BAR_AGE = 150
-ANALOG_K = 150
-ANALOG_MIN_ROWS = 400
-HEAVY = ["AAPL", "MSFT", "NVDA", "AMZN"]
-FEED = os.getenv("ALPACA_STOCK_FEED", "iex").lower().strip()
-OPT_FEED = os.getenv("ALPACA_OPTIONS_FEED", "indicative")
-
-# أحداث الأخبار بتوقيت نيويورك: "2026-11-12 08:30,2026-12-09 14:00"
-NEWS_EVENTS_RAW = os.getenv("NEWS_EVENTS_NY", "")
-
-# ========================= 2) LOGGING / EXCEPTIONS =========================
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout),
-              logging.FileHandler(BASE_DIR / "safaa_v115.log", encoding="utf-8")])
-log = logging.getLogger("SAFAA115")
 
 
-class APIError(Exception): pass
-class SafetyHalt(Exception): pass
-class EntryBlocked(Exception): pass
-class MarketDataUnavailable(Exception): pass
+def env(k, d=""):
+    return os.getenv(k, d).strip()
 
 
-# ========================= 3) HELPERS =========================
-def utc_now(): return datetime.now(UTC)
-def utc_iso(): return utc_now().isoformat()
-def ny_now(): return datetime.now(NY)
-def today_ny(): return ny_now().date()
-def today_str(): return today_ny().isoformat()
-def minutes_ny(): n = ny_now(); return n.hour * 60 + n.minute
-def make_id(p): return f"{p}-{uuid.uuid4().hex[:20]}"
-def clamp(x, lo, hi): return max(lo, min(hi, x))
-def sign(x): return 1 if x > 0 else -1 if x < 0 else 0
-def average(v): return sum(v) / len(v) if v else None
+ALPACA_KEY = env("APCA_API_KEY_ID")
+ALPACA_SECRET = env("APCA_API_SECRET_KEY")
+DATA_URL = env("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+STOCK_FEED = env("ALPACA_STOCK_FEED", "iex")
+FRED_KEY = env("FRED_API_KEY")
+TG_TOKEN = env("TELEGRAM_BOT_TOKEN")
+TG_CHAT = env("TELEGRAM_CHAT_ID")
+DB_PATH = env("DB_PATH", "./data/safaa_spx.db")
+MAX_STALE_MIN = int(env("MAX_STALE_MIN", "35"))      # البيانات المجانية متأخرة ~15 دقيقة
+UPDATE_MINUTES = int(env("UPDATE_MINUTES", "60"))
+_DEF_W = "NVDA:7.5,AAPL:6.5,MSFT:6.5,AMZN:4,GOOGL:4,META:3,AVGO:2.5,TSLA:2,JPM:1.5,LLY:1.3"
+LEADER_W = {k.strip().upper(): float(v) for k, v in
+            (p.split(":") for p in env("LEADER_WEIGHTS", _DEF_W).split(",") if ":" in p)}
+LEADERS = list(LEADER_W.keys())
+SECTORS = env("SECTORS", "XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLU").split(",")
+SIGNATURE = "⚡ تصميم أبو سحاب"
+CRITICAL = ["SPX", "ES", "VIX", "CHAIN"]   # تعطل أي منها = توقف الإصدار
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("safaa_spx")
 
 
-def safe_float(v, default=None):
+class SourceError(Exception):
+    pass
+
+
+def now_ny():
+    return datetime.now(NY)
+
+
+def is_rth(now):
+    m = now.hour * 60 + now.minute
+    return now.weekday() < 5 and 570 <= m < 960
+
+
+def n0(v):
+    return "—" if v is None else f"{v:,.0f}"
+
+
+# ============================ التخزين ============================
+def init_db():
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT,
+            anchor REAL, hi REAL, lo REAL, hi_near REAL, hi_far REAL, lo_near REAL, lo_far REAL,
+            p_up REAL, p_down REAL, p_neutral REAL, score REAL,
+            data_quality REAL, agreement REAL, payload TEXT)""")
+        c.execute("CREATE TABLE IF NOT EXISTS realized (day TEXT PRIMARY KEY, high REAL, low REAL, close REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS data_quality (ts TEXT, source TEXT, ok INTEGER, detail TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS gex_levels (
+            ts TEXT, spot REAL, flip REAL, call_wall REAL, put_wall REAL, net_gex REAL, regime TEXT)""")
+        c.execute("CREATE TABLE IF NOT EXISTS options_snapshots (ts TEXT, blob BLOB)")
+
+
+def kv_get(k):
+    with sqlite3.connect(DB_PATH) as c:
+        r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return r[0] if r else None
+
+
+def kv_set(k, v):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+
+
+def save_quality(now, q):
+    with sqlite3.connect(DB_PATH) as c:
+        c.executemany("INSERT INTO data_quality VALUES (?,?,?,?)",
+                      [(now.isoformat(timespec="seconds"), n, int(ok), msg) for n, (ok, msg) in q.items()])
+
+
+def save_prediction(now, kind, fc):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("""INSERT INTO predictions (ts,day,kind,anchor,hi,lo,hi_near,hi_far,lo_near,lo_far,
+                     p_up,p_down,p_neutral,score,data_quality,agreement,payload)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (now.isoformat(timespec="seconds"), now.date().isoformat(), kind, fc["anchor"], fc["hi"], fc["lo"],
+                   fc["hi_near"], fc["hi_far"], fc["lo_near"], fc["lo_far"],
+                   fc["probs"]["up"], fc["probs"]["down"], fc["probs"]["neutral"], fc["score"],
+                   fc["data_quality"], fc["agreement"], json.dumps(fc, default=float, ensure_ascii=False)))
+        g = fc["gex"]
+        c.execute("INSERT INTO gex_levels VALUES (?,?,?,?,?,?,?)",
+                  (now.isoformat(timespec="seconds"), g["spot"], g["flip"], g["call_wall"], g["put_wall"],
+                   g["net"], g["regime"]))
+
+
+def save_snapshot(now, chain):
+    """لقطة مضغوطة للسلسلة — هذه بيانات التدريب المستقبلية (لا يوجد تاريخ خيارات مجاني)."""
     try:
-        r = float(v)
-        return r if math.isfinite(r) else default
-    except (TypeError, ValueError):
-        return default
+        df = chain["df"]
+        spot = chain["spot"]
+        today = now.date()
+        x = df[(df.exp >= today) & (df.exp <= today + timedelta(days=7)) &
+               (df.strike.between(spot * 0.94, spot * 1.06))].copy()
+        x["exp"] = x["exp"].astype(str)
+        blob = gzip.compress(x.to_json(orient="records").encode())
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("INSERT INTO options_snapshots VALUES (?,?)", (now.isoformat(timespec="seconds"), blob))
+    except Exception as e:
+        log.warning("تعذر حفظ اللقطة: %s", e)
 
 
-def parse_ts(value):
-    if not value: return None
+# ============================ التيليجرام ============================
+def tg(text):
+    if not TG_TOKEN or not TG_CHAT:
+        log.warning("بيانات التيليجرام غير مكتملة")
+        return False
     try:
-        p = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if p.tzinfo is None: p = p.replace(tzinfo=UTC)
-        return p.astimezone(UTC)
-    except Exception:
-        return None
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text[:4000], "disable_web_page_preview": True}, timeout=15)
+        return r.status_code == 200
+    except Exception as e:
+        log.error("خطأ تيليجرام: %s", e)
+        return False
 
 
-def seconds_since(iso):
-    t = parse_ts(iso)
-    return (utc_now() - t).total_seconds() if t else 10 ** 9
-
-
-def std(v):
-    if len(v) < 2: return 0.0
-    m = sum(v) / len(v)
-    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
-
-
-def atomic_write_json(path, data):
-    tmp = Path(str(path) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-        f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-def read_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def format_money(v):
-    try: return f"${float(v):,.2f}"
-    except (TypeError, ValueError): return "غير متاح"
-
-
-# ========================= 4) HTTP =========================
-SESSION = requests.Session()
-SESSION.headers.update({"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET,
-                        "Content-Type": "application/json"})
-
-
-def api_request(method, url, params=None, payload=None):
-    method = method.upper()
-    attempts = 1 if method == "POST" else MAX_API_RETRIES
-    last = None
-    for a in range(attempts):
-        try:
-            r = SESSION.request(method, url, params=params, json=payload, timeout=REQUEST_TIMEOUT)
-            if r.status_code >= 400:
-                try: detail = r.json()
-                except Exception: detail = r.text[:500]
-                raise APIError(f"{method} {url} HTTP {r.status_code}: {detail}")
-            return r.json() if r.text else {}
-        except APIError:
-            raise
-        except requests.RequestException as exc:
-            last = exc
-            if method == "POST":
-                raise APIError("نتيجة POST غير مؤكدة.")
-            if a + 1 < attempts: time.sleep(1.2 * (a + 1))
-    raise APIError(str(last))
-
-
-def trading_api(m, path, params=None, payload=None):
-    return api_request(m, f"{TRADING_URL}{path}", params, payload)
-
-
-def data_api(m, path, params=None):
-    return api_request(m, f"{DATA_URL}{path}", params)
-
-
-# ========================= 5) LOCK / STATE / LEDGER =========================
-_LOCK = None
-
-
-def acquire_instance_lock():
-    global _LOCK
+# ============================ طبقة جمع البيانات ============================
+def yf_hist(sym, period, interval):
     try:
-        import fcntl
-    except ImportError:
-        raise SafetyHalt("تعذر استخدام قفل النظام.")
-    _LOCK = open(LOCK_FILE, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise SafetyHalt("نسخة أخرى تعمل بالفعل.")
-    _LOCK.seek(0); _LOCK.truncate(); _LOCK.write(str(os.getpid())); _LOCK.flush()
+        df = yf.Ticker(sym).history(period=period, interval=interval,
+                                    prepost=(interval != "1d"), auto_adjust=False)
+    except Exception as e:
+        raise SourceError(f"{sym}: {str(e)[:80]}")
+    if df is None or df.empty:
+        raise SourceError(f"{sym}: لا توجد بيانات")
+    df = df.dropna(subset=["Close"]).copy()
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    df.index = idx.tz_convert(NY)
+    return df
 
 
-def default_state():
-    now = utc_iso()
-    return {"version": VERSION, "created_at": now, "updated_at": now,
-            "halted": False, "halt_reason": None, "halt_scope": None,
-            "trading_day": today_str(), "starting_equity": None, "daily_pnl": 0.0,
-            "trades_today": 0, "consecutive_losses": 0, "last_candle_id": None,
-            "last_reconciliation": None, "telegram_offset": None, "position_meta": {},
-            "meta_w": [0.0] * 8, "meta_n": 0, "ts": {}, "last_decision": "لا قرار بعد.",
-            "report_day": None, "day_rejects": {}}
+def age_min(df):
+    return (now_ny() - df.index[-1].to_pydatetime()).total_seconds() / 60.0
 
 
-def default_ledger():
-    return {"version": VERSION, "orders": {}, "closed_trades": [], "events": [], "shadow": []}
+def daily_completed(sym, today):
+    df = yf_hist(sym, "3mo", "1d")
+    df = df[df.index.date < today]
+    if len(df) < 15:
+        raise SourceError(f"{sym}: تاريخ يومي غير كافٍ")
+    return df
 
 
-STATE = None
-LEDGER = None
-CTX = {}          # آخر سياق سوق
-ANALOG = {"day": None, "rows": [], "retry_at": 0}
-_CACHE = {"clock": (0, None), "account": (0, None), "levels": (None, None), "heavy": (0, 0.0)}
+def session_close(df, day):
+    m = df.index.hour * 60 + df.index.minute
+    d = df[(df.index.date == day) & (m < 960)]
+    return float(d["Close"].iloc[-1]) if not d.empty else None
 
 
-def save_state():
-    STATE["updated_at"] = utc_iso()
-    atomic_write_json(STATE_FILE, STATE)
-
-
-def save_ledger():
-    atomic_write_json(LEDGER_FILE, LEDGER)
-
-
-def ledger_event(kind, data=None):
-    LEDGER["events"].append({"id": make_id("EVT"), "type": kind, "timestamp": utc_iso(), "data": data or {}})
-    LEDGER["events"] = LEDGER["events"][-3000:]
-    save_ledger()
-
-
-def halt_bot(reason, scope="MANUAL"):
-    STATE["halted"] = True; STATE["halt_reason"] = str(reason); STATE["halt_scope"] = scope
-    save_state()
-    log.critical("TRADING HALTED (%s): %s", scope, reason)
-
-
-def ensure_not_halted():
-    if STATE.get("halted"):
-        raise SafetyHalt(STATE.get("halt_reason") or "البوت متوقف.")
-
-
-def note_reject(reason):
-    d = STATE.setdefault("day_rejects", {})
-    d[reason] = d.get(reason, 0) + 1
-    log.info("[REJECT] %s", reason)
-
-
-def initialize_storage():
-    global STATE, LEDGER
-    if INIT_FILE.exists():
-        if not STATE_FILE.exists() or not LEDGER_FILE.exists():
-            raise SafetyHalt("ملفات الحالة مفقودة.")
-        try:
-            STATE = read_json(STATE_FILE); LEDGER = read_json(LEDGER_FILE)
-        except Exception as exc:
-            raise SafetyHalt(f"تعذر قراءة الحالة: {exc}")
-        for k, v in default_state().items(): STATE.setdefault(k, v)
-        for k, v in default_ledger().items(): LEDGER.setdefault(k, v)
-        STATE["version"] = VERSION
-        save_state()
-        return
-    acc = trading_api("GET", "/v2/account")
-    if acc.get("status") != "ACTIVE":
-        raise SafetyHalt(f"الحساب غير نشط: {acc.get('status')}")
-    STATE, LEDGER = default_state(), default_ledger()
-    STATE["starting_equity"] = safe_float(acc.get("equity"))
-    if not STATE["starting_equity"]:
-        raise SafetyHalt("تعذر تحديد رأس المال.")
-    save_state(); save_ledger()
-    INIT_FILE.write_text(f"Initialized {utc_iso()} v{VERSION}\n")
-
-
-# ========================= 6) ACCOUNT / CLOCK =========================
-def get_account(max_age=8):
-    t, v = _CACHE["account"]
-    if v is not None and time.time() - t < max_age: return v
-    v = trading_api("GET", "/v2/account")
-    _CACHE["account"] = (time.time(), v)
-    return v
-
-
-def get_equity():
-    e = safe_float(get_account().get("equity"))
-    if not e or e <= 0: raise SafetyHalt("Equity غير صالح.")
-    return e
-
-
-def get_clock():
-    t, v = _CACHE["clock"]
-    if v is not None and time.time() - t < 15: return v
-    v = trading_api("GET", "/v2/clock")
-    _CACHE["clock"] = (time.time(), v)
-    return v
-
-
-def market_open(): return bool(get_clock().get("is_open", False))
-
-
-def entry_time_allowed():
-    n = ny_now()
-    return n.weekday() < 5 and ENTRY_START <= minutes_ny() <= ENTRY_END
-
-
-def force_exit_time_reached(): return minutes_ny() >= FORCE_EXIT
-
-
-def any_pending_orders():
-    return any(m.get("status") in ("PENDING_ENTRY", "PENDING_LEG1", "PENDING_LEG2", "PENDING_EXIT")
-           for m in STATE["position_meta"].values())
-
-
-def parse_events():
-    out = []
-    for item in NEWS_EVENTS_RAW.split(","):
-        item = item.strip()
-        if not item: continue
-        try: out.append(datetime.strptime(item, "%Y-%m-%d %H:%M").replace(tzinfo=NY))
-        except ValueError: log.warning("حدث خبر غير صالح: %s", item)
+def get_spx(now):
+    today = now.date()
+    dd = daily_completed("^GSPC", today)
+    tr = pd.concat([dd.High - dd.Low, (dd.High - dd.Close.shift()).abs(),
+                    (dd.Low - dd.Close.shift()).abs()], axis=1).max(axis=1)
+    prev = float(dd.Close.iloc[-1])
+    out = dict(prev_close=prev, atr=float(tr.tail(14).mean()), spot=prev,
+               day_high=None, day_low=None, closes=None)
+    if is_rth(now):
+        df = yf_hist("^GSPC", "5d", "5m")
+        a = age_min(df)
+        t = df[df.index.date == today]
+        if t.empty or a > MAX_STALE_MIN:
+            raise SourceError(f"SPX متأخر {a:.0f} دقيقة")
+        out.update(spot=float(t.Close.iloc[-1]), day_high=float(t.High.max()),
+                   day_low=float(t.Low.min()), closes=df.Close.tail(60))
     return out
 
 
-NEWS_EVENTS = parse_events()
+def get_future(sym, now):
+    df = yf_hist(sym, "5d", "5m")
+    a = age_min(df)
+    if a > MAX_STALE_MIN:
+        raise SourceError(f"{sym} متأخر {a:.0f} دقيقة")
+    today = now.date()
+    days = sorted({d for d in df.index.date if d < today})
+    if not days:
+        raise SourceError(f"{sym}: لا يوجد إغلاق سابق")
+    pdv = days[-1]
+    pc = session_close(df, pdv)
+    if not pc:
+        raise SourceError(f"{sym}: تعذر تحديد الإغلاق السابق")
+    last = float(df.Close.iloc[-1])
+    cut = datetime.combine(pdv, dtime(16, 0), tzinfo=NY)
+    on = df[df.index > cut]
+    return dict(last=last, prev_close=pc, ret_pct=(last / pc - 1) * 100,
+                on_high=float(on.High.max()), on_low=float(on.Low.min()), closes=df.Close.tail(60))
 
 
-def news_state():
-    now = ny_now()
-    for ev in NEWS_EVENTS:
-        d = (ev - now).total_seconds() / 60
-        if 0 < d <= 3: return "FLAT"
-        if -3 <= d <= 10: return "BLOCK"
-    return None
-
-
-def refresh_daily_baseline():
-    day = today_str()
-    if STATE["trading_day"] == day: return
-    process_orders()
-    if any_pending_orders(): return
-    if get_option_positions():
-        raise SafetyHalt("تغير اليوم مع وجود مراكز مفتوحة؛ تحقق يدوياً.")
-    if STATE["position_meta"]:
-        ledger_event("STALE_META_CLEARED", dict(STATE["position_meta"]))
-        STATE["position_meta"] = {}
-    eq = get_equity()
-    STATE.update({"trading_day": day, "starting_equity": eq, "daily_pnl": 0.0, "trades_today": 0,
-                  "consecutive_losses": 0, "day_rejects": {}})
-    if STATE.get("halted") and STATE.get("halt_scope") == "DAY":
-        STATE["halted"] = False; STATE["halt_reason"] = None; STATE["halt_scope"] = None
-    save_state()
-    log.info("يوم جديد | Equity=%.2f", eq)
-
-
-def check_daily_risk():
-    ensure_not_halted()
-    start = safe_float(STATE.get("starting_equity"))
-    if not start or start <= 0: raise SafetyHalt("رأس مال مرجعي غير صالح.")
-    pnl = get_equity() - start
-    STATE["daily_pnl"] = pnl
-    if pnl <= -(start * MAX_DAILY_DRAWDOWN):
-        halt_bot(f"حد الخسارة اليومية: {pnl:.2f}", "DAY"); raise SafetyHalt("حد الخسارة اليومية")
-    if STATE["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
-        halt_bot("خسائر متتالية.", "DAY"); raise SafetyHalt("خسائر متتالية")
-
-
-# ========================= 7) MARKET DATA =========================
-def parse_bar(item):
+def get_vix(now):
+    today = now.date()
+    dd = daily_completed("^VIX", today)
+    prev = float(dd.Close.iloc[-1])
+    vix = prev
+    rth = is_rth(now)
+    if rth:
+        df = yf_hist("^VIX", "5d", "5m")
+        if age_min(df) > MAX_STALE_MIN:
+            raise SourceError("VIX متأخر")
+        vix = float(df.Close.iloc[-1])
+    v9 = None
     try:
-        t = parse_ts(item.get("t"))
-        b = {"t": t, "open": float(item["o"]), "high": float(item["h"]),
-             "low": float(item["l"]), "close": float(item["c"]), "volume": float(item["v"])}
-    except (TypeError, ValueError, KeyError):
-        return None
-    if not t or min(b["open"], b["high"], b["low"], b["close"]) <= 0: return None
-    if b["high"] < b["low"] or b["volume"] < 0: return None
-    if b["high"] < max(b["open"], b["close"]) or b["low"] > min(b["open"], b["close"]): return None
-    return b
+        d9 = daily_completed("^VIX9D", today)
+        v9 = float(d9.Close.iloc[-1])
+        if rth:
+            v9 = float(yf_hist("^VIX9D", "5d", "5m").Close.iloc[-1])
+    except SourceError:
+        pass
+    return dict(vix=vix, prev=prev, chg_pct=(vix / prev - 1) * 100, vix9d=v9)
 
 
-def fetch_bars_paged(symbol, timeframe, start, end):
-    out, token = [], None
-    for _ in range(10):
-        params = {"timeframe": timeframe, "start": start.isoformat(), "end": end.isoformat(),
-                  "limit": 10000, "adjustment": "raw", "feed": FEED, "sort": "asc"}
-        if token: params["page_token"] = token
-        r = data_api("GET", f"/v2/stocks/{symbol}/bars", params)
-        out += [parse_bar(x) for x in (r.get("bars") or [])]
-        token = r.get("next_page_token")
-        if not token: break
-    return [b for b in out if b]
+# ---- خيارات SPX من ملفات Cboe المتأخرة (مجانية، رابط غير رسمي) ----
+CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json"
+OPT_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 
-def get_spy_bars():
-    last = None
-    for attempt in range(2):
-        try:
-            now = utc_now()
-            r = data_api("GET", f"/v2/stocks/{UNDERLYING}/bars", {
-                "timeframe": "1Min", "limit": 1000, "adjustment": "raw", "feed": FEED,
-                "sort": "desc", "start": (now - timedelta(hours=8)).isoformat(), "end": now.isoformat()})
-            bars = [parse_bar(x) for x in (r.get("bars") or [])]
-            bars = sorted({b["t"]: b for b in bars if b}.values(), key=lambda x: x["t"])
-            done = [b for b in bars if b["t"] + timedelta(minutes=1) <= now]
-            if len(done) < MIN_SESSION_BARS: raise MarketDataUnavailable("شموع غير كافية.")
-            age = (now - (done[-1]["t"] + timedelta(minutes=1))).total_seconds()
-            if age > SPY_MAX_BAR_AGE: raise MarketDataUnavailable(f"بيانات قديمة {age:.0f}s")
-            return done
-        except (APIError, MarketDataUnavailable) as exc:
-            last = exc
-            time.sleep(1.5)
-    raise MarketDataUnavailable(str(last))
+def gex_levels(spot, df, today, max_dte=7, band=0.06):
+    x = df.copy()
+    x["dte"] = x["exp"].map(lambda e: (e - today).days)
+    z = x[x.dte == 0]
+    z_ratio = float(z[z.cp == "C"].vol.sum() / max(1.0, z[z.cp == "P"].vol.sum())) if not z.empty else None
+    x = x[(x.dte >= 0) & (x.dte <= max_dte) & (x.strike.between(spot * (1 - band), spot * (1 + band)))
+          & (x.gamma > 0) & (x.oi > 0)].copy()
+    if x.empty:
+        raise SourceError("GEX: لا توجد عقود صالحة")
+    sign = np.where(x.cp == "C", 1.0, -1.0)
+    x["gex"] = x.gamma * x.oi * 100 * spot * spot * 0.01 * sign   # دولار لكل 1% حركة
+    by = x.groupby("strike").gex.sum().sort_index()
+    calls = x[x.cp == "C"].groupby("strike").gex.sum()
+    puts = x[x.cp == "P"].groupby("strike").gex.sum()
+    above = calls[calls.index >= spot]
+    below = puts[puts.index <= spot]
+    call_wall = float(above.idxmax()) if not above.empty else None
+    put_wall = float(below.idxmin()) if not below.empty else None
+    cum = by.cumsum()
+    s = np.sign(cum.values)
+    cross = [i for i in range(1, len(s)) if s[i] != s[i - 1] and s[i] != 0]
+    flip = float(cum.index[min(cross, key=lambda i: abs(cum.index[i] - spot))]) if cross else None
+    net = float(by.sum())
+    regime = ("POSITIVE" if spot > flip else "NEGATIVE") if flip else ("POSITIVE" if net > 0 else "NEGATIVE")
+    tot = x.gex.abs().sum()
+    z_share = float(x[x.dte == 0].gex.abs().sum() / tot) if tot > 0 else 0.0
+    return dict(spot=float(spot), flip=flip, call_wall=call_wall, put_wall=put_wall, net=net,
+                regime=regime, zero_dte_share=z_share, zero_dte_cp_vol=z_ratio)
 
 
-def session_bars(bars, day=None):
-    day = day or today_ny()
-    out = []
-    for b in bars:
-        t = b["t"].astimezone(NY)
-        m = t.hour * 60 + t.minute
-        if t.date() == day and 570 <= m < 960: out.append(b)
-    return out
-
-
-def daily_levels():
-    day = today_str()
-    if _CACHE["levels"][0] == day: return _CACHE["levels"][1]
-    res = None
+def get_chain(now):
     try:
-        now = utc_now()
-        bars = fetch_bars_paged(UNDERLYING, "1Day", now - timedelta(days=12), now)
-        prev = [b for b in bars if b["t"].astimezone(NY).date() < today_ny()]
-        if prev:
-            b = prev[-1]
-            res = {"high": b["high"], "low": b["low"], "close": b["close"], "range": b["high"] - b["low"]}
-    except Exception as exc:
-        log.warning("تعذر جلب الشمعة اليومية: %s", exc)
-    _CACHE["levels"] = (day, res)
-    return res
-
-
-def heavy_bias():
-    t, v = _CACHE["heavy"]
-    if time.time() - t < 60: return v
-    val = 0.0
-    try:
-        now = utc_now()
-        r = data_api("GET", "/v2/stocks/bars", {
-            "symbols": ",".join(HEAVY), "timeframe": "5Min", "limit": 1000, "adjustment": "raw",
-            "feed": FEED, "sort": "asc", "start": (now - timedelta(hours=3)).isoformat()})
-        vals = []
-        for sym, arr in (r.get("bars") or {}).items():
-            bs = [parse_bar(x) for x in arr]
-            bs = [b for b in bs if b]
-            if len(bs) >= 4:
-                ch = (bs[-1]["close"] - bs[-4]["close"]) / bs[-4]["close"]
-                vals.append(clamp(ch / 0.002, -1, 1))
-        val = average(vals) or 0.0
-    except Exception as exc:
-        log.warning("heavy bias: %s", exc)
-    _CACHE["heavy"] = (time.time(), val)
-    return val
-
-
-# ========================= 8) INDICATORS =========================
-def ema(values, period):
-    if len(values) < period: return None
-    k = 2.0 / (period + 1)
-    r = sum(values[:period]) / period
-    for x in values[period:]: r = x * k + r * (1 - k)
-    return r
-
-
-def calc_rsi(values, period=RSI_PERIOD):
-    if len(values) <= period: return None
-    ch = [values[i] - values[i - 1] for i in range(1, len(values))]
-    g = [max(x, 0) for x in ch]; l = [max(-x, 0) for x in ch]
-    ag, al = average(g[:period]), average(l[:period])
-    for i in range(period, len(ch)):
-        ag = (ag * (period - 1) + g[i]) / period
-        al = (al * (period - 1) + l[i]) / period
-    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-
-
-def calc_atr(bars, period=14):
-    if len(bars) <= period: return None
-    trs = []
-    for i in range(1, len(bars)):
-        c, p = bars[i], bars[i - 1]
-        trs.append(max(c["high"] - c["low"], abs(c["high"] - p["close"]), abs(c["low"] - p["close"])))
-    return average(trs[-period:])
-
-
-def vwap_sigma(sb):
-    pv = vv = 0.0
-    for b in sb:
-        v = max(b["volume"], 0.0)
-        pv += (b["high"] + b["low"] + b["close"]) / 3 * v; vv += v
-    if vv <= 0: return None, None
-    vwap = pv / vv
-    var = sum(max(b["volume"], 0.0) * (((b["high"] + b["low"] + b["close"]) / 3) - vwap) ** 2 for b in sb) / vv
-    return vwap, max(math.sqrt(var), 0.10)
-
-
-def five_min_closes(sb):
-    g = {}
-    for b in sb:
-        t = b["t"].astimezone(NY)
-        g[(t.hour * 60 + t.minute) // 5] = b["close"]
-    return [g[k] for k in sorted(g)]
-
-
-def compute_indicators(sb):
-    closes = [b["close"] for b in sb]
-    e9, e21, rsi = ema(closes, 9), ema(closes, 21), calc_rsi(closes)
-    vwap, sigma = vwap_sigma(sb)
-    atr1 = calc_atr(sb)
-    if None in (e9, e21, rsi, vwap, atr1) or atr1 <= 0:
-        raise MarketDataUnavailable("تعذر حساب المؤشرات.")
-    vols = [b["volume"] for b in sb]
-    avg_v = average(vols[-21:-1])
-    vr = vols[-1] / avg_v if avg_v and avg_v > 0 else 1.0
-    orb = [b for b in sb if 570 <= (b["t"].astimezone(NY).hour * 60 + b["t"].astimezone(NY).minute) < 585]
-    or_ok = minutes_ny() >= 585 and len(orb) >= 10
-    last = closes[-31:]
-    path = sum(abs(last[i] - last[i - 1]) for i in range(1, len(last)))
-    er = abs(last[-1] - last[0]) / path if path > 0 else 0.0
-    sides = [sign(c - vwap) for c in last]
-    crosses = sum(1 for i in range(1, len(sides)) if sides[i] and sides[i - 1] and sides[i] != sides[i - 1])
-
-    # --- إضافة صائد الانفجارات: رصد الاختناق السعري ---
-    c20 = closes[-20:]
-    squeeze = False
-    if len(c20) == 20:
-        std20 = std(c20)
-        bb_width = 4 * std20           # عرض بولينجر
-        kc_width = 3 * atr1            # عرض كيلتنر التقريبي
-        squeeze = (bb_width < kc_width) # السعر يختنق ويستعد للانفجار
-    # --------------------------------------------------
-
-    return {"price": closes[-1], "prev": closes[-2], "closes": closes, "ema9": e9, "ema21": e21,
-            "rsi": rsi, "vwap": vwap, "sigma": sigma, "atr1": atr1, "scale": atr1 * math.sqrt(15),
-            "vr": vr, "day_open": sb[0]["open"], "day_hi": max(b["high"] for b in sb),
-            "day_lo": min(b["low"] for b in sb), "or_hi": max(b["high"] for b in orb) if or_ok else None,
-            "or_lo": min(b["low"] for b in orb) if or_ok else None, "closes5": five_min_closes(sb),
-            "er": er, "crosses": crosses, "t": sb[-1]["t"].isoformat(),
-            "squeeze": squeeze}
-
-
-def classify_regime(ind):
-    if ind["er"] >= 0.30: return "TREND"
-    if ind["er"] <= 0.15 and ind["crosses"] >= 3: return "RANGE"
-    return "MIXED"
-
-
-# ========================= 9) ANALOG FORECASTING (kNN) =========================
-KNN_W = [1.2, 1.0, 0.6, 1.1, 0.7, 0.4]
-
-
-def day_feature_rows(bars):
-    rows, closes, trs, vols = [], [], [], []
-    e9 = e21 = None
-    pv = vv = 0.0
-    gains, losses, ag, al = [], [], None, None
-    for i, b in enumerate(bars):
-        c = b["close"]; closes.append(c); vols.append(b["volume"])
-        e9 = c if e9 is None else c * 0.2 + e9 * 0.8
-        e21 = c if e21 is None else c * (2 / 22) + e21 * (1 - 2 / 22)
-        v = max(b["volume"], 0.0)
-        pv += (b["high"] + b["low"] + c) / 3 * v; vv += v
-        vwap = pv / vv if vv > 0 else c
-        pc = bars[i - 1]["close"] if i > 0 else c
-        trs.append(max(b["high"] - b["low"], abs(b["high"] - pc), abs(b["low"] - pc)))
-        if i > 0:
-            ch = c - pc; g = max(ch, 0.0); l = max(-ch, 0.0)
-            if ag is None:
-                gains.append(g); losses.append(l)
-                if len(gains) == RSI_PERIOD:
-                    ag, al = sum(gains) / RSI_PERIOD, sum(losses) / RSI_PERIOD
-            else:
-                ag = (ag * (RSI_PERIOD - 1) + g) / RSI_PERIOD
-                al = (al * (RSI_PERIOD - 1) + l) / RSI_PERIOD
-        if i < 25 or ag is None: continue
-        atr1 = sum(trs[-14:]) / 14
-        if atr1 <= 0: continue
-        rsi = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-        scale = atr1 * math.sqrt(15)
-        avg_v = sum(vols[-21:-1]) / 20
-        vr = v / avg_v if avg_v > 0 else 1.0
-        t = b["t"].astimezone(NY)
-        mins = t.hour * 60 + t.minute - 570
-        feat = [clamp((c - vwap) / scale, -4, 4), clamp((e9 - e21) / scale, -3, 3) * 2,
-                (rsi - 50) / 25, clamp((c - closes[i - 5]) / (atr1 * math.sqrt(5)), -4, 4),
-                mins / 390.0, clamp(vr, 0, 3) - 1]
-        rows.append({"i": i, "feat": feat, "scale": scale, "close": c})
-    return rows
-
-
-def attach_forward(rows, bars, horizon=SHADOW_HORIZON):
-    out, j, n = [], 0, len(bars)
-    for r in rows:
-        target = bars[r["i"]]["t"] + timedelta(minutes=horizon)
-        while j < n and bars[j]["t"] < target: j += 1
-        if j >= n: break
-        if (bars[j]["t"] - target).total_seconds() > 120: continue
-        out.append((r["feat"], (bars[j]["close"] - r["close"]) / r["scale"]))
-    return out
-
-
-def build_analog_db():
-    now = utc_now()
-    raw = fetch_bars_paged(UNDERLYING, "1Min", now - timedelta(days=32), now)
-    by_day = {}
-    for b in raw:
-        by_day.setdefault(b["t"].astimezone(NY).date(), []).append(b)
+        r = requests.get(CBOE_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+    except Exception as e:
+        raise SourceError(f"Cboe: {str(e)[:80]}")
+    if r.status_code != 200:
+        raise SourceError(f"Cboe HTTP {r.status_code}")
+    j = r.json().get("data", {})
+    spot = float(j.get("current_price") or 0)
     rows = []
-    for d, bars in by_day.items():
-        if d >= today_ny(): continue
-        sb = session_bars(bars, d)
-        if len(sb) < 200: continue
-        rows += attach_forward(day_feature_rows(sb), sb)
-    ANALOG["rows"] = rows
-    ANALOG["day"] = today_str()
-    log.info("ANALOG DB | rows=%s | days=%s", len(rows), len(by_day))
+    for o in j.get("options", []):
+        m = OPT_RE.match(o.get("option", ""))
+        if not m:
+            continue
+        root, ymd, cp, k = m.groups()
+        rows.append(dict(root=root, exp=datetime.strptime(ymd, "%y%m%d").date(), cp=cp, strike=int(k) / 1000.0,
+                         oi=float(o.get("open_interest") or 0), vol=float(o.get("volume") or 0),
+                         gamma=float(o.get("gamma") or 0), delta=float(o.get("delta") or 0),
+                         iv=float(o.get("iv") or 0)))
+    if not rows or spot <= 0:
+        raise SourceError("Cboe: بيانات فارغة")
+    df = pd.DataFrame(rows)
+    return dict(spot=spot, df=df, gex=gex_levels(spot, df, now.date()))
 
 
-def ensure_analog():
-    if ANALOG["day"] == today_str() or time.time() < ANALOG["retry_at"]: return
-    try:
-        build_analog_db()
-    except Exception as exc:
-        ANALOG["retry_at"] = time.time() + 900
-        log.warning("ANALOG BUILD FAILED: %s", exc)
+# ---- Alpaca المجاني (IEX) ----
+def ah():
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        raise SourceError("مفاتيح Alpaca غير مضبوطة")
+    return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
 
-def analog_forecast(feat):
-    rows = ANALOG["rows"]
-    if not feat or len(rows) < ANALOG_MIN_ROWS: return None
-    scored = []
-    for f, fwd in rows:
-        d = 0.0
-        for a, b, w in zip(feat, f, KNN_W): d += w * (a - b) ** 2
-        scored.append((d, fwd))
-    scored.sort(key=lambda x: x[0])
-    top = scored[:ANALOG_K]
-    wts = [1 / (1 + math.sqrt(d)) for d, _ in top]
-    sw = sum(wts)
-    return {"p_up": sum(w for w, (_, fw) in zip(wts, top) if fw > 0) / sw,
-            "mean": sum(w * fw for w, (_, fw) in zip(wts, top)) / sw,
-            "fwds": [fw for _, fw in top], "n": len(top)}
+def get_breadth(now):
+    if not is_rth(now):
+        raise SourceError("غير مؤكد قبل الافتتاح")
+    r = requests.get(f"{DATA_URL}/v2/stocks/snapshots", headers=ah(),
+                     params={"symbols": ",".join(LEADERS + SECTORS), "feed": STOCK_FEED}, timeout=15)
+    if r.status_code != 200:
+        raise SourceError(f"Alpaca HTTP {r.status_code}")
+    j = r.json()
+    j = j.get("snapshots", j)
+
+    def rets(names):
+        out = []
+        for s in names:
+            sn = j.get(s) or {}
+            p = (sn.get("latestTrade") or {}).get("p")
+            pc = (sn.get("prevDailyBar") or {}).get("c")
+            if p and pc:
+                out.append((p / pc - 1) * 100)
+        return out
+
+    L, S = rets(LEADERS), rets(SECTORS)
+    if len(L) < 5:
+        raise SourceError("بيانات القياديات غير كافية")
+    return dict(leaders_up=sum(v > 0 for v in L) / len(L), leaders_avg=float(np.mean(L)),
+                sectors_up=(sum(v > 0 for v in S) / len(S)) if S else None)
 
 
-# ========================= 10) OPTIONS CHAIN =========================
-OPTION_RE = re.compile(r"^SPY\d{6}[CP]\d{8}$")
+def get_spy_vwap(now):
+    if not is_rth(now):
+        raise SourceError("خارج الجلسة")
+    s = datetime.combine(now.date(), dtime(9, 30), tzinfo=NY).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get(f"{DATA_URL}/v2/stocks/SPY/bars", headers=ah(),
+                     params={"timeframe": "1Min", "start": s, "limit": 1000, "feed": STOCK_FEED}, timeout=15)
+    bars = (r.json().get("bars") or []) if r.status_code == 200 else []
+    if len(bars) < 10:
+        raise SourceError("VWAP: شموع غير كافية")
+    df = pd.DataFrame(bars)
+    vwap = (((df.h + df.l + df.c) / 3) * df.v).sum() / df.v.sum()
+    return dict(dist_pct=float((df.c.iloc[-1] / vwap - 1) * 100))
 
 
-def get_option_snapshots(symbols):
-    symbols = list(dict.fromkeys(str(s).strip() for s in symbols if s))
+def fred_last(series):
+    if not FRED_KEY:
+        raise SourceError("FRED_API_KEY غير مضبوط")
+    r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                     params=dict(series_id=series, api_key=FRED_KEY, file_type="json",
+                                 sort_order="desc", limit=6), timeout=15)
+    obs = [o for o in r.json().get("observations", []) if o.get("value") not in (".", "", None)]
+    if len(obs) < 2:
+        raise SourceError(f"FRED {series}: بيانات غير كافية")
+    return float(obs[0]["value"]), float(obs[1]["value"])
+
+
+def get_macro(now):
     out = {}
-    for i in range(0, len(symbols), 100):
-        r = data_api("GET", "/v1beta1/options/snapshots",
-                     {"symbols": ",".join(symbols[i:i + 100]), "feed": OPT_FEED, "limit": 1000})
-        snaps = r.get("snapshots", {})
-        if isinstance(snaps, dict): out.update(snaps)
-    return out
-
-
-def extract_quote(snapshot):
-    if not isinstance(snapshot, dict): return None
-    q = snapshot.get("latestQuote")
-    if not isinstance(q, dict): return None
     try:
-        bid, ask = float(q.get("bp", 0)), float(q.get("ap", 0))
-        bs, as_ = float(q.get("bs", 0) or 0), float(q.get("as", 0) or 0)
-        t = parse_ts(q.get("t"))
-        if not t: return None
-        age = (utc_now() - t).total_seconds()
-        if age < -5 or age > MAX_OPTION_QUOTE_AGE: return None
-        if ask <= 0 or bid < 0 or ask < bid: return None
-        mid = (ask + bid) / 2
-        return {"bid": bid, "ask": ask, "bid_size": bs, "ask_size": as_, "mid": mid,
-                "spread": ask - bid, "spread_percent": (ask - bid) / mid if mid > 0 else 1.0, "age": age}
-    except (TypeError, ValueError):
-        return None
-
-
-def extract_greeks(snapshot):
-    g = (snapshot or {}).get("greeks") or {}
-    return {n: safe_float(g.get(n)) for n in ("delta", "gamma", "theta", "vega")}
-
-
-def get_contracts(opt_type, price):
-    r = trading_api("GET", "/v2/options/contracts", {
-        "underlying_symbols": UNDERLYING, "status": "active", "type": opt_type,
-        "expiration_date": today_str(), "strike_price_gte": f"{price - STRIKE_WINDOW:.2f}",
-        "strike_price_lte": f"{price + STRIKE_WINDOW:.2f}", "limit": 1000})
-    out = []
-    for c in r.get("option_contracts") or []:
-        sym = str(c.get("symbol", "")).strip()
-        if OPTION_RE.match(sym) and c.get("status") == "active" and c.get("tradable") is not False:
-            out.append(c)
-    return out
-
-
-def build_chain(price):
-    raw = {"call": get_contracts("call", price), "put": get_contracts("put", price)}
-    syms = [c["symbol"] for t in raw for c in raw[t]]
-    if not syms: raise EntryBlocked("لا عقود 0DTE متاحة.")
-    snaps = get_option_snapshots(syms)
-    chain = {"call": [], "put": []}
-    for t in ("call", "put"):
-        for c in raw[t]:
-            snap = snaps.get(c["symbol"])
-            q = extract_quote(snap)
-            if not q: continue
-            chain[t].append({"symbol": c["symbol"], "type": t, "strike": float(c["strike_price"]),
-                             "expiration": c["expiration_date"], "quote": q, "greeks": extract_greeks(snap),
-                             "oi": int(safe_float(c.get("open_interest"), 0) or 0)})
-    by_k = {}
-    for t in ("call", "put"):
-        for l in chain[t]: by_k.setdefault(l["strike"], {})[t] = l
-    both = [k for k, v in by_k.items() if len(v) == 2]
-    chain["atm"] = chain["straddle"] = chain["parity"] = None
-    if both:
-        k = min(both, key=lambda x: abs(x - price))
-        c, p = by_k[k]["call"]["quote"]["mid"], by_k[k]["put"]["quote"]["mid"]
-        chain.update(atm=k, straddle=c + p, parity=k + c - p)
-    calls_up = [l for l in chain["call"] if l["strike"] >= price and l["oi"] > 0]
-    puts_dn = [l for l in chain["put"] if l["strike"] <= price and l["oi"] > 0]
-    chain["call_wall"] = max(calls_up, key=lambda l: l["oi"])["strike"] if calls_up else None
-    chain["put_wall"] = max(puts_dn, key=lambda l: l["oi"])["strike"] if puts_dn else None
-    return chain
-
-
-def liquid_legs(chain, typ, dmin, dmax):
-    out = []
-    for l in chain[typ]:
-        q, d = l["quote"], l["greeks"].get("delta")
-        if d is None or not dmin <= abs(d) <= dmax: continue
-        if (typ == "call" and d <= 0) or (typ == "put" and d >= 0): continue
-        if q["bid"] <= 0 or q["bid_size"] <= 0 or q["ask_size"] <= 0: continue
-        if q["spread_percent"] > MAX_SPREAD_PERCENT: continue
-        out.append(l)
-    return out
-
-
-# ========================= 11) VOLATILITY / LEVELS / CONVICTION =========================
-def vol_state(ind, chain):
-    rem = max(1, 960 - minutes_ny())
-    c = ind["closes"][-31:]
-    rets = [(c[i] - c[i - 1]) / c[i - 1] for i in range(1, len(c))]
-    proj = std(rets) * ind["price"] * math.sqrt(rem) * 0.8
-    straddle = chain.get("straddle") if chain else None
-    iv_ratio = straddle / proj if straddle and proj > 0 else 1.0
-    dl = daily_levels()
-    prev_range = dl["range"] if dl else None
-    range_used = (ind["day_hi"] - ind["day_lo"]) / max(prev_range, 1.0) if prev_range else 0.5
-    return {"iv_ratio": iv_ratio, "range_used": range_used, "straddle": straddle, "remaining": rem}
-
-
-def collect_levels(price, ind, chain, scale):
-    lv = []
-    dl = daily_levels()
-    if dl: lv += [dl["high"], dl["low"], dl["close"]]
-    if ind["or_hi"]: lv += [ind["or_hi"], ind["or_lo"]]
-    lv += [ind["day_hi"], ind["day_lo"]]
-    base = math.floor(price / 5) * 5
-    lv += [base, base + 5]
-    if chain:
-        lv += [x for x in (chain.get("call_wall"), chain.get("put_wall")) if x]
-    up = sorted(x for x in lv if x > price + 0.03)
-    dn = sorted((x for x in lv if x < price - 0.03), reverse=True)
-    room_up = (up[0] - price) / scale if up else 3.0
-    room_dn = (price - dn[0]) / scale if dn else 3.0
-    tgt_up = next((x for x in up if x - price >= 0.8 * scale), None)
-    tgt_dn = next((x for x in dn if price - x >= 0.8 * scale), None)
-    return {"room_up": room_up, "room_dn": room_dn, "target_up": tgt_up, "target_dn": tgt_dn}
-
-
-# [تعديل 1] وزن trend5 من 12 إلى 6 | [تعديل 2] إضافة وزن vpos (موقع السعر من VWAP + نطاق الافتتاح)
-W = {"trend1": 10, "trend5": 6, "vwap": 10, "mom": 6, "rsi": 5, "vol": 7, "orb": 10,
-     "heavy": 8, "parity": 6, "analog": 16, "vpos": 8}
-
-
-def score_market(ind, chain, vs, regime, heavy, analog, levels):
-    p, scale = ind["price"], ind["scale"]
-    c = {}
-    c["trend1"] = clamp((ind["ema9"] - ind["ema21"]) / (0.35 * scale), -1, 1)
-    z = (p - ind["vwap"]) / ind["sigma"]          # [تعديل] نُقل للأعلى لاستخدامه في trend5
-    e3, e8 = ema(ind["closes5"], 3), ema(ind["closes5"], 8)
-    if e3 is None or e8 is None: c["trend5"] = 0.0
-    elif e3 > e8 and p > e8: c["trend5"] = 1.0
-    elif e3 < e8 and p < e8: c["trend5"] = -1.0
-    else: c["trend5"] = 0.3 if e3 > e8 else -0.3
-    # [تعديل 1] تضعيف trend5 الصاعد إلى النصف إذا السعر تحت VWAP بأكثر من 1σ
-    if c["trend5"] > 0 and z < -1.0:
-        c["trend5"] *= 0.5
-    c["vwap"] = clamp(z / 1.5, -1, 1) if abs(z) <= 2.2 else -0.3 * sign(z)
-    cl = ind["closes"]
-    c["mom"] = clamp((cl[-1] - cl[-4]) / (ind["atr1"] * math.sqrt(3)) / 1.5, -1, 1)
-    r = ind["rsi"]
-    c["rsi"] = 0.3 if r < 22 else -0.3 if r > 78 else clamp((r - 50) / 20, -1, 1)
-    c["vol"] = clamp(ind["vr"] - 1, 0, 1) * sign(p - ind["prev"])
-    orv = 0.0
-    if ind["or_hi"]:
-        if p > ind["or_hi"]: orv = 1.0 if p - ind["or_hi"] < 1.2 * scale else 0.4
-        elif p < ind["or_lo"]: orv = -1.0 if ind["or_lo"] - p < 1.2 * scale else -0.4
-    c["orb"] = orv
-    # [تعديل 2] مكوّن موقع من VWAP: تحت VWAP وتحت قاع OR = هبوط، فوق VWAP وفوق قمة OR = صعود
-    vpos = 0.0
-    if ind["or_hi"]:
-        if p < ind["vwap"] and p < ind["or_lo"]: vpos = -1.0
-        elif p > ind["vwap"] and p > ind["or_hi"]: vpos = 1.0
-    c["vpos"] = vpos
-    c["heavy"] = heavy
-    c["parity"] = clamp((chain["parity"] - p) / (0.3 * scale), -1, 1) if chain and chain.get("parity") else 0.0
-    if analog:
-        v = clamp((analog["p_up"] - 0.5) / 0.15, -1, 1)
-        c["analog"] = v if sign(analog["mean"]) == sign(analog["p_up"] - 0.5) else v * 0.5
-    else:
-        c["analog"] = 0.0
-    w = dict(W)
-    if regime == "RANGE":
-        for k in ("trend1", "mom", "vol", "orb", "trend5"): w[k] = w[k] * 0.3
-        c["mr"] = clamp(-z / 2.0, -1, 1) if abs(z) >= 1.2 else 0.0
-        w["mr"] = 14
-    S = sum(w[k] * c[k] for k in c)
-    d = 1 if S >= 10 else -1 if S <= -10 else 0
-    adj = 0.0
-    pen = 0.0
-    if d:
-        room = levels["room_up"] if d > 0 else levels["room_dn"]
-        adj = 10 * clamp((room - 0.7) / 1.0, -1, 1)
-    near_hi = (ind["day_hi"] - p) < 0.3 * scale
-    near_lo = (p - ind["day_lo"]) < 0.3 * scale
-    if (d > 0 and near_hi) or (d < 0 and near_lo):
-        if vs["range_used"] > 1.8: pen += 14
-        elif vs["range_used"] > 1.3: pen += 8
-    if DEAD_ZONE[0] <= minutes_ny() <= DEAD_ZONE[1]: pen += 4
-    conv = clamp(abs(S) + adj - pen, 0, 100)
-    return {"S": S, "dir": d, "conv": conv, "parts": {k: round(w[k] * c[k], 1) for k in c},
-            "adj": adj, "pen": pen, "z": z}
-
-
-# ========================= 12) META MODEL + THOMPSON =========================
-def meta_features(sc, analog, ev_ratio, vs, regime):
-    d = sc["dir"] or 1
-    edge = (analog["p_up"] - 0.5) * d * 4 if analog else 0.0
-    return [1.0, sc["conv"] / 100, edge, clamp(ev_ratio if ev_ratio is not None else 0.0, -0.2, 0.5) * 2,
-            clamp(vs["range_used"], 0, 2) - 1, 1.0 if regime == "RANGE" else 0.0,
-            1.0 if minutes_ny() >= 13 * 60 + 30 else 0.0, clamp(vs["iv_ratio"], 0.5, 1.8) - 1]
-
-
-def meta_predict(x):
-    z = sum(w * v for w, v in zip(STATE["meta_w"], x))
-    return 1 / (1 + math.exp(-clamp(z, -30, 30)))
-
-
-def meta_train(x, y):
-    p = meta_predict(x)
-    for i in range(len(x)):
-        STATE["meta_w"][i] += 0.05 * ((y - p) * x[i] - 0.001 * STATE["meta_w"][i])
-    STATE["meta_n"] += 1
-
-
-def ts_update(strategy, win):
-    if not strategy: return
-    st = STATE["ts"].setdefault(strategy, {"w": 0.0, "l": 0.0})
-    st["w" if win else "l"] += 1
-    if st["w"] + st["l"] > 200: st["w"] *= 0.9; st["l"] *= 0.9
-
-
-def ts_draw(strategy):
-    st = STATE["ts"].get(strategy, {"w": 0, "l": 0})
-    return random.betavariate(st["w"] + 2, st["l"] + 2)
-
-
-def perf_mult():
-    t = LEDGER["closed_trades"][-20:]
-    if len(t) < 10: return 1.0
-    wr = sum(1 for x in t if x["pnl"] > 0) / len(t)
-    return clamp(0.6 + wr * 0.8, 0.6, 1.3)
-
-
-# ========================= 13) CANDIDATES + EV =========================
-def leg_change(leg, move, horizon):
-    g = leg["greeks"]
-    delta, gamma, theta = g.get("delta") or 0.0, g.get("gamma") or 0.0, g.get("theta") or 0.0
-    decay = min(leg["quote"]["mid"] * 0.4, abs(theta) * horizon / 390.0)
-    return delta * move + 0.5 * gamma * move * move - decay
-
-
-def candidate_ev(c, moves):
-    if not moves: return None
-    pn = []
-    for m in moves:
-        v = sum(s * leg_change(l, m, SHADOW_HORIZON) for l, s in c["legs_signed"])
-        v = clamp(v, c["clip_lo"], c["clip_hi"])
-        pn.append(v)
-    friction = 0.6 * sum(l["quote"]["spread"] for l, _ in c["legs_signed"])
-    return (sum(pn) / len(pn) - friction) / c["max_loss_ps"]
-
-
-def build_single(typ, chain, moves):
-    legs = [l for l in liquid_legs(chain, typ, TARGET_DELTA_MIN, TARGET_DELTA_MAX)
-            if MIN_OPTION_ASK <= l["quote"]["ask"] <= MAX_OPTION_ASK]
-    legs.sort(key=lambda l: abs(abs(l["greeks"]["delta"]) - TARGET_DELTA) + l["quote"]["spread_percent"])
-    best = None
-    for l in legs[:5]:
-        ask = l["quote"]["ask"]
-        c = {"strategy": typ.upper(), "kind": "SINGLE", "legs_signed": [(l, 1)], "credit": False,
-             "max_loss_ps": ask * SINGLE_RISK_FRACTION, "cost_ps": ask, "width": None,
-             "clip_lo": -ask, "clip_hi": 1e9, "limit_cap": ask * 1.15}
-        c["ev"] = candidate_ev(c, moves)
-        if best is None or (c["ev"] or -9) > (best["ev"] or -9): best = c
-    return best
-
-
-def build_vertical(kind, chain, moves):
-    typ = "call" if kind in ("BULL_CALL_SPREAD", "BEAR_CALL_SPREAD") else "put"
-    debit = kind in ("BULL_CALL_SPREAD", "BEAR_PUT_SPREAD")
-    legs = liquid_legs(chain, typ, SPREAD_DELTA_MIN, SPREAD_DELTA_MAX)
-    pairs = []
-    for a in legs:
-        for b in legs:
-            if a is b: continue
-            if kind == "BULL_CALL_SPREAD": lo, sh, ok = a, b, b["strike"] > a["strike"]
-            elif kind == "BEAR_PUT_SPREAD": lo, sh, ok = a, b, b["strike"] < a["strike"]
-            elif kind == "BULL_PUT_SPREAD": sh, lo, ok = a, b, a["strike"] > b["strike"]
-            else: sh, lo, ok = a, b, a["strike"] < b["strike"]
-            if not ok: continue
-            width = abs(lo["strike"] - sh["strike"])
-            if not SPREAD_MIN_WIDTH <= width <= SPREAD_MAX_WIDTH: continue
-            net = lo["quote"]["ask"] - sh["quote"]["bid"]          # موجب = دفع
-            dl, ds = abs(lo["greeks"]["delta"]), abs(sh["greeks"]["delta"])
-            if debit:
-                if not 0 < net <= SPREAD_MAX_DEBIT or net >= width * 0.8 or ds >= dl: continue
-                score = abs(dl - TARGET_DELTA) * 3 + abs(ds - 0.25)
-                ml, mg = net, width - net
-            else:
-                cr = -net
-                if cr < SPREAD_MIN_CREDIT or cr >= width * 0.8 or dl >= ds or ds > 0.42: continue
-                score = abs(ds - 0.30) * 3 + abs(dl - 0.12)
-                ml, mg = width - cr, cr
-            score += lo["quote"]["spread_percent"] + sh["quote"]["spread_percent"]
-            pairs.append((score, lo, sh, width, net, ml, mg))
-    pairs.sort(key=lambda x: x[0])
-    best = None
-    for score, lo, sh, width, net, ml, mg in pairs[:10]:
-        c = {"strategy": kind, "kind": "SPREAD", "legs_signed": [(lo, 1), (sh, -1)], "credit": not debit,
-             "max_loss_ps": ml, "cost_ps": ml, "width": width, "clip_lo": -ml, "clip_hi": mg,
-             "limit_cap": net + max(0.02, abs(net) * 0.15)}
-        c["ev"] = candidate_ev(c, moves)
-        if best is None or (c["ev"] or -9) > (best["ev"] or -9): best = c
-    return best
-
-
-def candidate_strategies(d, vs, regime):
-    if STRATEGY_MODE == "SINGLES":
-        return ["CALL"] if d > 0 else ["PUT"]
-    c = ["CALL", "BULL_CALL_SPREAD", "BULL_PUT_SPREAD"] if d > 0 else ["PUT", "BEAR_PUT_SPREAD", "BEAR_CALL_SPREAD"]
-    if STRATEGY_MODE != "AUTO": return [x for x in c if x == STRATEGY_MODE]
-    if minutes_ny() >= LATE_SPREAD_AFTER: c = [x for x in c if x not in ("CALL", "PUT")]
-    if vs["iv_ratio"] > 1.3: c = [x for x in c if x not in ("CALL", "PUT")]
-    if vs["iv_ratio"] < 0.8: c = [x for x in c if "PUT_SPREAD" not in x or "BEAR" in x or "BULL_CALL" in x or True and x.startswith(("BEAR_PUT", "BULL_CALL")) or x in ("CALL", "PUT")]
-    return c
-
-
-def build_candidate(strategy, chain, moves):
-    if strategy in ("CALL", "PUT"): return build_single(strategy.lower(), chain, moves)
-    return build_vertical(strategy, chain, moves)
-
-
-# ========================= 14) SIZING =========================
-def get_buying_power():
-    a = get_account()
-    bp = safe_float(a.get("options_buying_power"), safe_float(a.get("buying_power"), 0.0))
-    if not bp or bp <= 0: raise EntryBlocked("Buying power غير كافٍ.")
-    return bp
-
-
-def size_position(c, equity, conv, meta_mult):
-    frac = RISK_BASE + (RISK_MAX - RISK_BASE) * clamp((conv - CONV_MIN) / (100 - CONV_MIN), 0, 1)
-    frac = min(frac * meta_mult * perf_mult(), RISK_MAX * 1.3)
-    q = min(math.floor(equity * frac / (c["max_loss_ps"] * 100)),
-            math.floor(equity * MAX_PREMIUM_FRACTION / (c["cost_ps"] * 100)),
-            math.floor(get_buying_power() / (c["cost_ps"] * 100)), MAX_CONTRACTS)
-    return max(0, int(q))
-
-
-# ========================= 15) ORDERS =========================
-FINAL = {"filled", "canceled", "expired", "rejected", "done_for_day"}
-
-
-def get_order(oid): return trading_api("GET", f"/v2/orders/{oid}") if oid else None
-
-
-def cancel_order(oid):
-    try:
-        trading_api("DELETE", f"/v2/orders/{oid}")
-        return True
-    except APIError as exc:
-        log.error("CANCEL FAILED %s: %s", oid, exc)
-        return False
-
-
-def validate_qty(q):
-    if not isinstance(q, int) or q < 1 or q > MAX_CONTRACTS:
-        raise SafetyHalt("كمية خارج الحدود.")
-
-
-def validate_symbol(s):
-    if not OPTION_RE.match(str(s or "")): raise SafetyHalt(f"رمز خيارات غير صالح: {s}")
-
-
-def submit_order_payload(payload):
-    validate_qty(int(payload.get("qty", 0)))
-    cid = f"SAFAA115-{today_ny().strftime('%Y%m%d')}-{uuid.uuid4().hex[:12]}"
-    payload["client_order_id"] = cid
-    try:
-        r = trading_api("POST", "/v2/orders", payload=payload)
-    except APIError as err:
-        try:
-            r = trading_api("GET", "/v2/orders:by_client_order_id", {"client_order_id": cid})
-        except APIError:
-            raise err
-    if not isinstance(r, dict) or not r.get("id"): raise APIError("لم يؤكد الوسيط الأمر.")
-    LEDGER["orders"][r["id"]] = {"id": r["id"], "status": r.get("status"), "created_at": utc_iso(),
-                                 "updated_at": utc_iso(), "filled_qty": 0, "avg": None}
-    save_ledger()
-    return r
-
-
-def update_order_record(oid, order):
-    rec = LEDGER["orders"].get(oid)
-    if rec:
-        rec.update(status=order.get("status"), filled_qty=int(safe_float(order.get("filled_qty"), 0) or 0),
-                   avg=safe_float(order.get("filled_avg_price")), updated_at=utc_iso())
-        save_ledger()
-
-
-def mleg_payload(meta, qty, price, closing, market=False):
-    long_sym, short_sym = meta["long_symbol"], meta["short_symbol"]
-    validate_symbol(long_sym); validate_symbol(short_sym)
-    if long_sym == short_sym: raise SafetyHalt("نفس العقد للرجلين.")
-    if closing:
-        legs = [{"symbol": long_sym, "ratio_qty": "1", "side": "sell", "position_intent": "sell_to_close"},
-                {"symbol": short_sym, "ratio_qty": "1", "side": "buy", "position_intent": "buy_to_close"}]
-    else:
-        legs = [{"symbol": long_sym, "ratio_qty": "1", "side": "buy", "position_intent": "buy_to_open"},
-                {"symbol": short_sym, "ratio_qty": "1", "side": "sell", "position_intent": "sell_to_open"}]
-    p = {"order_class": "mleg", "qty": str(qty), "time_in_force": "day", "legs": legs}
-    if market:
-        p["type"] = "market"
-    else:
-        price = round(float(price), 2)
-        if price == 0: price = 0.01
-        p.update(type="limit", limit_price=f"{price:.2f}")
-    return p
-
-
-def entry_frac_price(meta, snaps, frac):
-    if meta["kind"] == "SINGLE":
-        q = extract_quote(snaps.get(meta["symbol"]))
-        if not q: raise EntryBlocked("لا سعر حديث للعقد.")
-        if q["ask"] > meta["limit_cap"]: raise EntryBlocked("السعر ابتعد عن الحد.")
-        return round(max(0.01, q["bid"] + frac * (q["ask"] - q["bid"])), 2)
-    lq = extract_quote(snaps.get(meta["long_symbol"]))
-    sq = extract_quote(snaps.get(meta["short_symbol"]))
-    if not lq or not sq: raise EntryBlocked("لا أسعار حديثة للسبريد.")
-    best, worst = lq["bid"] - sq["ask"], lq["ask"] - sq["bid"]
-    if worst > meta["limit_cap"]: raise EntryBlocked("سعر السبريد ابتعد.")
-    price = round(best + frac * (worst - best), 2)
-    if meta["credit"] and price > -0.01: raise EntryBlocked("Credit غير كافٍ.")
-    if not meta["credit"] and price < 0.01: price = 0.01
-    return price
-
-
-def submit_entry(meta, step):
-    syms = [meta["symbol"]] if meta["kind"] == "SINGLE" else [meta["long_symbol"], meta["short_symbol"]]
-    for s in syms: validate_symbol(s)
-    snaps = get_option_snapshots(syms)
-
-    # 1. حالة العقد المفرد (لم تتغير)
-    if meta["kind"] == "SINGLE":
-        price = entry_frac_price(meta, snaps, ENTRY_STEPS[step])
-        payload = {"symbol": meta["symbol"], "qty": str(meta["quantity"]), "side": "buy", "type": "limit",
-                   "time_in_force": "day", "limit_price": f"{price:.2f}", "position_intent": "buy_to_open"}
-        r = submit_order_payload(payload)
-        meta.update(status="PENDING_ENTRY", entry_step=step, step_at=utc_iso(), entry_limit=abs(price),
-                    entry_filled=0, entry_average_price=None, exit_order_id=None, exit_attempts=0,
-                    realized_pnl=meta.get("realized_pnl", 0.0), order_id=r["id"])
-
-    # 2. حالة السبريد (نظام الـ Legging الجديد)
-    else:
-        lq = extract_quote(snaps.get(meta["long_symbol"]))
-        if not lq: raise EntryBlocked("لا سعر حديث للعقد الأول (Long).")
-
-        # نحاول نصطاد العقد الأول بسعر أقرب للـ Bid لتقليل التكلفة
-        leg1_price = round(lq["bid"] + ENTRY_STEPS[step] * (lq["ask"] - lq["bid"]), 2)
-        leg1_price = max(0.01, leg1_price)
-
-        payload = {"symbol": meta["long_symbol"], "qty": str(meta["quantity"]), "side": "buy", "type": "limit",
-                   "time_in_force": "day", "limit_price": f"{leg1_price:.2f}", "position_intent": "buy_to_open"}
-
-        r = submit_order_payload(payload)
-        meta.update(status="PENDING_LEG1", entry_step=step, step_at=utc_iso(), leg1_limit=leg1_price,
-                    leg1_order_id=r["id"], entry_filled=0, exit_order_id=None, exit_attempts=0,
-                    realized_pnl=meta.get("realized_pnl", 0.0), order_id=r["id"])
-
-    meta.setdefault("created_at", utc_iso())
-    STATE["position_meta"][r["id"]] = meta
-    save_state()
-    ledger_event("ENTRY_SUBMITTED", {"order": r["id"], "strategy": meta["strategy"], "step": step})
-    log.info("ENTRY SUBMITTED | %s | Qty=%s | Step=%s", meta["strategy"], meta["quantity"], step)
-    return r
-
-
-
-def entry_window_ok():
-    return (not STATE.get("halted") and entry_time_allowed() and not force_exit_time_reached()
-            and not news_state() and market_open())
-
-
-def handle_entry_order(oid, meta):
-    # حالة العقود المفردة القديمة
-    if meta.get("status") == "PENDING_ENTRY":
-        order = get_order(meta.get("order_id", oid))
-        if not order: return
-        update_order_record(oid, order)
-        status = str(order.get("status", "")).lower()
-        filled = int(safe_float(order.get("filled_qty"), 0) or 0)
-
-        if status in FINAL:
-            if filled > 0:
-                avg = abs(safe_float(order.get("filled_avg_price"), meta.get("entry_limit", 0.0)))
-                meta.update(status="OPEN", entry_filled=filled, entry_average_price=avg, risk_base=avg,
-                            opened_at=utc_iso(), peak_return=0.0, partial_done=False)
-                STATE["trades_today"] += 1
-                save_state()
-                telegram_send(f"✅ تم الدخول\n{meta['strategy']} × {filled} @ {avg:.2f}\nPAPER")
-            else:
-                STATE["position_meta"].pop(oid, None)
-                save_state()
-            return
-        if seconds_since(meta.get("step_at")) > ENTRY_STEP_SECONDS or force_exit_time_reached():
-            cancel_order(oid)
-
-    # المرحلة الأولى من السبريد (شراء الـ Long)
-    elif meta.get("status") == "PENDING_LEG1":
-        leg1_id = meta.get("leg1_order_id")
-        order = get_order(leg1_id)
-        if not order: return
-        status = str(order.get("status", "")).lower()
-        filled = int(safe_float(order.get("filled_qty"), 0) or 0)
-
-        if status in FINAL:
-            if filled > 0:
-                meta["leg1_avg"] = safe_float(order.get("filled_avg_price"), meta.get("leg1_limit", 0.0))
-                meta["leg1_filled"] = filled
-                meta["status"] = "PENDING_LEG2"
-
-                # إطلاق العقد الثاني (البيع) فوراً لضمان اكتمال السبريد!
-                snaps = get_option_snapshots([meta["short_symbol"]])
-                sq = extract_quote(snaps.get(meta["short_symbol"]))
-                leg2_price = round(sq["bid"] + 0.1 * (sq["ask"] - sq["bid"]), 2) if sq else 0.01
-
-                p2 = {"symbol": meta["short_symbol"], "qty": str(filled), "side": "sell", "type": "limit",
-                      "time_in_force": "day", "limit_price": f"{max(0.01, leg2_price):.2f}", "position_intent": "sell_to_open"}
-
-                r2 = submit_order_payload(p2)
-                meta.update(leg2_order_id=r2["id"], leg2_limit=leg2_price, step_at=utc_iso())
-                save_state()
-                log.info("LEG 1 FILLED! Firing LEG 2 (Short) -> %s", meta["short_symbol"])
-            else:
-                STATE["position_meta"].pop(oid, None)
-                save_state()
-            return
-        if seconds_since(meta.get("step_at")) > ENTRY_STEP_SECONDS or force_exit_time_reached():
-            cancel_order(leg1_id)
-
-    # المرحلة الثانية من السبريد (تأكيد اكتمال الصفقة)
-    elif meta.get("status") == "PENDING_LEG2":
-        leg2_id = meta.get("leg2_order_id")
-        order2 = get_order(leg2_id)
-        if not order2: return
-        status2 = str(order2.get("status", "")).lower()
-        filled2 = int(safe_float(order2.get("filled_qty"), 0) or 0)
-
-        if status2 in FINAL:
-            if filled2 > 0:
-                # اكتمل السبريد بنجاح! نقوم بحساب التكلفة الإجمالية بدقة
-                leg2_avg = safe_float(order2.get("filled_avg_price"), meta.get("leg2_limit", 0.0))
-                net_avg = meta["leg1_avg"] - leg2_avg  # التكلفة الصافية
-                risk_base = meta["width"] - abs(net_avg) if meta.get("credit") else abs(net_avg)
-
-                meta.update(status="OPEN", entry_filled=filled2, entry_average_price=abs(net_avg),
-                            risk_base=risk_base, opened_at=utc_iso(), peak_return=0.0, partial_done=False)
-                STATE["trades_today"] += 1
-                save_state()
-                telegram_send(f"✅ تم اصطياد السبريد (Legging)\n{meta['strategy']} × {filled2}\nصافي التكلفة: {abs(net_avg):.2f}\nPAPER")
-            else:
-                # لم يتنفذ العقد الثاني؟ نرسل أمر ماركت فوراً لمنع الانكشاف (Naked Long Risk)
-                log.warning("LEG 2 FAILED TO FILL! Converting to MARKET order to lock spread.")
-                p2_market = {"symbol": meta["short_symbol"], "qty": str(meta["leg1_filled"]), "side": "sell",
-                             "type": "market", "time_in_force": "day", "position_intent": "sell_to_open"}
-                r_market = submit_order_payload(p2_market)
-                meta["leg2_order_id"] = r_market["id"]
-                save_state()
-            return
-
-        # إذا تأخر التنفيذ لأكثر من 5 ثوانٍ، نعيد إرساله بسعر السوق
-        if seconds_since(meta.get("step_at")) > 5:
-            cancel_order(leg2_id)
-
-
-def pnl_per_share(meta, exit_avg):
-    e = safe_float(meta.get("entry_average_price"), 0.0)
-    return (e - exit_avg) if meta.get("credit") else (exit_avg - e)
-
-
-def handle_exit_order(oid, meta):
-    xid = meta.get("exit_order_id")
-    if not xid:
-        meta["status"] = "OPEN"; save_state(); return
-    order = get_order(xid)
-    if not order: return
-    update_order_record(xid, order)
-    status = str(order.get("status", "")).lower()
-    filled = int(safe_float(order.get("filled_qty"), 0) or 0)
-    if status in FINAL:
-        reason = meta.get("exit_reason")
-        if filled > 0:
-            avg = abs(safe_float(order.get("filled_avg_price"), 0.0))
-            meta["realized_pnl"] = meta.get("realized_pnl", 0.0) + pnl_per_share(meta, avg) * filled * 100
-            meta["entry_filled"] = int(meta["entry_filled"]) - filled
-        meta["exit_order_id"] = None; meta["exit_qty"] = None
-        if meta["entry_filled"] <= 0:
-            total = meta.get("realized_pnl", 0.0)
-            STATE["consecutive_losses"] = STATE["consecutive_losses"] + 1 if total < 0 else 0
-            ts_update(meta["strategy"], total > 0)
-            LEDGER["closed_trades"].append({"order": oid, "strategy": meta["strategy"], "pnl": total,
-                                            "reason": reason, "closed_at": utc_iso()})
-            STATE["position_meta"].pop(oid, None)
-            save_state(); save_ledger()
-            ledger_event("TRADE_CLOSED", {"order": oid, "pnl": total, "reason": reason})
-            telegram_send(f"🔔 إغلاق {meta['strategy']}\nالسبب: {reason}\nالنتيجة: {format_money(total)}\nPAPER")
-        else:
-            meta["status"] = "OPEN"
-            if reason == "PARTIAL" and filled > 0: meta["partial_done"] = True
-            else: meta["exit_attempts"] = int(meta.get("exit_attempts", 0)) + 1
-            save_state()
-        return
-    if seconds_since(meta.get("exit_submitted_at")) > EXIT_ORDER_TIMEOUT:
-        cancel_order(xid)
-
-
-def process_orders():
-    for oid, meta in list(STATE["position_meta"].items()):
-        try:
-            if meta.get("status") in ("PENDING_ENTRY", "PENDING_LEG1", "PENDING_LEG2"):
-                handle_entry_order(oid, meta)
-            elif meta.get("status") == "PENDING_EXIT":
-                handle_exit_order(oid, meta)
-        except APIError as exc:
-            log.error("ORDER API ERROR %s: %s", oid, exc)
-        except SafetyHalt:
-            raise
-        except Exception:
-            log.exception("ORDER ERROR %s", oid)
-    save_state()
-
-
-
-# ========================= 16) POSITIONS / RECONCILIATION =========================
-def get_option_positions():
-    r = trading_api("GET", "/v2/positions")
-    if not isinstance(r, list): raise APIError("تعذر قراءة المراكز.")
-    out = []
-    for p in r:
-        if str(p.get("asset_class", "")).lower() != "us_option": continue
-        sym = str(p.get("symbol", "")).strip()
-        qty = safe_float(p.get("qty"), 0.0)
-        if not OPTION_RE.match(sym) or not qty: continue
-        out.append({"symbol": sym, "signed": int(round(abs(qty) if str(p.get("side")).lower() == "long" else -abs(qty)))})
-    return out
-
-
-def expected_positions():
-    exp = {}
-    for m in STATE["position_meta"].values():
-        q = int(m.get("entry_filled", 0))
-        if m.get("status") != "OPEN" or q <= 0: continue
-        if m["kind"] == "SINGLE":
-            exp[m["symbol"]] = exp.get(m["symbol"], 0) + q
-        else:
-            exp[m["long_symbol"]] = exp.get(m["long_symbol"], 0) + q
-            exp[m["short_symbol"]] = exp.get(m["short_symbol"], 0) - q
-    return exp
-
-
-def reconcile():
-    if any_pending_orders(): return True
-    actual = {p["symbol"]: p["signed"] for p in get_option_positions()}
-    exp = expected_positions()
-    bad = [(s, exp.get(s, 0), actual.get(s, 0)) for s in set(actual) | set(exp) if exp.get(s, 0) != actual.get(s, 0)]
-    STATE["last_reconciliation"] = utc_iso()
-    save_state()
-    if bad:
-        for s, e, a in bad: log.critical("MISMATCH %s expected=%s actual=%s", s, e, a)
-        halt_bot("اختلاف بين المراكز الفعلية والسجل المحلي.")
-        telegram_send("⛔ اختلاف في المراكز، إيقاف احترازي.")
-        return False
-    return True
-
-
-def periodic_reconcile():
-    prev = parse_ts(STATE.get("last_reconciliation"))
-    if prev and (utc_now() - prev).total_seconds() < RECONCILE_INTERVAL: return True
-    return reconcile()
-
-
-# ========================= 17) POSITION MANAGEMENT =========================
-def position_mark(meta, snaps):
-    if meta["kind"] == "SINGLE":
-        q = extract_quote(snaps.get(meta["symbol"]))
-        if not q: return None
-        return {"ret": (q["bid"] - meta["entry_average_price"]) / meta["entry_average_price"]}
-    lq = extract_quote(snaps.get(meta["long_symbol"]))
-    sq = extract_quote(snaps.get(meta["short_symbol"]))
-    if not lq or not sq: return None
-    e = meta["entry_average_price"]
-    pnl = (lq["bid"] - sq["ask"]) - (-e if meta["credit"] else e)
-    return {"ret": pnl / meta["risk_base"]}
-
-
-def decide_exit(meta, ret, held, price):
-    peak = max(meta.get("peak_return", 0.0), ret)
-    meta["peak_return"] = peak; meta["last_return"] = ret
-    d = meta.get("dir", 1)
-    if ret <= -HARD_STOP: return "HARD_STOP"
-    inval = meta.get("inval")
-    if price and inval and held >= 90 and (price - inval) * d < 0: return "INVALIDATION"
-    if peak >= BREAKEVEN_AFTER and ret < 0.02: return "BREAKEVEN_STOP"
-    if ret >= TP_FULL: return "TAKE_PROFIT"
-    if peak >= TRAIL_ACTIVATE and peak - ret >= max(0.15, 0.35 * peak): return "TRAILING"
-
-    # --- إضافة صائد الانفجارات: الهروب عند موت الزخم ---
-    if meta.get("pre_breakout") and peak >= 0.15: # إذا ربحنا 15% أو أكثر من الانفجار الاستباقي
-        ind_ctx = CTX.get("ind")
-        sc_ctx = CTX.get("score")
-        if ind_ctx and sc_ctx:
-            mom_val = sc_ctx.get("parts", {}).get("mom", 0.0)
-            # إذا انعكس الزخم أو اختفت السيولة فجأة
-            if (d > 0 and mom_val <= 0) or (d < 0 and mom_val >= 0) or ind_ctx.get("vr", 1) < 0.8:
-                return "MOMENTUM_DEATH"
-    # ---------------------------------------------------
-
-    tgt = meta.get("target")
-    if price and tgt and ret > 0.05 and (price - tgt) * d >= -0.02: return "TARGET_LEVEL"
-    sc = CTX.get("score")
-    if sc and held >= 120 and sc["dir"] == -d and sc["conv"] >= REVERSAL_CONV and ret < 0.15: return "REVERSAL"
-    if held > TIME_STOP_SEC and abs(ret) < 0.08 and not meta.get("partial_done"): return "TIME_STOP"
-    if not meta.get("partial_done") and int(meta["entry_filled"]) >= 2 and ret >= PARTIAL_AT: return "PARTIAL"
-    return None
-
-
-def exit_position(oid, meta, qty, reason, snaps, market=False):
-    if meta.get("exit_order_id"): return
-    attempts = int(meta.get("exit_attempts", 0))
-    if attempts >= 3 or (reason in ("TIME_EXIT", "NEWS_EXIT") and attempts >= 1): market = True
-    if meta["kind"] == "SINGLE":
-        validate_symbol(meta["symbol"])
-        q = extract_quote(snaps.get(meta["symbol"]))
-        p = {"symbol": meta["symbol"], "qty": str(qty), "side": "sell", "time_in_force": "day",
-             "position_intent": "sell_to_close"}
-        if market or not q:
-            p["type"] = "market"
-        else:
-            pad = max(0.01, q["bid"] * 0.04) * (1 + attempts)
-            p.update(type="limit", limit_price=f"{max(0.01, round(q['bid'] - pad, 2)):.2f}")
-    else:
-        lq = extract_quote(snaps.get(meta["long_symbol"]))
-        sq = extract_quote(snaps.get(meta["short_symbol"]))
-        if market or not lq or not sq:
-            p = mleg_payload(meta, qty, 0, closing=True, market=True)
-        else:
-            net = sq["ask"] - lq["bid"]
-            pad = max(0.01, abs(net) * 0.05) * (1 + attempts)
-            p = mleg_payload(meta, qty, net + pad, closing=True)
-    r = submit_order_payload(p)
-    meta.update(exit_order_id=r["id"], exit_submitted_at=utc_iso(), exit_qty=qty, exit_reason=reason,
-                status="PENDING_EXIT")
-    save_state()
-    ledger_event("EXIT_SUBMITTED", {"entry": oid, "exit": r["id"], "reason": reason, "market": p.get("type") == "market"})
-    log.warning("EXIT %s | %s | Qty=%s | %s", reason, meta["strategy"], qty, p.get("type"))
-
-
-def ctx_price():
-    ind = CTX.get("ind")
-    if ind and CTX.get("ts", 0) > time.time() - 180: return ind["price"]
-    return None
-
-
-def manage_one(oid, meta):
-    qty = int(meta.get("entry_filled", 0))
-    if qty <= 0: return
-    syms = [meta["symbol"]] if meta["kind"] == "SINGLE" else [meta["long_symbol"], meta["short_symbol"]]
-    snaps = get_option_snapshots(syms)
-    mark = position_mark(meta, snaps)
-    forced = "TIME_EXIT" if force_exit_time_reached() else ("NEWS_EXIT" if news_state() == "FLAT" else None)
-    if forced:
-        exit_position(oid, meta, qty, forced, snaps, market=(mark is None))   # إصلاح: لا نترك المركز بلا خروج
-        return
-    if mark is None:
-        log.warning("لا سعر حديث للمركز %s", oid)
-        return
-    held = seconds_since(meta.get("opened_at"))
-    reason = decide_exit(meta, mark["ret"], held, ctx_price())
-    log.info("POSITION %s | ret=%.1f%% | peak=%.1f%% | %s", meta["strategy"], mark["ret"] * 100,
-             meta.get("peak_return", 0) * 100, reason or "HOLD")
-    save_state()
-    if reason == "PARTIAL":
-        exit_position(oid, meta, max(1, qty // 2), "PARTIAL", snaps)
-    elif reason:
-        exit_position(oid, meta, qty, reason, snaps)
-
-
-def manage_positions():
-    for oid, meta in list(STATE["position_meta"].items()):
-        if meta.get("status") != "OPEN": continue
-        try:
-            manage_one(oid, meta)
-        except SafetyHalt as exc:
-            halt_bot(str(exc)); return
-        except APIError as exc:
-            log.error("MANAGE API ERROR %s: %s", oid, exc)
-        except Exception:
-            log.exception("MANAGE ERROR %s", oid)
-
-
-# ========================= 18) CONTEXT + SHADOW =========================
-def build_context():
-    bars = get_spy_bars()
-    sb = session_bars(bars)
-    if len(sb) < MIN_SESSION_BARS: raise MarketDataUnavailable("جلسة قصيرة.")
-    ind = compute_indicators(sb)
-    rows = day_feature_rows(sb)
-    feat = rows[-1]["feat"] if rows and rows[-1]["i"] == len(sb) - 1 else None
-    CTX.update(ind=ind, sb=sb, feat=feat, regime=classify_regime(ind), ts=time.time(),
-               candle_id=hashlib.sha256(f"{UNDERLYING}|{ind['t']}".encode()).hexdigest()[:24])
-    return CTX
-
-
-def record_shadow(sc, ind, pick, mx, taken, why):
-    LEDGER["shadow"].append({"id": make_id("SH"), "t": ind["t"], "price": ind["price"], "scale": ind["scale"],
-                             "dir": sc["dir"], "conv": round(sc["conv"], 1), "pick": pick, "mx": mx,
-                             "taken": taken, "why": why, "resolved": False,
-                             "hour": ny_now().hour})
-    LEDGER["shadow"] = LEDGER["shadow"][-1500:]
-    save_ledger()
-
-
-def resolve_shadow():
-    sb = CTX.get("sb")
-    if not sb: return
-    now, changed = utc_now(), False
-    for rec in LEDGER["shadow"][-250:]:
-        if rec.get("resolved"): continue
-        t0 = parse_ts(rec["t"])
-        if t0.astimezone(NY).date() != today_ny():
-            rec.update(resolved=True, y=None); changed = True; continue
-        target = t0 + timedelta(minutes=SHADOW_HORIZON)
-        if now < target + timedelta(minutes=1): continue
-        later = [b for b in sb if b["t"] >= target]
-        if not later: continue
-        fwd = (later[0]["close"] - rec["price"]) / rec["scale"]
-        dret = rec["dir"] * fwd
-        y = 1 if dret > SHADOW_WIN_ATR else 0
-        rec.update(resolved=True, fwd=round(fwd, 3), dret=round(dret, 3), y=y)
-        meta_train(rec["mx"], y)
-        ts_update(rec.get("pick"), y)
-        changed = True
-    if changed:
-        save_ledger(); save_state()
-
-
-# ========================= 19) DECISION ENGINE =========================
-def validate_entry(d):
-    ensure_not_halted()
-    if not market_open(): raise EntryBlocked("السوق مغلق.")
-    if not entry_time_allowed(): raise EntryBlocked("خارج وقت الدخول.")
-    if force_exit_time_reached(): raise EntryBlocked("وقت الإغلاق.")
-    if news_state(): raise EntryBlocked("نافذة خبر اقتصادي.")
-    check_daily_risk()
-    metas = STATE["position_meta"]
-    if len(metas) >= MAX_OPEN_POSITIONS: raise EntryBlocked("حد المراكز.")
-    if len(metas) == 1:
-        m = next(iter(metas.values()))
-        if not (m.get("status") == "OPEN" and m.get("dir") == d and m.get("peak_return", 0) >= ADD_ON_MIN_RETURN):
-            raise EntryBlocked("لا إضافة: المركز الحالي لم يثبت.")
-    if STATE["trades_today"] >= MAX_TRADES_PER_DAY: raise EntryBlocked("حد صفقات اليوم.")
-    if STATE["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES: raise EntryBlocked("خسائر متتالية.")
-
-
-def evaluate_and_enter():
-    ind, regime = CTX["ind"], CTX["regime"]
-    price, scale = ind["price"], ind["scale"]
-    chain = None
-    try:
-        chain = build_chain(price)
-    except (APIError, EntryBlocked) as exc:
-        note_reject(f"لا سلسلة خيارات: {exc}")
-    analog = analog_forecast(CTX.get("feat"))
-    vs = vol_state(ind, chain)
-    levels = collect_levels(price, ind, chain, scale)
-    sc = score_market(ind, chain, vs, regime, heavy_bias(), analog, levels)
-    CTX["score"] = sc
-    d, conv = sc["dir"], sc["conv"]
-    why = (f"SPY {price:.2f} | {regime} | dir={d:+d} conv={conv:.0f} | VWAPσ={sc['z']:+.2f} "
-           f"| IV/RV={vs['iv_ratio']:.2f} | range={vs['range_used']:.2f} | "
-           f"analog={'%.0f%%' % (analog['p_up'] * 100) if analog else 'n/a'} | parts={sc['parts']}")
-    log.info(why)
-    STATE["last_decision"] = why
-    save_state()
-    if d == 0 or not chain:
-        return None
-
-    mx0 = meta_features(sc, analog, None, vs, regime)
-    need = CONV_MIN + (0 if analog else 10)
-
-    # --- تعديل صائد الانفجارات (الهجوم الاستباقي بدون تكرار) ---
-    is_pre_breakout = False
-    heavy_val = heavy_bias()
-    if ind.get("squeeze") and regime == "RANGE" and vs["iv_ratio"] < 1.15:
-        if heavy_val >= 2.0 and ind["vwap"] - price < ind["scale"]:
-            d = 1
-            need = 20
-            is_pre_breakout = True
-            log.info("🔥 SQUEEZE HUNTER: تجهيز عقد CALL قبل الانفجار!")
-        elif heavy_val <= -2.0 and price - ind["vwap"] < ind["scale"]:
-            d = -1
-            need = 20
-            is_pre_breakout = True
-            log.info("🔥 SQUEEZE HUNTER: تجهيز عقد PUT قبل الانهيار!")
-    # ---------------------------------------------------------
-
-    moves = [f * scale * 0.7 for f in analog["fwds"]] if analog else None
-    best, best_score = None, -1e9
-    for strat in candidate_strategies(d, vs, regime):
-        try:
-            c = build_candidate(strat, chain, moves)
-        except Exception:
-            log.exception("candidate %s", strat); continue
-        if not c: continue
-        ev = c["ev"]
-        if analog and (ev is None or ev < MIN_EV_RATIO): continue
-        s = (ev if ev is not None else 0.01) * (0.6 + ts_draw(strat))
-        if s > best_score: best, best_score = c, s
-    pick = best["strategy"] if best else None
-    ev = best["ev"] if best else None
-    mx = meta_features(sc, analog, ev, vs, regime) if best else mx0
-    p_meta = meta_predict(mx)
-    reason = None
-    if conv < need: reason = f"قناعة {conv:.0f} < {need}"
-    elif not best: reason = "لا استراتيجية بحافة EV كافية"
-    elif STATE["meta_n"] >= META_MIN_N and p_meta < META_MIN_P: reason = f"النموذج الثاني يرفض (p={p_meta:.2f})"
-    if not reason:
-        try:
-            validate_entry(d)
-            equity = get_equity()
-            mult = clamp(0.5 + (p_meta - 0.4) * 3, 0.5, 1.6) if STATE["meta_n"] >= META_MIN_N else 1.0
-            qty = size_position(best, equity, conv, mult)
-            if qty < 1: raise EntryBlocked("رأس المال لا يسمح بحجم دخول.")
-            lg = best["legs_signed"]
-            meta = {"kind": best["kind"], "strategy": best["strategy"], "dir": d, "credit": best["credit"],
-                    "quantity": qty, "width": best["width"], "limit_cap": best["limit_cap"],
-                    "option_type": lg[0][0]["type"], "expiration": lg[0][0]["expiration"],
-                    "inval": price - d * STOP_ATR_MULT * scale,
-                    "target": levels["target_up"] if d > 0 else levels["target_dn"],
-                    "conv": conv, "ev_text": f"{ev:.2f}" if ev is not None else "-",
-                    "pre_breakout": is_pre_breakout}  # تسجيل حالة الاستباق
-            if best["kind"] == "SINGLE":
-                meta["symbol"] = lg[0][0]["symbol"]
-            else:
-                meta.update(long_symbol=lg[0][0]["symbol"], short_symbol=lg[1][0]["symbol"],
-                            long_strike=lg[0][0]["strike"], short_strike=lg[1][0]["strike"])
-            r = submit_entry(meta, 0)
-            telegram_send(f"🚨 أمر دخول\n{best['strategy']} × {qty}\nSPY {price:.2f} | {regime}\n"
-                          f"قناعة {conv:.0f} | EV {meta['ev_text']} | meta {p_meta:.2f}\nPAPER")
-            record_shadow(sc, ind, pick, mx, True, "ENTERED")
-            return r
-        except EntryBlocked as exc:
-            reason = str(exc)
-    note_reject(reason)
-    STATE["last_decision"] += f"\n→ مرفوض: {reason}"
-    if conv >= SHADOW_MIN_SCORE: record_shadow(sc, ind, pick, mx, False, reason)
-    return None
-
-
-
-# ========================= 20) TELEGRAM / REPORTS =========================
-def telegram_send(msg):
-    """بدون Telegram: تسجيل في الشاشة وفي ملف التنبيهات."""
-    text = str(msg)
-    log.info("📣 %s", text.replace("\n", " | "))
-    try:
-        with open(BASE_DIR / "safaa_notifications.log", "a", encoding="utf-8") as f:
-            f.write(f"{utc_iso()}\n{text}\n\n")
+        y10, y10p = fred_last("DGS10")
+        out.update(y10=y10, y10_bps=(y10 - y10p) * 100)
     except Exception:
         pass
+    try:
+        dx = yf_hist("DX-Y.NYB", "10d", "1d")
+        out.update(dxy=float(dx.Close.iloc[-1]), dxy_chg=(float(dx.Close.iloc[-1] / dx.Close.iloc[-2]) - 1) * 100)
+    except Exception:
+        pass
+    if not out:
+        raise SourceError("لا توجد بيانات ماكرو")
+    return out
+
+
+def get_news(now):
+    r = requests.get(f"{DATA_URL}/v1beta1/news", headers=ah(), params={"symbols": "SPY", "limit": 3}, timeout=15)
+    if r.status_code != 200:
+        raise SourceError(f"News HTTP {r.status_code}")
+    return [n.get("headline", "")[:110] for n in r.json().get("news", [])]
+
+
+def get_leaders(now):
+    """الشركات الكبرى موزونة، وتعمل قبل الافتتاح وأثناء الجلسة (Yahoo، متأخر)."""
+    syms = list(LEADER_W)
+    try:
+        raw = yf.download(syms, period="5d", interval="5m", prepost=True, group_by="ticker",
+                          progress=False, auto_adjust=False, threads=True)
+    except Exception as e:
+        raise SourceError(f"القياديات: {str(e)[:80]}")
+    if raw is None or raw.empty:
+        raise SourceError("القياديات: لا بيانات")
+    today = now.date()
+    items = []
+    for s in syms:
+        try:
+            sub = raw[s].dropna(subset=["Close"]).copy()
+        except KeyError:
+            continue
+        if sub.empty:
+            continue
+        idx = sub.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        sub.index = idx.tz_convert(NY)
+        if age_min(sub) > 90:
+            continue
+        days = sorted({dd for dd in sub.index.date if dd < today})
+        if not days:
+            continue
+        pc = session_close(sub, days[-1])
+        if not pc:
+            continue
+        items.append(dict(sym=s, ret=(float(sub.Close.iloc[-1]) / pc - 1) * 100, w=LEADER_W[s]))
+    if len(items) < 5:
+        raise SourceError("القياديات: بيانات غير كافية")
+    tw = sum(i["w"] for i in items)
+    return dict(items=items,
+                wavg=sum(i["ret"] * i["w"] for i in items) / tw,
+                wup=sum(i["w"] for i in items if i["ret"] > 0) / tw,
+                top=sorted(items, key=lambda i: -i["w"])[:5])
+
+
+def get_nasdaq(now):
+    """مؤشر ناسداك 100 (^NDX) — حي أثناء الجلسة فقط، وقبل الافتتاح نستخدم NQ."""
+    today = now.date()
+    dd = daily_completed("^NDX", today)
+    prev = float(dd.Close.iloc[-1])
+    last = prev
+    live = is_rth(now)
+    if live:
+        df = yf_hist("^NDX", "5d", "5m")
+        if age_min(df) > MAX_STALE_MIN:
+            raise SourceError("NDX متأخر")
+        last = float(df.Close.iloc[-1])
+    return dict(last=last, prev=prev, ret_pct=(last / prev - 1) * 100, live=live)
+
+
+SOURCES = [
+    ("SPX", get_spx), ("ES", lambda n: get_future("ES=F", n)), ("NQ", lambda n: get_future("NQ=F", n)),
+    ("VIX", get_vix), ("CHAIN", get_chain), ("LEADERS", get_leaders), ("NASDAQ", get_nasdaq),
+    ("BREADTH", get_breadth), ("VWAP", get_spy_vwap), ("MACRO", get_macro), ("NEWS", get_news),
+]
+
+
+# ============================ طبقة التحقق ============================
+def collect(now):
+    d, q = {}, {}
+    for name, fn in SOURCES:
+        try:
+            d[name] = fn(now)
+            q[name] = (True, "")
+        except Exception as e:
+            d[name] = None
+            q[name] = (False, str(e)[:120])
+    # فحص تطابق Cboe مع SPX: يكشف البيانات القديمة
+    if q["CHAIN"][0] and q["SPX"][0]:
+        ref = d["SPX"]["spot"] if is_rth(now) else d["SPX"]["prev_close"]
+        if abs(d["CHAIN"]["spot"] / ref - 1) > 0.008:
+            q["CHAIN"] = (False, f"Cboe {d['CHAIN']['spot']:.0f} لا يطابق SPX {ref:.0f} (بيانات قديمة؟)")
+            d["CHAIN"] = None
+    return d, q
+
+
+# ============================ الدمج والتوقع ============================
+def lab(v, thr, up, down, flat):
+    return up if v > thr else (down if v < -thr else flat)
+
+
+def build_forecast(d, now):
+    spx, es, vix, ch = d["SPX"], d["ES"], d["VIX"], d["CHAIN"]
+    nq, br, vw, mc = d.get("NQ"), d.get("BREADTH"), d.get("VWAP"), d.get("MACRO")
+    ld, nd = d.get("LEADERS"), d.get("NASDAQ")
+    gex = ch["gex"]
+    rth = is_rth(now)
+    anchor = spx["spot"] if rth else spx["prev_close"] * es["last"] / es["prev_close"]
+
+    comps = {}
+    f, w = [math.tanh(es["ret_pct"] / 0.5)], [0.7]
+    if nq:
+        f.append(math.tanh(nq["ret_pct"] / 0.7))
+        w.append(0.3)
+    comps["futures"] = (float(np.average(f, weights=w)), 0.27)
+    comps["vix"] = (-math.tanh(vix["chg_pct"] / 6.0), 0.13)
+    g = 0.0
+    if gex["call_wall"] and 0 <= (gex["call_wall"] - anchor) / anchor < 0.0015:
+        g -= 0.4
+    if gex["put_wall"] and 0 <= (anchor - gex["put_wall"]) / anchor < 0.0015:
+        g += 0.4
+    comps["gex"] = (g, 0.13)
+    cl = spx["closes"] if rth and spx["closes"] is not None else es["closes"]
+    e5, e13 = cl.ewm(span=5, adjust=False).mean().iloc[-1], cl.ewm(span=13, adjust=False).mean().iloc[-1]
+    tech = math.tanh((e5 - e13) / cl.iloc[-1] * 1500)
+    if vw:
+        tech = 0.7 * tech + 0.3 * math.tanh(vw["dist_pct"] / 0.15)
+    comps["technical"] = (tech, 0.12)
+    if ld:
+        comps["leaders"] = (0.5 * math.tanh(ld["wavg"] / 0.5) + 0.5 * math.tanh((ld["wup"] - 0.5) * 4), 0.15)
+    if br and br.get("sectors_up") is not None:
+        comps["breadth"] = (math.tanh((br["sectors_up"] - 0.5) * 4), 0.05)
+    if mc:
+        parts = []
+        if "dxy_chg" in mc:
+            parts.append(-math.tanh(mc["dxy_chg"] / 0.4))
+        if "y10_bps" in mc:
+            parts.append(-math.tanh(mc["y10_bps"] / 6.0))
+        if parts:
+            comps["macro"] = (float(np.mean(parts)), 0.08)
+
+    # ناسداك: أثناء الجلسة NDX الفعلي، وقبل الافتتاح الفرق بين NQ وES
+    rel, rel_src = None, ""
+    if nd and nd["live"]:
+        spx_ret = (spx["spot"] / spx["prev_close"] - 1) * 100
+        rel, rel_src = nd["ret_pct"] - spx_ret, "NDX"
+        comps["nasdaq"] = (math.tanh(nd["ret_pct"] / 0.7), 0.07)
+    elif nq:
+        rel, rel_src = nq["ret_pct"] - es["ret_pct"], "NQ"
+
+    tw = sum(wt for _, wt in comps.values())
+    S = sum(sc * wt for sc, wt in comps.values()) / tw
+    quality = tw
+    sig_n = [sc for sc, _ in comps.values() if abs(sc) > 0.1]
+    agreement = (sum(1 for sc in sig_n if np.sign(sc) == np.sign(S)) / len(sig_n)) if sig_n else 0.0
+    conflicts = sum(1 for sc, _ in comps.values() if abs(sc) > 0.15 and np.sign(sc) != np.sign(S))
+    near_wall = (gex["call_wall"] and S > 0 and 0 <= (gex["call_wall"] - anchor) / anchor < 0.002) or \
+                (gex["put_wall"] and S < 0 and 0 <= (anchor - gex["put_wall"]) / anchor < 0.002)
+    rev_score = conflicts + (1 if near_wall else 0)
+    reversal = "مرتفع" if rev_score >= 3 else ("متوسط" if rev_score >= 1 else "منخفض")
+
+    neutral = 0.4 * math.exp(-(S / 0.2) ** 2)
+    sg = 1 / (1 + math.exp(-4 * S))
+    probs = dict(up=(1 - neutral) * sg, down=(1 - neutral) * (1 - sg), neutral=neutral)
+    label = max(probs, key=probs.get)
+
+    iv = vix["vix"] if not vix["vix9d"] else 0.5 * vix["vix"] + 0.5 * vix["vix9d"]
+    sig_day = 0.6 * (anchor * iv / 100 / math.sqrt(252)) + 0.4 * (spx["atr"] / 1.596)
+    sig_day *= 0.9 if gex["regime"] == "POSITIVE" else 1.12
+    m = now.hour * 60 + now.minute
+    frac = 1.0 if m < 570 else max(0.05, (960 - m) / 390.0)
+    sig = sig_day * math.sqrt(frac)
+    c = anchor + S * 0.15 * sig
+    hi, lo = c + 0.798 * sig, c - 0.798 * sig
+    hi_near, hi_far = c + 0.126 * sig, c + 1.645 * sig
+    lo_near, lo_far = c - 0.126 * sig, c - 1.645 * sig
+    if rth:
+        dh, dl = spx["day_high"], spx["day_low"]
+        hi, hi_near, hi_far = max(hi, dh), max(hi_near, dh), max(hi_far, dh)
+        lo, lo_near, lo_far = min(lo, dl), min(lo_near, dl), min(lo_far, dl)
+
+    L = [f"ES: {lab(es['ret_pct'], 0.15, 'داعم للصعود', 'داعم للهبوط', 'محايد')} ({es['ret_pct']:+.2f}%)"]
+    L.append(f"NQ: {lab(nq['ret_pct'], 0.2, 'داعم للصعود', 'داعم للهبوط', 'محايد')} ({nq['ret_pct']:+.2f}%)"
+             if nq else "NQ: غير متاح")
+    if rel is not None:
+        tag = lab(rel, 0.15, "قيادة تقنية", "تأخر تقنية", "متوافق مع SPX")
+        base = f"NDX {nd['ret_pct']:+.2f}% | " if rel_src == "NDX" else ""
+        L.append(f"ناسداك: {base}الفرق عن SPX {rel:+.2f}% ({tag})")
+    v9 = f" | VIX9D {vix['vix9d']:.1f}" if vix["vix9d"] else ""
+    L.append(f"VIX: {vix['vix']:.1f} ({vix['chg_pct']:+.1f}%) "
+             f"{lab(vix['chg_pct'], 3, 'ارتفاع التقلب', 'انخفاض التقلب', 'مستقر')}{v9}")
+    L.append(f"GEX: جاما {'إيجابية' if gex['regime']=='POSITIVE' else 'سلبية'} | Flip {n0(gex['flip'])} | "
+             f"مقاومة {n0(gex['call_wall'])} | دعم {n0(gex['put_wall'])}")
+    zr = gex["zero_dte_cp_vol"]
+    L.append(f"0DTE: {gex['zero_dte_share']*100:.0f}% من الجاما" + (f" | حجم Call/Put {zr:.2f}" if zr else ""))
+    if ld:
+        L.append(f"الشركات الكبرى (موزونة): {ld['wavg']:+.2f}% | {ld['wup']*100:.0f}% من الوزن صاعد")
+        L.append("الأكبر وزناً: " + " | ".join(f"{i['sym']} {i['ret']:+.1f}%" for i in ld["top"]))
+    else:
+        L.append("الشركات الكبرى: غير متاح")
+    if br and br.get("sectors_up") is not None:
+        L.append(f"Breadth (قطاعات): {br['sectors_up']*100:.0f}% صاعدة")
+    else:
+        L.append("Breadth (قطاعات): " + ("غير مؤكد قبل الافتتاح" if not rth else "غير متاح"))
+    if mc:
+        bits = []
+        if "y10" in mc:
+            bits.append(f"10Y {mc['y10']:.2f}% ({mc.get('y10_bps', 0):+.0f}bp)")
+        if "dxy" in mc:
+            bits.append(f"DXY {mc['dxy']:.1f} ({mc['dxy_chg']:+.2f}%)")
+        L.append("Macro: " + " | ".join(bits))
+    if d.get("NEWS"):
+        L.append("أخبار: " + d["NEWS"][0])
+
+    levels = dict(r1=gex["call_wall"] if gex["call_wall"] and gex["call_wall"] > anchor else None, r2=hi_far,
+                  s1=gex["put_wall"] if gex["put_wall"] and gex["put_wall"] < anchor else None, s2=lo_far)
+    return dict(anchor=anchor, spot=spx["spot"], hi=hi, lo=lo, hi_near=hi_near, hi_far=hi_far,
+                lo_near=lo_near, lo_far=lo_far, probs=probs, label=label, score=S, reversal=reversal,
+                data_quality=quality, agreement=agreement, gex=gex_public(gex), lines=L, levels=levels,
+                comps={k: round(v[0], 3) for k, v in comps.items()})
+
+
+def gex_public(g):
+    return {k: g[k] for k in ("spot", "flip", "call_wall", "put_wall", "net", "regime")}
+
+
+# ============================ التقارير ============================
+def format_report(fc, title):
+    p, lv = fc["probs"], fc["levels"]
+    out = ["💎 صَفاء التحليل", title, f"📅 {now_ny():%Y-%m-%d %H:%M} (نيويورك)", "━━━━━━━━━━━━",
+           "القمة المتوقعة", n0(fc["hi"]), "القاع المتوقع", n0(fc["lo"]),
+           f"نطاق القمة (80%): {n0(fc['hi_near'])} – {n0(fc['hi_far'])}",
+           f"نطاق القاع (80%): {n0(fc['lo_far'])} – {n0(fc['lo_near'])}",
+           "━━━━━━━━━━━━", "تحليل الأسواق"] + fc["lines"] + [
+           "━━━━━━━━━━━━", "توقعات النموذج (تقديرية، غير معايَرة بعد)",
+           f"الصعود {p['up']*100:.0f}%", f"الهبوط {p['down']*100:.0f}%", f"العرضي {p['neutral']*100:.0f}%",
+           f"خطر الانعكاس: {fc['reversal']}",
+           f"جودة البيانات: {fc['data_quality']*100:.0f}% | اتفاق الإشارات: {fc['agreement']*100:.0f}%",
+           "━━━━━━━━━━━━", "مستويات المراقبة",
+           f"المقاومة الأولى: {n0(lv['r1'])}", f"المقاومة الثانية: {n0(lv['r2'])}",
+           f"الدعم الأول: {n0(lv['s1'])}", f"الدعم الثاني: {n0(lv['s2'])}",
+           "━━━━━━━━━━━━", "بيانات مجانية متأخرة ~15 دقيقة",
+           "تحليل احتمالي — لا يوجد ضمان للربح", SIGNATURE]
+    return "\n".join(out)
+
+
+def format_close_risk(fc):
+    g = fc["gex"]
+    return "\n".join(["🔔 مخاطر الإغلاق (15:45 نيويورك)", f"جاما: {'إيجابية' if g['regime']=='POSITIVE' else 'سلبية'}",
+                      f"Flip {n0(g['flip'])} | مقاومة {n0(g['call_wall'])} | دعم {n0(g['put_wall'])}",
+                      f"السعر {n0(fc['spot'])} | خطر الانعكاس: {fc['reversal']}",
+                      "قرب الإغلاق وانتهاء 0DTE يزيدان تذبذب الحركة", SIGNATURE])
+
+
+def eval_summary():
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("""SELECT p.anchor,p.hi,p.lo,p.hi_near,p.hi_far,p.lo_near,p.lo_far,p.p_up,p.p_down,
+                            r.high,r.low,r.close FROM predictions p JOIN realized r ON p.day=r.day
+                            WHERE p.kind='premarket'""").fetchall()
+    n = len(rows)
+    if n == 0:
+        return "لا توجد بيانات تقييم كافية بعد"
+    mh = np.mean([abs(r[1] - r[9]) for r in rows])
+    ml = np.mean([abs(r[2] - r[10]) for r in rows])
+    da = np.mean([(r[11] > r[0]) == (r[7] > r[8]) for r in rows])
+    ch = np.mean([r[3] <= r[9] <= r[4] for r in rows])
+    cl = np.mean([r[6] <= r[10] <= r[5] for r in rows])
+    note = " (عينة صغيرة — لا يُعتمد عليها)" if n < 20 else ""
+    return (f"التقييم التراكمي ({n} يوم){note}\nخطأ القمة: {mh:.1f} نقطة | خطأ القاع: {ml:.1f} نقطة\n"
+            f"دقة الاتجاه: {da*100:.0f}% | تغطية نطاق 80%: قمة {ch*100:.0f}% / قاع {cl*100:.0f}%")
+
+
+# ============================ الجدولة والتشغيل ============================
+def halt(bad):
+    last = kv_get("last_halt")
+    if last and (now_ny() - datetime.fromisoformat(last)).total_seconds() < 1800:
+        return
+    kv_set("last_halt", now_ny().isoformat())
+    tg("⛔ توقف إصدار التوقعات (Fail Closed)\n" + "\n".join(bad) +
+       "\nلن تصدر توقعات حتى تعود المصادر الأساسية.\n" + SIGNATURE)
+
+
+def run_forecast(kind):
+    now = now_ny()
+    d, q = collect(now)
+    save_quality(now, q)
+    bad = [f"{n}: {q[n][1]}" for n in CRITICAL if not q[n][0]]
+    if bad:
+        log.warning("توقف: %s", bad)
+        halt(bad)
+        return None
+    fc = build_forecast(d, now)
+    save_prediction(now, kind, fc)
+    return fc, d, now
+
+
+def job_pre_update():
+    return bool(run_forecast("premarket_update"))
+
+
+def job_pre_final():
+    r = run_forecast("premarket")
+    if not r:
+        return False
+    fc, d, now = r
+    tg(format_report(fc, "تقرير توقعات S&P 500 — قبل الافتتاح"))
+    save_snapshot(now, d["CHAIN"])
     return True
 
 
-def hit_rates(recs):
-    by_pick, by_hour = {}, {}
-    for r in recs:
-        for table, key in ((by_pick, r.get("pick") or "-"), (by_hour, r.get("hour"))):
-            w, n = table.get(key, (0, 0)); table[key] = (w + r["y"], n + 1)
-    return by_pick, by_hour
+def job_rth(now):
+    r = run_forecast("intraday")
+    if not r:
+        return
+    fc, d, now = r
+    if now.minute < 5 or now.minute in range(30, 35):
+        save_snapshot(now, d["CHAIN"])
+    last_label, last_send = kv_get("last_label"), kv_get("last_send")
+    due = (not last_send) or (now - datetime.fromisoformat(last_send)).total_seconds() >= UPDATE_MINUTES * 60
+    if fc["label"] != last_label or due:
+        if tg(format_report(fc, "تحديث توقعات S&P 500 — أثناء الجلسة")):
+            kv_set("last_label", fc["label"])
+            kv_set("last_send", now.isoformat())
 
 
-def stats_message(today_only=False):
-    recs = [r for r in LEDGER["shadow"] if r.get("resolved") and r.get("y") is not None]
-    if today_only:
-        recs = [r for r in recs if parse_ts(r["t"]).astimezone(NY).date() == today_ny()]
-    closed = LEDGER["closed_trades"]
-    if today_only:
-        closed = [t for t in closed if parse_ts(t["closed_at"]).astimezone(NY).date() == today_ny()]
-    lines = [f"📊 {'تقرير اليوم' if today_only else 'إحصائيات'} v{VERSION}"]
-    wins = sum(1 for t in closed if t["pnl"] > 0)
-    lines.append(f"صفقات مغلقة: {len(closed)} | رابحة: {wins} | صافي: {format_money(sum(t['pnl'] for t in closed))}")
-    if recs:
-        bp, bh = hit_rates(recs)
-        lines.append(f"إشارات الظل: {len(recs)} | إصابة: {sum(r['y'] for r in recs) / len(recs) * 100:.0f}%")
-        lines.append("حسب الاستراتيجية: " + " | ".join(f"{k} {w / n * 100:.0f}% ({n})" for k, (w, n) in bp.items()))
-        lines.append("حسب الساعة: " + " | ".join(f"{k}h {w / n * 100:.0f}% ({n})" for k, (w, n) in sorted(bh.items())))
-    lines.append(f"عينات النموذج الثاني: {STATE['meta_n']}")
-    if STATE.get("day_rejects"):
-        top = sorted(STATE["day_rejects"].items(), key=lambda x: -x[1])[:5]
-        lines.append("أكثر أسباب الرفض: " + " | ".join(f"{k} ({v})" for k, v in top))
-    return "\n".join(lines)
+def job_close_risk():
+    r = run_forecast("close_risk")
+    if not r:
+        return False
+    tg(format_close_risk(r[0]))
+    return True
 
 
-def status_message():
+def job_eval():
+    now = now_ny()
     try:
-        a = get_account()
-        halted = STATE.get("halted")
-        return "\n".join([f"💎 صَفاء التحليل v{VERSION} | PAPER",
-                          f"الحالة: {'متوقف: ' + str(STATE.get('halt_reason')) if halted else 'يعمل'}",
-                          f"Equity: {format_money(a.get('equity'))}",
-                          f"صافي اليوم: {format_money(STATE.get('daily_pnl', 0))}",
-                          f"صفقات اليوم: {STATE['trades_today']} | خسائر متتالية: {STATE['consecutive_losses']}",
-                          f"مراكز قائمة: {len(STATE['position_meta'])}",
-                          "تحليل احتمالي — لا ضمان للربح."])
-    except Exception as exc:
-        return f"تعذر استخراج الحالة: {exc}"
+        df = yf_hist("^GSPC", "5d", "5m")
+    except SourceError:
+        return False
+    m = df.index.hour * 60 + df.index.minute
+    t = df[(df.index.date == now.date()) & (m < 960)]
+    if t.empty:
+        return False
+    hi, lo, cl = float(t.High.max()), float(t.Low.min()), float(t.Close.iloc[-1])
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT OR REPLACE INTO realized VALUES (?,?,?,?)", (now.date().isoformat(), hi, lo, cl))
+        row = c.execute("SELECT hi,lo FROM predictions WHERE day=? AND kind='premarket'",
+                        (now.date().isoformat(),)).fetchone()
+    today_line = (f"توقع القمة {n0(row[0])} مقابل الفعلي {n0(hi)} | توقع القاع {n0(row[1])} مقابل الفعلي {n0(lo)}"
+                  if row else "لا يوجد توقع قبل الافتتاح اليوم")
+    tg("\n".join(["📊 حفظ النتائج والتقييم", f"إغلاق SPX: {cl:,.2f}", today_line, eval_summary(), SIGNATURE]))
+    return True
 
 
-def handle_command(text, chat_id):
-    if str(chat_id) != TELEGRAM_CHAT_ID: return
-    cmd = str(text or "").strip().lower().split("@")[0]
-    if cmd in ("/start", "/help"):
-        telegram_send("/status الحالة\n/why سبب آخر قرار\n/stats إحصائيات\n/report تقرير اليوم\n"
-                      "/risk الحدود\n/halt إيقاف\n/resume استئناف")
-    elif cmd == "/status": telegram_send(status_message())
-    elif cmd == "/why": telegram_send(STATE.get("last_decision", "-"))
-    elif cmd == "/stats": telegram_send(stats_message())
-    elif cmd == "/report": telegram_send(stats_message(True))
-    elif cmd == "/risk":
-        telegram_send(f"Risk {RISK_BASE * 100:.0f}-{RISK_MAX * 100:.0f}% | DD {MAX_DAILY_DRAWDOWN * 100:.0f}% | "
-                      f"Trades {MAX_TRADES_PER_DAY} | Contracts {MAX_CONTRACTS} | Mode {STRATEGY_MODE} | PAPER")
-    elif cmd == "/halt":
-        halt_bot("طلب من Telegram."); telegram_send("⛔ إيقاف: لا دخول جديد.")
-    elif cmd == "/resume":
-        STATE.update(halted=False, halt_reason=None, halt_scope=None); save_state()
-        telegram_send("▶️ تم رفع الإيقاف.")
+def once(key, now, start, window, fn):
+    m = now.hour * 60 + now.minute
+    k = f"{now.date()}:{key}"
+    if start <= m < start + window and not kv_get(k):
+        if fn():
+            kv_set(k, "1")
 
 
-def poll_telegram():
-    """إيقاف/استئناف عن طريق إنشاء ملف في مجلد البوت."""
-    halt_file = BASE_DIR / "HALT"
-    resume_file = BASE_DIR / "RESUME"
-    try:
-        if resume_file.exists():
-            STATE.update(halted=False, halt_reason=None, halt_scope=None)
-            save_state()
-            resume_file.unlink()
-            if halt_file.exists():
-                halt_file.unlink()
-            log.warning("تم رفع الإيقاف عبر ملف RESUME.")
-        elif halt_file.exists() and not STATE.get("halted"):
-            halt_bot("ملف HALT موجود.")
-    except Exception:
-        log.exception("File command error.")
-
-
-def maybe_daily_report():
-    n = ny_now()
-    if n.weekday() >= 5 or minutes_ny() < 16 * 60 + 5 or STATE.get("report_day") == today_str(): return
-    telegram_send(stats_message(True))
-    bdir = BASE_DIR / "backup"; bdir.mkdir(exist_ok=True)
-    for f in (STATE_FILE, LEDGER_FILE):
-        if f.exists(): shutil.copy(f, bdir / f"{today_str()}_{f.name}")
-    STATE["report_day"] = today_str()
-    save_state()
-
-
-# ========================= 21) MAIN CYCLE =========================
-def run_one_cycle():
-    try:
-        poll_telegram()
-        refresh_daily_baseline()
-        maybe_daily_report()
-        if not market_open(): return
-        ensure_analog()
-        try:
-            build_context()
-        except MarketDataUnavailable as exc:
-            log.warning("MARKET DATA: %s", exc)
-        if not STATE.get("halted"): check_daily_risk()
-        process_orders()
-        manage_positions()
-        resolve_shadow()
-        if STATE.get("halted"): return
-        if not periodic_reconcile(): return
-        if force_exit_time_reached() or not entry_time_allowed(): return
-        if CTX.get("ts", 0) < time.time() - SPY_MAX_BAR_AGE: return
-        if CTX.get("candle_id") == STATE.get("last_candle_id"): return
-        STATE["last_candle_id"] = CTX["candle_id"]
-        save_state()
-        evaluate_and_enter()
-    except EntryBlocked as exc:
-        note_reject(str(exc))
-    except SafetyHalt as exc:
-        if not STATE.get("halted"): halt_bot(str(exc))
-    except MarketDataUnavailable as exc:
-        log.warning("MARKET DATA: %s", exc)
-    except APIError as exc:
-        log.error("BROKER API ERROR: %s", exc)
-    except Exception:
-        log.exception("UNHANDLED CYCLE ERROR.")
-
-
-def startup_checks():
-    if not API_KEY or not API_SECRET: raise SafetyHalt("أضف APCA_API_KEY_ID و APCA_API_SECRET_KEY.")
-    a = get_account(0)
-    if a.get("status") != "ACTIVE": raise SafetyHalt("الحساب ليس ACTIVE.")
-    if a.get("trading_blocked") or a.get("account_blocked"): raise SafetyHalt("الحساب محظور.")
-    if safe_float(a.get("equity"), 0) <= 0: raise SafetyHalt("Equity غير صالح.")
-    log.info("STARTUP OK | Equity=%s | Paper", a.get("equity"))
+def tick():
+    now = now_ny()
+    if now.weekday() >= 5:
+        return
+    m = now.hour * 60 + now.minute
+    once("pre_update", now, 9 * 60, 15, job_pre_update)
+    once("pre_final", now, 9 * 60 + 20, 12, job_pre_final)
+    if 575 <= m < 955:
+        k = f"{now.date()}:rth:{m // 5}"
+        if not kv_get(k):
+            kv_set(k, "1")
+            job_rth(now)
+    once("close_risk", now, 15 * 60 + 45, 10, job_close_risk)
+    once("eval", now, 16 * 60 + 15, 90, job_eval)
 
 
 def main():
-    log.warning("SAFAA v%s | PAPER ONLY | MODE=%s", VERSION, STRATEGY_MODE)
-    acquire_instance_lock()
-    startup_checks()
-    initialize_storage()
-    ensure_analog()
-    reconcile()
-    telegram_send(f"💎 صَفاء التحليل v{VERSION} بدأ.\nAdaptive Engine | PAPER ONLY")
-    try:
-        while True:
-            t0 = time.monotonic()
-            run_one_cycle()
-            time.sleep(max(1, SCAN_SECONDS - (time.monotonic() - t0)))
-    except KeyboardInterrupt:
-        log.warning("Manual shutdown.")
-    telegram_send(f"⛔ صَفاء التحليل v{VERSION} توقف.")
+    init_db()
+    log.info("تشغيل صَفاء التحليل SPX")
+    tg("🚀 تم تشغيل صَفاء التحليل SPX (مصادر مجانية)\nلا تنفيذ تلقائي — تحليل احتمالي فقط\n" + SIGNATURE)
+    while True:
+        try:
+            tick()
+        except Exception as e:
+            log.exception("خطأ تشغيلي: %s", e)
+        time.sleep(20)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "stats":
-        STATE = read_json(STATE_FILE)
-        LEDGER = read_json(LEDGER_FILE)
-        print(stats_message())
-        print("\nآخر قرار:\n" + str(STATE.get("last_decision")))
-        sys.exit(0)
-    try:
-        main()
-    except Exception as exc:
-        log.critical("FATAL: %s", exc, exc_info=True)
-        raise
+    main()
