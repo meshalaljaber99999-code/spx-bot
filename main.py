@@ -7,6 +7,7 @@
 import os, re, sys, json, gzip, math, time, sqlite3, logging, uuid
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import numpy as np
@@ -1232,24 +1233,6 @@ def once(key, now, start, window, fn):
             kv_set(k, "1")
 
 
-def tick():
-    now = now_ny()
-    if now.weekday() >= 5:
-        return
-    m = now.hour * 60 + now.minute
-    once("pre_update", now, 9 * 60, 15, job_pre_update)
-    once("pre_final", now, 9 * 60 + 20, 12, job_pre_final)
-    if 575 <= m < 955:
-        k = f"{now.date()}:rth:{m // 5}"
-        if not kv_get(k):
-            kv_set(k, "1")
-            job_rth(now)
-    once("close_risk", now, 15 * 60 + 45, 10, job_close_risk)
-    for s in (630, 690, 750, 810, 870, 930):
-        once(f"hr{s}", now, s + 1, 6, job_hourly)
-    once("eval", now, 16 * 60 + 15, 90, job_eval)
-
-
 def dump_1m_once():
     if kv_get("dump_1m_done"):
         return
@@ -1304,14 +1287,12 @@ def train_model():
 
 
 # ===================== وحدة توصيات العقود — أكبر 40 شركة =====================
-from concurrent.futures import ThreadPoolExecutor
-
 REC_TICKERS = [x.strip().upper() for x in env(
     "REC_TICKERS",
     "NVDA,AAPL,MSFT,AMZN,GOOGL,META,AVGO,TSLA,BRK-B,LLY,JPM,WMT,V,ORCL,MA,XOM,NFLX,COST,JNJ,HD,"
     "PLTR,BAC,ABBV,PG,CVX,UNH,KO,GE,AMD,CSCO,TMUS,WFC,MS,IBM,PM,CRM,ABT,AXP,LIN,MCD").split(",") if x.strip()]
-REC_MOVE = float(env("REC_MOVE", "5"))
-REC_MIN_SCORE = float(env("REC_MIN_SCORE", "98"))
+REC_MOVE_PCT = float(env("REC_MOVE_PCT", "1.5"))   # الحركة المتوقعة كنسبة مئوية من سعر السهم (1.5% افتراضياً)
+REC_MIN_SCORE = float(env("REC_MIN_SCORE", "85"))  # عتبة القبول (من 100)
 REC_MIN_FP = int(env("REC_MIN_FP", "4"))
 REC_MIN_TOUCH = float(env("REC_MIN_TOUCH", "0.50"))
 REC_MIN_FREQ = float(env("REC_MIN_FREQ", "0.35"))
@@ -1504,9 +1485,10 @@ def rec_market(now):
     return dict(es=es["ret_pct"], vix=vx["chg_pct"], drop=float(kv_get(f"dropmax:{now.date()}") or 0))
 
 
-# ---------------- الاختبار الرجعي (حركة السهم لا ربح العقد) ----------------
+# ---------------- الاختبار الرجعي (حركة السهم النسبية لا ربح العقد) ----------------
 def rec_backtest(daily):
     sig, base = [], []
+    move_frac = REC_MOVE_PCT / 100.0
     for s, dd in daily.items():
         if dd is None or len(dd) < 200:
             continue
@@ -1517,11 +1499,12 @@ def rec_backtest(daily):
         pct = bbw.rolling(121).apply(lambda x: (x[:-1] < x[-1]).mean(), raw=True).values
         vm = pd.Series(v).rolling(20).mean().shift(1).values
         for i in range(125, len(c) - 3):
+            mv = c[i] * move_frac
             for d in (1, -1):
                 res = 0
                 for j in range(i + 1, i + 4):
-                    st = (l[j] <= c[i] - 2.5) if d == 1 else (h[j] >= c[i] + 2.5)
-                    tg_ = (h[j] >= c[i] + REC_MOVE) if d == 1 else (l[j] <= c[i] - REC_MOVE)
+                    st = (l[j] <= c[i] - 0.5 * mv) if d == 1 else (h[j] >= c[i] + 0.5 * mv)
+                    tg_ = (h[j] >= c[i] + mv) if d == 1 else (l[j] <= c[i] - mv)
                     if st:
                         break
                     if tg_:
@@ -1560,6 +1543,7 @@ def rec_accuracy():
 def _pick(ch, spot, dirn, dte_set, now, gap, opex):
     today, df, best, why = now.date(), ch["df"], None, "لا عقد مناسب"
     m = now.hour * 60 + now.minute
+    req_move = spot * (REC_MOVE_PCT / 100.0)
     for e in sorted(df.exp.unique()):
         dte = (e - today).days
         if dte not in dte_set or (dte == 0 and (gap > 0.015 or opex)):
@@ -1571,10 +1555,10 @@ def _pick(ch, spot, dirn, dte_set, now, gap, opex):
             continue
         days = dte if dte > 0 else (1.0 if m < 570 else max(0.05, (960 - m) / 390))
         sig = spot * iv * math.sqrt(days / 365)
-        if sig < REC_MOVE:
+        if sig < req_move:
             why = "الحركة المتوقعة"
             continue
-        touch = 2 * (1 - _ncdf(REC_MOVE / sig))
+        touch = 2 * (1 - _ncdf(req_move / sig))
         if touch < REC_MIN_TOUCH + (0.05 if opex else 0):
             why = "احتمال اللمس"
             continue
@@ -1596,7 +1580,7 @@ def _pick(ch, spot, dirn, dte_set, now, gap, opex):
         if be_r > 0.70:
             why = "نقطة التعادل"
             continue
-        T1 = max(REC_MOVE, 0.6 * sig)
+        T1 = max(req_move, 0.6 * sig)
         T2 = max(1.5 * T1, sig)
         S1, S2, SS = spot + dirn * T1, spot + dirn * T2, spot - dirn * T1 / 2
         est = lambda S: max(mid + dl * (S - spot) + 0.5 * gm * (S - spot) ** 2, 0.01)
@@ -1668,13 +1652,15 @@ def rec_analyze(s, X):
         return 1 if (x9 > x21 and c.iloc[-1] > x21) else (-1 if (x9 < x21 and c.iloc[-1] < x21) else 0)
     if not (td == tf("1h") == tf("15min") == dirn):
         raise Rej("الأطر غير متوافقة")
-    # ملف السهم
+    # ملف السهم (نسبي لكل سهم)
+    move_frac = REC_MOVE_PCT / 100.0
     hi_, lo_, op_ = dd.High.values[-63:], dd.Low.values[-63:], dd.Open.values[-63:]
-    exc = [max(hi_[i:i + 3].max() - op_[i], op_[i] - lo_[i:i + 3].min()) for i in range(len(op_) - 3)]
-    if float(np.mean([x >= REC_MOVE for x in exc])) < REC_MIN_FREQ:
+    exc_pct = [max(hi_[i:i + 3].max() - op_[i], op_[i] - lo_[i:i + 3].min()) / max(op_[i], 1e-6)
+               for i in range(len(op_) - 3)]
+    if float(np.mean([x >= move_frac for x in exc_pct])) < REC_MIN_FREQ:
         raise Rej("سهم هادئ")
-    moved = (spot - prevc) * dirn
-    if moved >= 0.8 * REC_MOVE:
+    moved_pct = ((spot - prevc) / prevc) * dirn
+    if moved_pct >= 0.8 * move_frac:
         raise Rej("الحركة استُهلكت")
     day = bars.index[-1].date()
     b = bars[bars.index.date == day]
@@ -1769,7 +1755,7 @@ def rec_scan(now, dte_set):
         raise SourceError("بيانات yfinance فارغة")
     daily = {s: _split(rd, s, True) for s in syms}
     intra = {s: _split(ri, s) for s in syms}
-    wk = now.strftime("%G-%V")
+    wk = f"{now.strftime('%G-%V')}:{REC_MOVE_PCT}"
     if kv_get("rec_bt_wk") != wk:
         try:
             kv_set("rec_bt", json.dumps(rec_backtest(daily)))
@@ -1850,13 +1836,13 @@ def rec_run(now, dte_set, kind):
     with sqlite3.connect(DB_PATH) as c:
         used = c.execute("SELECT sym, side, sector FROM recs WHERE sent=1 AND day=?", (day,)).fetchall()
         openr = {x[0] for x in c.execute("SELECT sym FROM recs WHERE sent=1 AND status='open'").fetchall()}
-    
+
     final, taken = [], {(u[2], 1 if u[1] == "CALL" else -1) for u in used}
-    
-    # 1. مرحلة التصفية واختيار التوصيات (تتم بالكامل أولاً)
+
+    # 1. مرحلة التصفية واختيار التوصيات
     for r in sorted(res["recs"], key=lambda x: -x["score"]):
         if r["score"] < REC_MIN_SCORE:
-            if r["score"] >= 90:
+            if r["score"] >= REC_MIN_SCORE - 7:
                 _rec_save(now, kind, r, False)
             continue
         if r["sym"] in openr or any(u[0] == r["sym"] and u[1] != r["side"] for u in used):
@@ -1865,17 +1851,16 @@ def rec_run(now, dte_set, kind):
             continue
         taken.add((r["sector"], r["dir"]))
         final.append(r)
-        
-    # 2. مرحلة الإرسال والحفظ (خارج حلقة التصفية وبمسافة بادئة سليمة)
+
+    # 2. مرحلة الإرسال والحفظ
     for r in final:
         if tg_pro(rec_msg_pro(r, now)):
             _rec_save(now, kind, r, True)
-            
+
     if not final:
         extra = (" | بيانات ناقصة: " + ", ".join(res["bad"][:6])) if res["bad"] else ""
         tg(f"🔍 فحص {res['ok']}/{res['n']} — لا توجد توصية اليوم{extra}\n{SIGNATURE}")
     return True
-
 
 
 def rec_recheck(now):
@@ -1969,7 +1954,7 @@ def job_rec_eval():
                           "AND result IN ('win','loss','expired')", (since,)).fetchone()
             tg(f"📅 تقرير الأسبوع\nتوصيات: {a[0]} | نجاح: {(a[1] or 0)}"
                f"{'' if a[2] is None else f' | متوسط {a[2]:+.0f}%'}\n"
-               f"مرشحات 90-98 (للمعايرة): {b[0]} | نجاح: {(b[1] or 0)}\n{SIGNATURE}")
+               f"مرشحات {int(REC_MIN_SCORE)-7}-{int(REC_MIN_SCORE)} (للمعايرة): {b[0]} | نجاح: {(b[1] or 0)}\n{SIGNATURE}")
     if len(last3) == 3 and all(x in ("loss", "expired") for x in last3):
         kv_set("rec_kill", "1")
         tg("⛔ قاطع الخسائر: 3 توصيات متتالية لم تنجح. توقف الإرسال للمراجعة.\n" + SIGNATURE)
@@ -2016,6 +2001,7 @@ def main():
         except Exception as e:
             log.exception("خطأ تشغيلي: %s", e)
         time.sleep(20)
+
 
 def rec_msg_pro(r, now):
     ksa = now.astimezone(RIYADH)
