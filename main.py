@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل SPX — النسخة الكمّية v2.2
+صَفاء التحليل SPX — النسخة الكمّية v2.3
 تصميم أبو سحاب
 تحليل احتمالي فقط — لا تنفيذ تلقائي — Fail Closed
 """
@@ -46,6 +46,7 @@ LEADER_W = {k.strip().upper(): float(v) for k, v in
 LEADERS = list(LEADER_W.keys())
 SECTORS = env("SECTORS", "XLK,XLF,XLE,XLV,XLY,XLP,XLI,XLU").split(",")
 SIGNATURE = "⚡ تصميم أبو سحاب"
+BRAND = "💎 صَفاء التحليل"
 CRITICAL = ["SPX", "ES", "VIX", "CHAIN"]
 ML_FEATURES = ["time_of_day", "vix_score", "gex_score", "tech_score", "breadth_score",
                "micro_score", "credit_score", "futures_score", "leaders_score"]
@@ -1291,11 +1292,16 @@ REC_TICKERS = [x.strip().upper() for x in env(
     "REC_TICKERS",
     "NVDA,AAPL,MSFT,AMZN,GOOGL,META,AVGO,TSLA,BRK-B,LLY,JPM,WMT,V,ORCL,MA,XOM,NFLX,COST,JNJ,HD,"
     "PLTR,BAC,ABBV,PG,CVX,UNH,KO,GE,AMD,CSCO,TMUS,WFC,MS,IBM,PM,CRM,ABT,AXP,LIN,MCD").split(",") if x.strip()]
-REC_MOVE_PCT = float(env("REC_MOVE_PCT", "1.5"))   # الحركة المتوقعة كنسبة مئوية من سعر السهم (1.5% افتراضياً)
-REC_MIN_SCORE = float(env("REC_MIN_SCORE", "85"))  # عتبة القبول (من 100)
-REC_MIN_FP = int(env("REC_MIN_FP", "4"))
-REC_MIN_TOUCH = float(env("REC_MIN_TOUCH", "0.50"))
+REC_MOVE_PCT = float(env("REC_MOVE_PCT", "1.5"))     # الحركة المتوقعة كنسبة مئوية من سعر السهم
+REC_MAX_DTE = int(env("REC_MAX_DTE", "7"))           # أقصى عدد أيام لانتهاء العقد (أسبوع)
+REC_MIN_SCORE = float(env("REC_MIN_SCORE", "88"))    # عتبة القبول (من 100) — صارمة
+REC_MIN_FP = int(env("REC_MIN_FP", "5"))             # أقل عدد بصمات من 6
+REC_MIN_TOUCH = float(env("REC_MIN_TOUCH", "0.60"))  # أقل احتمال لمس الهدف
 REC_MIN_FREQ = float(env("REC_MIN_FREQ", "0.35"))
+REC_MAX_IVRV = float(env("REC_MAX_IVRV", "1.3"))    # أعلى نسبة IV/RV
+REC_MAX_DAY = int(env("REC_MAX_DAY", "3"))           # أقصى توصيات في اليوم
+REC_BT_MIN_N = int(env("REC_BT_MIN_N", "30"))        # أقل عدد إشارات في الاختبار الرجعي
+REC_BT_MARGIN = float(env("REC_BT_MARGIN", "0.05"))  # هامش التفوق على خط الأساس
 _SEC = {"رقائق": "NVDA AVGO AMD", "تقنية": "AAPL MSFT ORCL CRM PLTR IBM CSCO",
         "اتصالات وإعلام": "GOOGL META NFLX TMUS", "استهلاكي": "AMZN TSLA WMT COST HD MCD PG KO PM",
         "مالية": "BRK-B JPM V MA BAC WFC MS AXP", "صحة": "LLY JNJ ABBV UNH ABT",
@@ -1389,7 +1395,7 @@ def _chain(s, now):
             continue
         _, ymd, cp, k = m.groups()
         e = datetime.strptime(ymd, "%y%m%d").date()
-        if e < now.date() or (e - now.date()).days > 3:
+        if e < now.date() or (e - now.date()).days > REC_MAX_DTE:
             continue
         rows.append(dict(exp=e, cp=cp, strike=int(k) / 1000.0, oi=float(o.get("open_interest") or 0),
                          vol=float(o.get("volume") or 0), gamma=float(o.get("gamma") or 0),
@@ -1476,7 +1482,10 @@ def rec_econ(now, zero):
         if not it:
             continue
         t = datetime.strptime(it, "%Y-%m-%d %H:%M").replace(tzinfo=NY)
-        if abs((t - now).total_seconds()) <= 3600 or (zero and t.date() == now.date() and t > now):
+        delta = (t - now).total_seconds()
+        # حدث خلال ساعة، أو 0DTE وفيه حدث اليوم، أو توصية أيام وفيه حدث خلال 24 ساعة
+        if abs(delta) <= 3600 or (zero and t.date() == now.date() and t > now) \
+                or ((not zero) and 0 <= delta <= 86400):
             raise SourceError(f"حدث اقتصادي {it}")
 
 
@@ -1563,13 +1572,13 @@ def _pick(ch, spot, dirn, dte_set, now, gap, opex):
             why = "احتمال اللمس"
             continue
         cp = "C" if dirn == 1 else "P"
-        c = x[(x.cp == cp) & (x.delta.abs().between(0.30, 0.50)) & (x.oi >= 1000) & (x.vol >= 500)
+        c = x[(x.cp == cp) & (x.delta.abs().between(0.30, 0.50)) & (x.oi >= 1500) & (x.vol >= 500)
               & (x.bid > 0) & (x.ask > 0)].copy()
         if c.empty:
             why = "السيولة"
             continue
         c["mid"] = (c.bid + c.ask) / 2
-        c = c[(c.ask - c.bid) / c.mid <= 0.05]
+        c = c[(c.ask - c.bid) / c.mid <= 0.04]
         if c.empty:
             why = "فارق السعر"
             continue
@@ -1686,13 +1695,12 @@ def rec_analyze(s, X):
         raise Rej("السوق معاكس")
     # العقد
     gap = abs(spot / prevc - 1)
-    cdte, cb = _pick(ch, spot, dirn, X["dte"], now, gap, X["opex"])
-    if not cb:
-        raise Rej(cdte if isinstance(cdte, str) else cb)
-    c = cb
+    c, why = _pick(ch, spot, dirn, X["dte"], now, gap, X["opex"])
+    if not c:
+        raise Rej(why)
     rv = float(np.log(cd).diff().tail(20).std() * math.sqrt(252))
     ivrv = c["iv"] / max(rv, 1e-6)
-    if ivrv > 1.5:
+    if ivrv > REC_MAX_IVRV:
         raise Rej("IV مرتفع")
     # الجاما والتدفق
     try:
@@ -1722,7 +1730,7 @@ def rec_analyze(s, X):
     s_vol = 5 * clip(rvol / 2, 0, 1) + (5 if (spot - vw) * dirn >= 0 else 0)
     s_lvl = 10 * clip((0.9 * atr - abs(spot - lvl)) / (0.6 * atr), 0, 1)
     s_flow = 8 * clip(ratio - 1, 0, 1) + 7 * clip(mvo / 0.5, 0, 1)
-    s_iv = 10 * clip((1.5 - ivrv) / 0.6, 0, 1)
+    s_iv = 10 * clip((REC_MAX_IVRV - ivrv) / 0.5, 0, 1)
     al = 0.6 * clip(mk["es"] * dirn / 0.25) + 0.4 * clip(-mk["vix"] * dirn / 3)
     s_mk = 10 * (0.5 + 0.5 * al)
     s_rr = 7 * clip(c["reward"] / 3, 0, 1) + 4 * clip(c["oi"] / 3000, 0, 1) + 4 * clip((0.7 - c["be"]) / 0.3, 0, 1)
@@ -1766,8 +1774,13 @@ def rec_scan(now, dte_set):
         bt = json.loads(kv_get("rec_bt") or "{}")
     except ValueError:
         bt = {}
-    if env("REC_BT_GATE", "1") == "1" and bt.get("n", 0) >= 30 and bt.get("wr_test", 0) <= bt.get("base_test", 0):
-        return dict(gate="الاختبار الرجعي لا يدعم الإشارات حالياً")
+    # بوابة صارمة: بدون دعم إحصائي واضح لا تُرسل أي توصية
+    if env("REC_BT_GATE", "1") == "1":
+        ok_bt = (bt.get("n", 0) >= REC_BT_MIN_N and bt.get("n_test", 0) >= 8
+                 and bt.get("wr", 0) >= bt.get("base", 0) + REC_BT_MARGIN
+                 and bt.get("wr_test", 0) >= bt.get("base_test", 0) + REC_BT_MARGIN)
+        if not ok_bt:
+            return dict(gate="الاختبار الرجعي لا يدعم الإشارات بما يكفي (لا ضمان إحصائي)")
     X = dict(now=now, dte=dte_set, daily=daily, intra=intra, mkt=mk, alp=_alp_prices(syms),
              news=_news_syms(syms, now), chain=_par(lambda s: _chain(s, now), syms, 5),
              earn=_par(lambda s: _earn(s, now), syms, 6),
@@ -1788,22 +1801,19 @@ def rec_scan(now, dte_set):
 
 
 def rec_msg(r, now):
-    ksa, sep = now.astimezone(RIYADH), "━━━━━━━━━━━━"
-    lab_ = ("صعود حاد 🟢" if r["dir"] == 1 else "هبوط حاد 🔴") if r["fp"] >= 4 else "حركة عادية ⚪"
-    ico = "🟢" if r["dir"] == 1 else "🔴"
+    """رسالة التوصية — نص عادي بنفس شكل الرسالة المطلوبة."""
+    up = r["dir"] == 1
     return "\n".join([
-        "💎 صَفاء التحليل", f"🎯 توصية عقد{' 0DTE' if r['dte'] == 0 else ''} — {lab_}",
-        f"🕘 {now:%H:%M} نيويورك | {ksa:%H:%M} السعودية", sep,
-        f"📌 {r['sym']} | السعر الآن: {r['spot']:.2f}",
-        f"{ico} {r['side']} | Strike {r['strike']:g} | الانتهاء {r['expiry']}",
-        f"نطاق الدخول: {r['mid'] * 0.92:.2f} – {r['mid'] * 1.08:.2f}", sep,
-        f"🎯 الهدف 1: سهم {r['t1']:.2f} (عقد ≈ {r['c_t1']:.2f})",
-        f"🎯 الهدف 2: سهم {r['t2']:.2f} (عقد ≈ {r['c_t2']:.2f})",
-        f"🛑 الوقف: سهم {r['stop']:.2f} (عقد ≈ {r['c_stop']:.2f})",
-        f"❌ تُلغى الفكرة: إغلاق شمعة 5د {'تحت' if r['dir'] == 1 else 'فوق'} {r['lvl']:.2f}", sep,
-        f"💥 قوة الانفجار: {r['fp'] / 6 * 100:.0f}%", f"📊 نقاط التوافق: {r['score']:.0f}%",
-        f"📈 الدقة التاريخية لهذه الفئة: {rec_accuracy()}", sep,
-        "تحليل احتمالي — لا يوجد ضمان للربح", SIGNATURE])
+        f"📈 عقد {'كول' if up else 'بوت'} مقترح {'🟩' if up else '🟥'}",
+        f"📌 السهم: {r['sym']}",
+        f"📅 تاريخ الانتهاء: {r['expiry']}",
+        f"💵 السترايك: {r['strike']:g}",
+        f"💰 السعر الحالي: {r['mid']:.2f} $",
+        f"🎯 الهدف 1: {r['c_t1']:.2f} $ | الهدف 2: {r['c_t2']:.2f} $",
+        f"🛑 الوقف: {r['c_stop']:.2f} $",
+        f"❌ تُلغى: إغلاق شمعة 5د {'تحت' if up else 'فوق'} {r['lvl']:.2f}",
+        BRAND,
+    ])
 
 
 def _rec_save(now, kind, r, sent):
@@ -1852,10 +1862,14 @@ def rec_run(now, dte_set, kind):
         taken.add((r["sector"], r["dir"]))
         final.append(r)
 
-    # 2. مرحلة الإرسال والحفظ
+    # 2. مرحلة الإرسال والحفظ (بحد أقصى يومي)
+    sent_today = len(used)
     for r in final:
-        if tg_pro(rec_msg_pro(r, now)):
+        if sent_today >= REC_MAX_DAY:
+            break
+        if tg(rec_msg(r, now)):
             _rec_save(now, kind, r, True)
+            sent_today += 1
 
     if not final:
         extra = (" | بيانات ناقصة: " + ", ".join(res["bad"][:6])) if res["bad"] else ""
@@ -1888,7 +1902,7 @@ def rec_recheck(now):
 
 
 def job_rec_pre():
-    return rec_run(now_ny(), {1, 2, 3}, "pre")
+    return rec_run(now_ny(), set(range(1, REC_MAX_DTE + 1)), "pre")
 
 
 def job_rec_zero():
@@ -1992,8 +2006,8 @@ def main():
         train_model()
         return
     dump_1m_once()
-    log.info("تشغيل صَفاء التحليل SPX v2.2")
-    tg("🚀 تم تشغيل صَفاء التحليل SPX v2.2\nتوقع الساعات + خطر الهبوط الحاد\n"
+    log.info("تشغيل صَفاء التحليل SPX v2.3")
+    tg("🚀 تم تشغيل صَفاء التحليل SPX v2.3\nتوقع الساعات + خطر الهبوط الحاد + توصيات أسبوعية صارمة\n"
        "لا تنفيذ تلقائي — تحليل احتمالي فقط\n" + SIGNATURE)
     while True:
         try:
@@ -2001,55 +2015,6 @@ def main():
         except Exception as e:
             log.exception("خطأ تشغيلي: %s", e)
         time.sleep(20)
-
-
-def rec_msg_pro(r, now):
-    ksa = now.astimezone(RIYADH)
-    up = r["dir"] == 1
-    sig = ("SHARP RISE 🟢" if up else "SHARP DROP 🔴") if r["fp"] >= 4 else "NORMAL MOVE ⚪"
-    exp = datetime.strptime(r["expiry"], "%Y-%m-%d")
-    dte = "0DTE" if r["dte"] == 0 else f"{r['dte']}DTE"
-    bar = lambda p: "▰" * max(0, min(10, round(p / 10))) + "▱" * (10 - max(0, min(10, round(p / 10))))
-    box = "\n".join([
-        "╔══════════════════╗",
-        "║  💎 SAFAA SIGNAL  ║",
-        "╚══════════════════╝",
-        f"▌ {r['sym']}   {r['side']}   {r['strike']:g}",
-        f"▌ EXP    {exp:%d/%m}   {dte}",
-        f"▌ SPOT   {r['spot']:.2f}",
-        f"▌ ENTRY  {r['mid'] * 0.92:.2f} → {r['mid'] * 1.08:.2f}",
-        "▌",
-        f"▌ T1     {r['t1']:.2f}   ▸ {r['c_t1']:.2f}",
-        f"▌ T2     {r['t2']:.2f}   ▸ {r['c_t2']:.2f}",
-        f"▌ STOP   {r['stop']:.2f}   ▸ {r['c_stop']:.2f}",
-        f"▌ CANCEL 5m close {'below' if up else 'above'} {r['lvl']:.2f}",
-        "▌",
-        f"▌ {sig}",
-        f"▌ BLAST  {bar(r['fp'] / 6 * 100)} {r['fp'] / 6 * 100:.0f}%",
-        f"▌ SCORE  {bar(r['score'])} {r['score']:.0f}%",
-        "╚══════════════════",
-        f"{now:%H:%M} NY · {ksa:%H:%M} KSA",
-    ])
-    return "\n".join([
-        f"<pre>{box}</pre>",
-        f"📈 الدقة التاريخية: {rec_accuracy()}",
-        "تحليل احتمالي — لا يوجد ضمان للربح",
-        "",
-        "<b>✦ ⚡ أبو سحاب ⚡ ✦</b>",
-    ])
-
-
-def tg_pro(text):
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          json={"chat_id": TG_CHAT, "text": text[:4000], "parse_mode": "HTML",
-                                "disable_web_page_preview": True}, timeout=15)
-        if r.status_code != 200:
-            log.error("تيليجرام: %s", r.text[:200])
-        return r.status_code == 200
-    except Exception as e:
-        log.error("خطأ تيليجرام: %s", e)
-        return False
 
 
 if __name__ == "__main__":
