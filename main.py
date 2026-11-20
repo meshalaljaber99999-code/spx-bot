@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل SPX — النسخة الكمّية v2.4.1
+صَفاء التحليل SPX — النسخة الكمّية v2.4.2
 تصميم أبو سحاب
 تحليل احتمالي فقط — لا تنفيذ تلقائي — Fail Closed
+
+التعديلات في v2.4.2:
+- معالجة Cboe HTTP 403: هيدرز متصفح كاملة + إعادة محاولة مع تأخير
+- كاش احتياطي لسلسلة SPX (يُستخدم عند فشل Cboe مع تنبيه أن الجاما قديمة)
+- تقليل ضغط الطلبات المتوازية على Cboe في وحدة التوصيات
 
 التعديلات في v2.4:
 - توقع الافتتاح + أول 10/20/30 دقيقة
@@ -11,7 +16,7 @@
 - توسيع توصيات العقود إلى 60 شركة أكبر في السوق الأمريكي
 - تخفيف فلتر "الحركة استُهلكت" لالتقاط التحركات الكبيرة
 """
-import os, re, sys, json, gzip, math, time, sqlite3, logging, uuid
+import os, re, sys, io, json, gzip, math, time, sqlite3, logging, uuid, base64, random
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +52,9 @@ MODEL_PATH = env("MODEL_PATH", "./data/safaa_lgbm_model.txt")
 ML_WEIGHT = float(env("ML_WEIGHT", "0.0"))          # 0 = Shadow فقط
 MAX_STALE_MIN = int(env("MAX_STALE_MIN", "35"))
 UPDATE_MINUTES = int(env("UPDATE_MINUTES", "60"))
+# أقصى عمر مقبول لكاش سلسلة SPX (بالدقائق): أثناء الجلسة / خارجها
+CHAIN_CACHE_MAX_MIN = int(env("CHAIN_CACHE_MAX_MIN", "30"))
+CHAIN_CACHE_OFF_MIN = int(env("CHAIN_CACHE_OFF_MIN", "4500"))
 _DEF_W = "NVDA:7.5,AAPL:6.5,MSFT:6.5,AMZN:4,GOOGL:4,META:3,AVGO:2.5,TSLA:2,JPM:1.5,LLY:1.3"
 LEADER_W = {k.strip().upper(): float(v) for k, v in
             (p.split(":") for p in env("LEADER_WEIGHTS", _DEF_W).split(",") if ":" in p)}
@@ -169,6 +177,8 @@ def save_prediction(now, kind, fc):
 def save_snapshot(now, chain):
     """لقطة مضغوطة للسلسلة — بيانات تدريب مستقبلية."""
     try:
+        if chain.get("stale_min") is not None:
+            return  # لا نحفظ لقطات من الكاش القديم
         df, spot, today = chain["df"], chain["spot"], now.date()
         x = df[(df.exp >= today) & (df.exp <= today + timedelta(days=7)) &
                (df.strike.between(spot * 0.94, spot * 1.06))].copy()
@@ -297,6 +307,33 @@ def get_vix(now):
 
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json"
 OPT_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+CBOE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.cboe.com/",
+    "Origin": "https://www.cboe.com",
+    "Connection": "keep-alive",
+}
+
+
+def cboe_get(url, tries=3, delay=5.0, timeout=25):
+    """طلب Cboe مع إعادة محاولة وتأخير تصاعدي عند 403/429/5xx."""
+    last = "Cboe: فشل"
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=CBOE_HEADERS, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            last = f"Cboe HTTP {r.status_code}"
+            if r.status_code not in (403, 429, 500, 502, 503, 504):
+                break
+        except Exception as e:
+            last = f"Cboe: {str(e)[:80]}"
+        if i < tries - 1:
+            time.sleep(delay * (i + 1) + random.uniform(0, 1.5))
+    raise SourceError(last)
 
 
 def gex_levels(spot, df, today, max_dte=7, band=0.06):
@@ -329,14 +366,8 @@ def gex_levels(spot, df, today, max_dte=7, band=0.06):
                 regime=regime, zero_dte_share=z_share, zero_dte_cp_vol=z_ratio)
 
 
-def get_chain(now):
-    try:
-        r = requests.get(CBOE_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-    except Exception as e:
-        raise SourceError(f"Cboe: {str(e)[:80]}")
-    if r.status_code != 200:
-        raise SourceError(f"Cboe HTTP {r.status_code}")
-    j = r.json().get("data", {})
+def _parse_spx_chain(payload):
+    j = payload.get("data", {})
     spot = float(j.get("current_price") or 0)
     rows = []
     for o in j.get("options", []):
@@ -350,8 +381,65 @@ def get_chain(now):
                          iv=float(o.get("iv") or 0)))
     if not rows or spot <= 0:
         raise SourceError("Cboe: بيانات فارغة")
-    df = pd.DataFrame(rows)
-    return dict(spot=spot, df=df, gex=gex_levels(spot, df, now.date()))
+    return spot, pd.DataFrame(rows)
+
+
+def chain_cache_save(now, spot, df):
+    """حفظ آخر سلسلة ناجحة (مفلترة ومضغوطة) كاحتياط عند حظر Cboe."""
+    try:
+        today = now.date()
+        x = df[(df.exp >= today) & (df.exp <= today + timedelta(days=7)) &
+               (df.strike.between(spot * 0.92, spot * 1.08))].copy()
+        if x.empty:
+            return
+        x["exp"] = x["exp"].astype(str)
+        blob = gzip.compress(x.to_json(orient="records").encode())
+        kv_set("chain_cache", json.dumps({"ts": now.isoformat(timespec="seconds"), "spot": spot,
+                                          "b64": base64.b64encode(blob).decode()}))
+    except Exception as e:
+        log.warning("تعذر حفظ كاش السلسلة: %s", e)
+
+
+def chain_cache_load(now):
+    """يعيد (spot, df, age_min) أو None إن لم يوجد كاش صالح."""
+    try:
+        raw = kv_get("chain_cache")
+        if not raw:
+            return None
+        j = json.loads(raw)
+        age = (now - datetime.fromisoformat(j["ts"])).total_seconds() / 60.0
+        limit = CHAIN_CACHE_MAX_MIN if is_rth(now) else CHAIN_CACHE_OFF_MIN
+        if age > limit:
+            log.warning("كاش السلسلة أقدم من الحد (%.0f دقيقة)", age)
+            return None
+        txt = gzip.decompress(base64.b64decode(j["b64"])).decode()
+        df = pd.read_json(io.StringIO(txt), orient="records", convert_dates=False)
+        df["exp"] = pd.to_datetime(df["exp"]).dt.date
+        return float(j["spot"]), df, age
+    except Exception as e:
+        log.warning("تعذر قراءة كاش السلسلة: %s", e)
+        return None
+
+
+def get_chain(now):
+    err = None
+    try:
+        spot, df = _parse_spx_chain(cboe_get(CBOE_URL))
+        gx = gex_levels(spot, df, now.date())
+        chain_cache_save(now, spot, df)
+        return dict(spot=spot, df=df, gex=gx, stale_min=None)
+    except SourceError as e:
+        err = e
+    cached = chain_cache_load(now)
+    if cached:
+        spot, df, age = cached
+        try:
+            gx = gex_levels(spot, df, now.date())
+            log.warning("استخدام كاش السلسلة (عمره %.0f دقيقة) بسبب: %s", age, err)
+            return dict(spot=spot, df=df, gex=gx, stale_min=age)
+        except SourceError:
+            pass
+    raise err
 
 
 def ah():
@@ -600,6 +688,9 @@ def build_forecast(d, now):
     m_now = now.hour * 60 + now.minute
     anchor = spx["spot"] if rth else spx["prev_close"] * es["last"] / es["prev_close"]
     warn = []
+    stale = ch.get("stale_min")
+    if stale is not None:
+        warn.append(f"⚠️ بيانات الجاما احتياطية (عمرها {stale:.0f} دقيقة) — Cboe لا يستجيب")
 
     # --- العقود الآجلة
     f, w = [math.tanh(es["ret_pct"] / 0.5)], [0.7]
@@ -729,6 +820,8 @@ def build_forecast(d, now):
     tw = sum(wt for _, wt in comps.values())
     S = heur_S = sum(sc * wt for sc, wt in comps.values()) / tw
     quality = sum(BASE_W[k] for k in comps if k in BASE_W) / sum(BASE_W.values())
+    if stale is not None:
+        quality *= 0.9
 
     # --- نموذج ML (Shadow افتراضياً)
     ml_features = {"time_of_day": m_now, "vix_score": vix_score, "gex_score": g, "tech_score": tech,
@@ -1456,11 +1549,9 @@ def rec_init():
 # ---------------- مصادر البيانات ----------------
 def _chain(s, now):
     root0 = s.replace("-", "")
-    r = requests.get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{root0}.json",
-                     headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-    if r.status_code != 200:
-        raise SourceError(f"Cboe HTTP {r.status_code}")
-    j = r.json().get("data", {})
+    payload = cboe_get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{root0}.json",
+                       tries=2, delay=3.0, timeout=15)
+    j = payload.get("data", {})
     spot = float(j.get("current_price") or 0)
     rows = []
     for o in j.get("options", []):
@@ -1872,7 +1963,7 @@ def rec_scan(now, dte_set):
         if not ok_bt:
             return dict(gate="الاختبار الرجعي لا يدعم الإشارات بما يكفي (لا ضمان إحصائي)")
     X = dict(now=now, dte=dte_set, daily=daily, intra=intra, mkt=mk, alp=_alp_prices(syms),
-             news=_news_syms(syms, now), chain=_par(lambda s: _chain(s, now), syms, 5),
+             news=_news_syms(syms, now), chain=_par(lambda s: _chain(s, now), syms, 3),
              earn=_par(lambda s: _earn(s, now), syms, 6),
              opex=(now.weekday() == 4 and 15 <= now.day <= 21))
     recs, bad, ok, reasons = [], [], 0, {}
@@ -2098,10 +2189,11 @@ def main():
         train_model()
         return
     dump_1m_once()
-    log.info("تشغيل صَفاء التحليل SPX v2.4.1")
-    tg("🚀 تم تشغيل صَفاء التحليل SPX v2.4.1\n"
+    log.info("تشغيل صَفاء التحليل SPX v2.4.2")
+    tg("🚀 تم تشغيل صَفاء التحليل SPX v2.4.2\n"
        "توقع الافتتاح + أول 30 دقيقة + خطر هبوط 50 نقطة\n"
        "توصيات عقود لأكبر 60 شركة + تخفيف فلتر الحركة\n"
+       "معالجة حظر Cboe 403: هيدرز + إعادة محاولة + كاش احتياطي\n"
        "لا تنفيذ تلقائي — تحليل احتمالي فقط\n" + SIGNATURE)
     while True:
         try:
