@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-صَفاء التحليل SPX — النسخة الكمّية v2.3
+صَفاء التحليل SPX — النسخة الكمّية v2.4.1
 تصميم أبو سحاب
 تحليل احتمالي فقط — لا تنفيذ تلقائي — Fail Closed
+
+التعديلات في v2.4:
+- توقع الافتتاح + أول 10/20/30 دقيقة
+- توقع احتمال هبوط ≥50 نقطة في أول نصف ساعة
+- قياس أكبر الشركات القيادية وإضافتها في الرسالة
+- توسيع توصيات العقود إلى 60 شركة أكبر في السوق الأمريكي
+- تخفيف فلتر "الحركة استُهلكت" لالتقاط التحركات الكبيرة
 """
 import os, re, sys, json, gzip, math, time, sqlite3, logging, uuid
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -516,11 +523,30 @@ def get_nasdaq(now):
 
 
 def get_nyse_breadth(now):
-    df = yf_hist("^ADD", "5d", "5m")
-    if age_min(df) > MAX_STALE_MIN:
-        raise SourceError("ADD متأخر")
-    v = float(df.Close.iloc[-1])
-    return dict(add=v, score=math.tanh(v / 1500.0))
+    """اتساع تقديري عبر نسبة RSP/SPY مقارنة بإغلاق الجلسة السابقة الرسمي."""
+    try:
+        rsp = yf_hist("RSP", "5d", "5m")
+        spy = yf_hist("SPY", "5d", "5m")
+        if is_rth(now) and (age_min(rsp) > MAX_STALE_MIN or age_min(spy) > MAX_STALE_MIN):
+            raise SourceError("RSP/SPY متأخر")
+        td = now.date()
+        days = sorted({d for d in spy.index.date if d < td})
+        if not days:
+            raise SourceError("RSP/SPY: لا يوجد إغلاق سابق")
+        r_prev, s_prev = None, None
+        for d_ in reversed(days):
+            r_prev = session_close(rsp, d_)
+            s_prev = session_close(spy, d_)
+            if r_prev and s_prev:
+                break
+        if not (r_prev and s_prev):
+            raise SourceError("RSP/SPY: تعذر تحديد الإغلاق السابق")
+        r_ret = float(rsp.Close.iloc[-1]) / r_prev - 1.0
+        s_ret = float(spy.Close.iloc[-1]) / s_prev - 1.0
+        rel = (r_ret - s_ret) * 100.0
+        return dict(add=rel * 1000.0, score=math.tanh(rel / 0.4))
+    except Exception as e:
+        raise SourceError(f"اتساع RSP/SPY: {str(e)[:60]}")
 
 
 def get_credit_spread(now):
@@ -792,6 +818,31 @@ def build_forecast(d, now):
         hi, hi_near, hi_far = max(hi, dh), max(hi_near, dh), max(hi_far, dh)
         lo, lo_near, lo_far = min(lo, dl), min(lo_near, dl), min(lo_far, dl)
 
+    # --- توقع الافتتاح وأول 30 دقيقة (مصحح v2.4.1)
+    open_pred = None
+    drop50_prob = None
+    if not rth:  # فقط قبل الجلسة — لا يُطبع بعد الافتتاح
+        open_est = spx["prev_close"] * es["last"] / es["prev_close"]
+        gf_open = 1.15 if gex["regime"] == "NEGATIVE" else 0.95
+        # أول 30 دقيقة تمثل ~25% من تباين اليوم (انحراف معياري ~0.50 من اليوم)
+        sig_30 = sig_day * 0.50 * gf_open
+        sig_10 = sig_30 * math.sqrt(10 / 30.0)
+        sig_20 = sig_30 * math.sqrt(20 / 30.0)
+        drift = S * 0.12
+        open_pred = {
+            "open": open_est,
+            "m10_hi": open_est + (0.85 + drift) * sig_10,
+            "m10_lo": open_est - (0.85 - drift) * sig_10,
+            "m20_hi": open_est + (0.95 + drift) * sig_20,
+            "m20_lo": open_est - (0.95 - drift) * sig_20,
+            "m30_hi": open_est + (1.05 + drift) * sig_30,
+            "m30_lo": open_est - (1.05 - drift) * sig_30,
+        }
+        # احتمال لمس القاع -50 نقطة (Reflection Principle)
+        expected_move_30 = S * 0.15 * sig_30
+        z = (-50.0 - expected_move_30) / max(sig_30, 1.0)
+        drop50_prob = float(min(0.99, 2.0 * _ncdf(z)))
+
     # --- سطور القراءة
     L = list(warn)
     L.append(f"ES: {lab(es['ret_pct'], 0.15, 'داعم للصعود', 'داعم للهبوط', 'محايد')} ({es['ret_pct']:+.2f}%)")
@@ -815,7 +866,7 @@ def build_forecast(d, now):
     else:
         L.append("الشركات الكبرى: غير متاح")
     if nyse:
-        L.append(f"اتساع NYSE (ADD): {nyse['add']:.0f}")
+        L.append(f"اتساع (RSP/SPY): {nyse['add']/1000:+.2f}% | درجة {nyse['score']:+.2f}")
     if br and br.get("sectors_up") is not None:
         L.append(f"Breadth (قطاعات): {br['sectors_up']*100:.0f}% صاعدة")
     elif not nyse:
@@ -847,7 +898,12 @@ def build_forecast(d, now):
                 gex={k: gex[k] for k in ("spot", "flip", "call_wall", "put_wall", "net", "regime")},
                 lines=L, levels=levels, comps={k: round(v[0], 3) for k, v in comps.items()},
                 ml_id=str(uuid.uuid4()), ml_features=ml_features,
-                drop_risk=dict(score=dr, level=dr_level, why=dr_why[:4]))
+                drop_risk=dict(score=dr, level=dr_level, why=dr_why[:4]),
+                open_pred=open_pred, drop50_prob=drop50_prob)
+
+
+def _ncdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
 # ============================ التقارير ============================
@@ -870,6 +926,24 @@ def format_report(fc, title):
         f"⚠️ خطر الانعكاس: {fc['reversal']}",
         f"📉 خطر هبوط حاد: {dk['level']} ({dk['score']}/100)",
         ("   الأسباب: " + " | ".join(dk["why"])) if dk["why"] else "",
+    ]
+
+    # --- توقع الافتتاح وأول 30 دقيقة
+    if fc.get("open_pred"):
+        op = fc["open_pred"]
+        out += [
+            sep, "🕐 توقع الافتتاح وأول 30 دقيقة",
+            f"الافتتاح المتوقع ≈ {n0(op['open'])}",
+            f"أول 10 دقائق: {n0(op['m10_lo'])} – {n0(op['m10_hi'])}",
+            f"أول 20 دقيقة: {n0(op['m20_lo'])} – {n0(op['m20_hi'])}",
+            f"أول 30 دقيقة: {n0(op['m30_lo'])} – {n0(op['m30_hi'])}",
+        ]
+        if fc.get("drop50_prob") is not None:
+            dp = fc["drop50_prob"] * 100
+            level = "منخفض" if dp < 20 else ("متوسط" if dp < 40 else ("مرتفع" if dp < 60 else "مرتفع جداً"))
+            out.append(f"احتمال هبوط ≥50 نقطة في أول نصف ساعة: {dp:.0f}% ({level})")
+
+    out += [
         sep, "🧭 قراءة الأسواق"] + ["• " + ln for ln in fc["lines"]] + [
         sep, "🎚️ مستويات المراقبة",
         f"🔴 مقاومة 1: {n0(lv['r1'])}", f"🔴 مقاومة 2: {n0(lv['r2'])}",
@@ -1287,11 +1361,15 @@ def train_model():
         print("النموذج لا يتفوق على خط الأساس — لم يُحفظ.")
 
 
-# ===================== وحدة توصيات العقود — أكبر 40 شركة =====================
+# ===================== وحدة توصيات العقود — أكبر 60 شركة =====================
+# تم توسيع القائمة إلى أكبر 60 شركة أمريكية سائلة تقريباً (حسب القيمة السوقية)
 REC_TICKERS = [x.strip().upper() for x in env(
     "REC_TICKERS",
     "NVDA,AAPL,MSFT,AMZN,GOOGL,META,AVGO,TSLA,BRK-B,LLY,JPM,WMT,V,ORCL,MA,XOM,NFLX,COST,JNJ,HD,"
-    "PLTR,BAC,ABBV,PG,CVX,UNH,KO,GE,AMD,CSCO,TMUS,WFC,MS,IBM,PM,CRM,ABT,AXP,LIN,MCD").split(",") if x.strip()]
+    "PLTR,BAC,ABBV,PG,CVX,UNH,KO,GE,AMD,CSCO,TMUS,WFC,MS,IBM,PM,CRM,ABT,AXP,LIN,MCD,"
+    "MU,TXN,QCOM,AMAT,INTC,ADP,ISRG,BKNG,TMO,PFE,MDT,LOW,SBUX,CAT,GS,BLK,SCHW,C,USB,PNC"
+).split(",") if x.strip()]
+
 REC_MOVE_PCT = float(env("REC_MOVE_PCT", "1.5"))     # الحركة المتوقعة كنسبة مئوية من سعر السهم
 REC_MAX_DTE = int(env("REC_MAX_DTE", "7"))           # أقصى عدد أيام لانتهاء العقد (أسبوع)
 REC_MIN_SCORE = float(env("REC_MIN_SCORE", "88"))    # عتبة القبول (من 100) — صارمة
@@ -1299,26 +1377,22 @@ REC_MIN_FP = int(env("REC_MIN_FP", "5"))             # أقل عدد بصمات 
 REC_MIN_TOUCH = float(env("REC_MIN_TOUCH", "0.60"))  # أقل احتمال لمس الهدف
 REC_MIN_FREQ = float(env("REC_MIN_FREQ", "0.35"))
 REC_MAX_IVRV = float(env("REC_MAX_IVRV", "1.3"))    # أعلى نسبة IV/RV
-REC_MAX_DAY = int(env("REC_MAX_DAY", "3"))           # أقصى توصيات في اليوم
+REC_MAX_DAY = int(env("REC_MAX_DAY", "4"))           # أقصى توصيات في اليوم (زِد قليلاً مع 60 شركة)
 REC_BT_MIN_N = int(env("REC_BT_MIN_N", "30"))        # أقل عدد إشارات في الاختبار الرجعي
 REC_BT_MARGIN = float(env("REC_BT_MARGIN", "0.05"))  # هامش التفوق على خط الأساس
-_SEC = {"رقائق": "NVDA AVGO AMD", "تقنية": "AAPL MSFT ORCL CRM PLTR IBM CSCO",
-        "اتصالات وإعلام": "GOOGL META NFLX TMUS", "استهلاكي": "AMZN TSLA WMT COST HD MCD PG KO PM",
-        "مالية": "BRK-B JPM V MA BAC WFC MS AXP", "صحة": "LLY JNJ ABBV UNH ABT",
-        "طاقة": "XOM CVX", "صناعي": "GE LIN"}
+_SEC = {"رقائق": "NVDA AVGO AMD MU TXN QCOM AMAT INTC", "تقنية": "AAPL MSFT ORCL CRM PLTR IBM CSCO ADP",
+        "اتصالات وإعلام": "GOOGL META NFLX TMUS", "استهلاكي": "AMZN TSLA WMT COST HD MCD PG KO PM SBUX LOW",
+        "مالية": "BRK-B JPM V MA BAC WFC MS AXP GS BLK SCHW C USB PNC", "صحة": "LLY JNJ ABBV UNH ABT TMO PFE MDT ISRG",
+        "طاقة": "XOM CVX", "صناعي": "GE LIN CAT"}
 SECTOR = {s: k for k, v in _SEC.items() for s in v.split()}
-REL = [{"NVDA", "AVGO", "AMD"}, {"JPM", "BAC", "WFC", "MS"}, {"V", "MA"}, {"XOM", "CVX"},
-       {"AAPL", "MSFT", "GOOGL", "META", "AMZN"}, {"LLY", "ABBV", "JNJ"}]
+REL = [{"NVDA", "AVGO", "AMD", "MU"}, {"JPM", "BAC", "WFC", "MS", "C", "USB", "PNC"}, {"V", "MA"}, {"XOM", "CVX"},
+       {"AAPL", "MSFT", "GOOGL", "META", "AMZN"}, {"LLY", "ABBV", "JNJ", "UNH"}]
 KW = ("downgrade", "upgrade", "investigation", "probe", "guidance", "fda", "lawsuit", "recall",
       "antitrust", "merger", "acquire", "acquisition", "bankruptcy", "tariff", "outage", "breach")
 
 
 class Rej(Exception):
     pass
-
-
-def _ncdf(x):
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
 def _ivn(v):
@@ -1383,7 +1457,7 @@ def rec_init():
 def _chain(s, now):
     root0 = s.replace("-", "")
     r = requests.get(f"https://cdn.cboe.com/api/global/delayed_quotes/options/{root0}.json",
-                     headers={"User-Agent": "Mozilla/5.0"}, timeout=40)
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
     if r.status_code != 200:
         raise SourceError(f"Cboe HTTP {r.status_code}")
     j = r.json().get("data", {})
@@ -1411,8 +1485,12 @@ def _earn(s, now):
     raw = kv_get(k)
     if raw:
         j = json.loads(raw)
-        if j.get("asof") == now.date().isoformat():
-            return j["d"]
+        try:
+            asof = datetime.strptime(j["asof"], "%Y-%m-%d").date()
+            if (now.date() - asof).days < 7:
+                return j["d"]
+        except Exception:
+            pass
     cal = yf.Ticker(s).calendar
     ds = cal.get("Earnings Date") if isinstance(cal, dict) else None
     if not ds:
@@ -1439,15 +1517,22 @@ def _alp_prices(syms):
 
 
 def _news_syms(syms, now):
+    """جلب الأخبار على دفعتين لتجنب فقدان الرموز بسبب حد الـ 50 خبراً."""
     out = set()
     try:
         st = (now - timedelta(hours=18)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        r = requests.get(f"{DATA_URL}/v1beta1/news", headers=ah(),
-                         params={"symbols": ",".join(_a(s) for s in syms), "limit": 50, "start": st}, timeout=20)
-        for n in r.json().get("news", []):
-            t = (n.get("headline", "") + " " + (n.get("summary") or "")).lower()
-            if any(k in t for k in KW):
-                out.update(x.replace(".", "-") for x in n.get("symbols", []))
+        batches = [syms[:30], syms[30:]] if len(syms) > 30 else [syms]
+        for batch in batches:
+            if not batch:
+                continue
+            r = requests.get(f"{DATA_URL}/v1beta1/news", headers=ah(),
+                             params={"symbols": ",".join(_a(s) for s in batch), "limit": 50, "start": st}, timeout=20)
+            if r.status_code != 200:
+                continue
+            for n in r.json().get("news", []):
+                t = (n.get("headline", "") + " " + (n.get("summary") or "")).lower()
+                if any(k in t for k in KW):
+                    out.update(x.replace(".", "-") for x in n.get("symbols", []))
     except Exception as e:
         log.warning("أخبار: %s", e)
     return out
@@ -1669,12 +1754,17 @@ def rec_analyze(s, X):
     if float(np.mean([x >= move_frac for x in exc_pct])) < REC_MIN_FREQ:
         raise Rej("سهم هادئ")
     moved_pct = ((spot - prevc) / prevc) * dirn
-    if moved_pct >= 0.8 * move_frac:
-        raise Rej("الحركة استُهلكت")
+    # --- تعديل v2.4: تخفيف فلتر "الحركة استُهلكت"
+    # سابقاً كان يرفض إذا تحركت ≥ 80% من الهدف. الآن يسمح حتى 1.4× الهدف
+    # حتى تلتقط الشركات اللي تحركت بقوة (مثل أكثر من 5 دولار)
+    if moved_pct >= 1.40 * move_frac:
+        raise Rej("الحركة استُهلكت كثيراً")
     day = bars.index[-1].date()
     b = bars[bars.index.date == day]
     vw = float(((b.High + b.Low + b.Close) / 3 * b.Volume).sum() / max(b.Volume.sum(), 1.0))
-    if abs(spot - vw) > 0.6 * atr:
+    # السماح بابتعاد أكبر عن VWAP عند وجود زخم حجم قوي
+    vw_mult = 1.1 if vr >= 2.0 else 0.75
+    if abs(spot - vw) > vw_mult * atr:
         raise Rej("بعيد عن VWAP")
     # أرباح
     mx = max(X["dte"])
@@ -1917,7 +2007,9 @@ def job_rec_zero():
 
 def _rec_eval_one(r, df, now):
     d, exp = (1 if r["side"] == "CALL" else -1), datetime.strptime(r["expiry"], "%Y-%m-%d").date()
-    for ts, b in df[df.index > datetime.fromisoformat(r["ts"])].iterrows():
+    m = df.index.hour * 60 + df.index.minute
+    rth_df = df[(df.index > datetime.fromisoformat(r["ts"])) & (m >= 570) & (m < 960)]
+    for ts, b in rth_df.iterrows():
         if ts.date() > exp:
             break
         hs = (b.Low <= r["stop"]) if d == 1 else (b.High >= r["stop"])
@@ -2006,8 +2098,10 @@ def main():
         train_model()
         return
     dump_1m_once()
-    log.info("تشغيل صَفاء التحليل SPX v2.3")
-    tg("🚀 تم تشغيل صَفاء التحليل SPX v2.3\nتوقع الساعات + خطر الهبوط الحاد + توصيات أسبوعية صارمة\n"
+    log.info("تشغيل صَفاء التحليل SPX v2.4.1")
+    tg("🚀 تم تشغيل صَفاء التحليل SPX v2.4.1\n"
+       "توقع الافتتاح + أول 30 دقيقة + خطر هبوط 50 نقطة\n"
+       "توصيات عقود لأكبر 60 شركة + تخفيف فلتر الحركة\n"
        "لا تنفيذ تلقائي — تحليل احتمالي فقط\n" + SIGNATURE)
     while True:
         try:
